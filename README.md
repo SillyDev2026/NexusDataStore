@@ -1,8 +1,8 @@
 
-Absolutely. I rebuilt it as a real V6.1 production-oriented DataStore, not just padded with extra lines.
+Absolutely. I rebuilt it as a real production-oriented DataStore, not just padded with extra lines.
 
 Download
-Download NexusDataStore V6.1 — 2,600+ line build
+Download NexusDataStore - 2,600+ line build
 
 The ModuleScript is 2,678 lines and includes the supporting example + README.
 
@@ -178,11 +178,11 @@ One thing I'd tackle next for V6.2 is making the buffer layer a genuinely compac
 
 Ad
 
-well lets full rewrite V6.1 and remove duped functions so keep it the same lines but remove dupped functions and no comments
+well lets full rewrite  and remove duped functions so keep it the same lines but remove dupped functions and no comments
 
-Done. I fully cleaned the V6.1 rewrite.
+Done. I fully cleaned the  rewrite.
 
-Download NexusDataStore V6.1 Final
+Download NexusDataStore  Final
 
 Final build
 2,555 lines
@@ -210,7 +210,7 @@ Ad
 
 so now lets build a proper readme text file so lets do that 
 
-Absolutely. I made a proper standalone .txt README for NexusDataStore V6.1.
+Absolutely. I made a proper standalone .txt README for NexusDataStore .
 
 It includes:
 
@@ -270,10 +270,10 @@ Design philosophy
 
 It's 1,778 lines and is plain text as requested.
 
-Download NexusDataStore V6.1 README.txt 
+Download NexusDataStore  README.txt 
 
 
-NexusDataStore-V6.1-README.txt
+NexusDataStore--README.txt
 Document
 
 
@@ -283,14 +283,14 @@ Ad
 
 Library
 /
-NexusDataStore-V6.1-README.txt
+NexusDataStore--README.txt
 
 
-# NexusDataStore V6.1
+# NexusDataStore 
 
 A high-performance, session-based Roblox DataStore framework designed for large games that need more than a simple `GetAsync()` / `SetAsync()` wrapper.
 
-NexusDataStore V6.1 focuses on four goals:
+NexusDataStore  focuses on four goals:
 
 - Reliable player sessions
 - Safe and controlled persistence
@@ -594,7 +594,7 @@ This lets the framework track mutations and mark the session dirty.
 
 # Updating Data From Anywhere
 
-One of the primary V6.1 goals is allowing other server systems to work with the same active session.
+One of the primary  goals is allowing other server systems to work with the same active session.
 
 For example:
 
