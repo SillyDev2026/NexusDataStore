@@ -84,6 +84,7 @@ Creating a Store
 -------------------------------------------------------------------------------
 
 A basic store looks like this:
+```lua
 
 local DataStore = require(script.Parent.Data.NexusDataStore)
 
@@ -113,7 +114,7 @@ local Store = DataStore.new({
 
     BudgetAware = true,
 })
-
+```
 The Name is the DataStore name used by the module.
 
 Template is the default data for a new player.
@@ -184,7 +185,7 @@ PlayerAdded
 -------------------------------------------------------------------------------
 
 Open the session when the player joins.
-
+```lua
 local Players = game:GetService("Players")
 
 Players.PlayerAdded:Connect(function(player)
@@ -203,7 +204,7 @@ Players.PlayerAdded:Connect(function(player)
     print("Coins:", session.Data.Coins)
 
 end)
-
+```
 If the session cannot be opened, it is normally better to kick the player
 than to start the game with empty data.
 
@@ -214,7 +215,7 @@ PlayerRemoving
 -------------------------------------------------------------------------------
 
 Release the session when the player leaves.
-
+```lua
 Players.PlayerRemoving:Connect(function(player)
 
     local session = Store:GetSession(player)
@@ -234,7 +235,7 @@ Players.PlayerRemoving:Connect(function(player)
     end
 
 end)
-
+```
 ReleaseAsync handles the final persistence step before the session is
 removed.
 
@@ -245,11 +246,11 @@ Server Shutdown
 -------------------------------------------------------------------------------
 
 Always close the store when the server shuts down.
-
+```lua
 game:BindToClose(function()
     Store:Close()
 end)
-
+```
 The store uses its shutdown path to deal with active sessions and pending
 saves.
 
@@ -260,13 +261,13 @@ The Session
 A session is the live representation of one player's data.
 
 For example:
-
+```lua
 local session = Store:GetSession(player)
 
 if session then
     print(session.Data.Coins)
 end
-
+```
 The session contains the data currently being used by the game.
 
 A typical flow is:
@@ -299,13 +300,13 @@ Reading Data
 -------------------------------------------------------------------------------
 
 Direct reads are simple:
-
+```lua
 local coins = session.Data.Coins
 
 local level = session.Data.Level
 
 local music = session.Data.Settings.Music
-
+```
 You can also use the module's data access methods when you want changes
 to go through the mutation system.
 
@@ -342,7 +343,7 @@ Don't do this.
 If Inventory.lua needs the player's data, use the existing session.
 
 For example, a central player data module can keep track of sessions:
-
+```lua
 local Sessions = {}
 
 Players.PlayerAdded:Connect(function(player)
@@ -368,7 +369,7 @@ Players.PlayerRemoving:Connect(function(player)
     end
 
 end)
-
+```
 Then another server system can use:
 
 local session = Sessions[player]
@@ -408,7 +409,7 @@ Leaderstats
 leaderstats should normally mirror your session.
 
 Example:
-
+```lua
 Players.PlayerAdded:Connect(function(player)
 
     local session, err = Store:OpenPlayerAsync(player)
@@ -442,7 +443,7 @@ Players.PlayerAdded:Connect(function(player)
     end)
 
 end)
-
+```
 For a larger game, it can be cleaner to change the session first and
 update leaderstats from the data change event instead.
 
@@ -453,7 +454,7 @@ DataChanged
 The store can notify systems when data changes.
 
 Example:
-
+```lua
 Store:On("DataChanged", function(
     session,
     path,
@@ -469,7 +470,7 @@ Store:On("DataChanged", function(
     )
 
 end)
-
+```
 This is useful when several systems need to react to the same change.
 
 For example:
@@ -490,7 +491,7 @@ Transactions
 Transactions are useful when several changes belong together.
 
 Example:
-
+```lua
 session:Transaction(function(tx)
 
     tx:Require("Coins", function(coins)
@@ -505,7 +506,7 @@ session:Transaction(function(tx)
     })
 
 end)
-
+```
 The idea is that the purchase is treated as one operation.
 
 This is much safer than doing:
@@ -519,7 +520,7 @@ Shop Example
 -------------------------------------------------------------------------------
 
 A shop purchase could look like:
-
+```lua
 local success, err = session:Transaction(function(tx)
 
     tx:Require("Coins", function(coins)
@@ -538,7 +539,7 @@ end)
 if not success then
     warn("Purchase failed:", err)
 end
-
+```
 For important game operations, validate everything on the server.
 
 -------------------------------------------------------------------------------
@@ -596,20 +597,20 @@ Migrations
 Data changes over time.
 
 For example, an old version might have:
-
+```
 {
     Coins = 100
 }
-
+```
 Later you add Gems:
-
+```
 {
     Coins = 100,
     Gems = 0
 }
-
+```
 Later you add Stats:
-
+```
 {
     Coins = 100,
     Gems = 0,
@@ -619,11 +620,11 @@ Later you add Stats:
         XP = 0,
     }
 }
-
+```
 Migrations handle these changes.
 
 Example:
-
+```
 Migrations = {
 
     [2] = function(data)
@@ -646,7 +647,7 @@ Migrations = {
     end,
 
 }
-
+```
 A migration should normally be safe to run against old data.
 
 Once a migration has been used in production, keep it around unless you
@@ -659,7 +660,7 @@ Schema
 A schema can be used to describe expected data.
 
 Example:
-
+```lua
 Schema = {
 
     Coins = {
@@ -681,7 +682,7 @@ Schema = {
     },
 
 }
-
+```
 Validation can catch things such as:
 
 - Wrong data types
@@ -709,7 +710,7 @@ Schema:
     "What is valid player data?"
 
 For example:
-
+```lua
 Template = {
     Coins = 0,
     Level = 1,
@@ -728,7 +729,7 @@ Schema = {
         Min = 1,
     },
 }
-
+```
 -------------------------------------------------------------------------------
 Autosave
 -------------------------------------------------------------------------------
@@ -1096,7 +1097,7 @@ Events are useful when several systems need to react to the same data
 operation.
 
 Example:
-
+```lua
 Store:On("DataChanged", function(
     session,
     path,
@@ -1112,9 +1113,9 @@ Store:On("DataChanged", function(
     )
 
 end)
-
+```
 Save failure:
-
+```lua
 Store:On("SaveFailed", function(session, err)
 
     warn(
@@ -1124,9 +1125,9 @@ Store:On("SaveFailed", function(session, err)
     )
 
 end)
-
+```
 Session loss:
-
+```lua
 Store:On("SessionLost", function(session, err)
 
     warn(
@@ -1136,7 +1137,7 @@ Store:On("SessionLost", function(session, err)
     )
 
 end)
-
+```
 Events are a good way to keep systems separate.
 
 For example:
@@ -1233,7 +1234,7 @@ A clean project will usually have one script responsible for opening and
 releasing sessions.
 
 Example:
-
+```lua
 local Players = game:GetService("Players")
 
 local DataStore = require(script.Parent.NexusDataStore)
@@ -1307,7 +1308,7 @@ game:BindToClose(function()
     Store:Close()
 
 end)
-
+```
 -------------------------------------------------------------------------------
 Inventory Example
 -------------------------------------------------------------------------------
@@ -1315,7 +1316,7 @@ Inventory Example
 An inventory system should work with the player's existing session.
 
 Example:
-
+```lua
 local function GiveItem(player, itemId, amount)
 
     local session = Store:GetSession(player)
@@ -1336,13 +1337,13 @@ local function GiveItem(player, itemId, amount)
     end)
 
 end
-
+```
 The important part is that GiveItem does not open another session.
 
 -------------------------------------------------------------------------------
 Currency Example
 -------------------------------------------------------------------------------
-
+```lua
 local function GiveCoins(player, amount)
 
     local session = Store:GetSession(player)
@@ -1362,7 +1363,7 @@ local function GiveCoins(player, amount)
     )
 
 end
-
+```
 -------------------------------------------------------------------------------
 Trading Example
 -------------------------------------------------------------------------------
@@ -1446,7 +1447,7 @@ What Not To Do
 -------------------------------------------------------------------------------
 
 Do not do this:
-
+```lua
 local DataStoreService = game:GetService("DataStoreService")
 
 local Store = DataStoreService:GetDataStore("Players")
@@ -1460,12 +1461,12 @@ Players.PlayerAdded:Connect(function(player)
     Store:SetAsync(player.UserId, data)
 
 end)
-
+```
 That approach leaves every system responsible for its own loading,
 saving, error handling, and shutdown behavior.
 
 Do not do this either:
-
+```lua
 Players.PlayerAdded:Connect(function(player)
 
     local session = Store:OpenPlayerAsync(player)
@@ -1474,7 +1475,7 @@ Players.PlayerAdded:Connect(function(player)
     local otherSession = Store:OpenPlayerAsync(player)
 
 end)
-
+```
 There should be one active session.
 
 -------------------------------------------------------------------------------
@@ -1547,7 +1548,7 @@ Error Handling
 Always check the result of important operations.
 
 Example:
-
+```lua
 local success, err = Store:Increment(
     session,
     "Coins",
@@ -1557,9 +1558,9 @@ local success, err = Store:Increment(
 if not success then
     warn("Could not change coins:", err)
 end
-
+```
 Likewise for loading:
-
+```lua
 local session, err = Store:OpenPlayerAsync(player)
 
 if not session then
@@ -1567,7 +1568,7 @@ if not session then
     player:Kick("Data failed to load.")
     return
 end
-
+```
 Do not silently ignore DataStore errors.
 
 -------------------------------------------------------------------------------
@@ -1803,7 +1804,7 @@ server and let the store handle the persistence side.
 License
 -------------------------------------------------------------------------------
 
-Add your project's license here.
+Free to use
 
 -------------------------------------------------------------------------------
 End
