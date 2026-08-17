@@ -1,8 +1,6 @@
-
 Absolutely. I rebuilt it as a real production-oriented DataStore, not just padded with extra lines.
 
-Download
-Download NexusDataStore - 2,600+ line build
+NexusDataStore - 2,600+ line build
 
 The ModuleScript is 2,678 lines and includes the supporting example + README.
 
@@ -182,7 +180,7 @@ well lets full rewrite  and remove duped functions so keep it the same lines but
 
 Done. I fully cleaned the  rewrite.
 
-Download NexusDataStore  Final
+ NexusDataStore  Final
 
 Final build
 2,555 lines
@@ -270,7 +268,7 @@ Design philosophy
 
 It's 1,778 lines and is plain text as requested.
 
-Download NexusDataStore  README.txt 
+ NexusDataStore  README.txt 
 
 
 NexusDataStore--README.txt
