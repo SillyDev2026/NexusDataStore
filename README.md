@@ -1,1809 +1,2907 @@
-NexusDataStore
-==============
+# NexusDataStore
 
-NexusDataStore is a session-based DataStore module for Roblox.
+![Version](https://img.shields.io/badge/version-v6.2.1-4c8bf5)
+![Language](https://img.shields.io/badge/language-Luau-00A2FF)
+![Platform](https://img.shields.io/badge/platform-Roblox-111111)
+![Runtime](https://img.shields.io/badge/runtime-server--only-orange)
+![Compression](https://img.shields.io/badge/compression-codec%20621-6f42c1)
 
-It is built around one simple rule:
+**NexusDataStore** is a session-based persistence framework for Roblox that centralizes player data loading, session ownership, validation, mutation tracking, compression, saving, retries, and shutdown handling behind one server-side API.
 
-    Open a player's data once.
-    Keep it in a session.
-    Make changes to that session.
-    Let the store handle saving.
+Instead of letting every gameplay system call `DataStoreService` directly, NexusDataStore follows one model:
 
-This keeps the rest of the game from having to deal with UpdateAsync,
-retry loops, save queues, session ownership, shutdown saves, and similar
-DataStore work.
+```text
+Open once
+   ↓
+Keep one active session
+   ↓
+Read / mutate session data
+   ↓
+Validate and track changes
+   ↓
+Queue / autosave
+   ↓
+Release on leave
+```
 
-The module is intended to be used from the server.
+> Current release: **v6.2.1**
 
--------------------------------------------------------------------------------
-Features
--------------------------------------------------------------------------------
+---
 
-- Player sessions
-- Session locking
-- Automatic saving
-- Manual saving
-- Save queues
-- Priority saves
-- Budget-aware saving
-- Retry handling
-- Backoff and jitter
-- Session heartbeats
-- Session expiration handling
-- Data templates
-- Schema validation
-- Data migrations
-- Transactions
-- Snapshots
-- Backups
-- Data diffing
-- Data patching
-- Mutation journals
-- Revision tracking
-- Buffer-based persistence
-- Data checks
-- Store events
-- Session events
-- Shutdown handling
-- Diagnostics
-- Store health information
-- Multiple active sessions
-- Centralized data access
+## Why NexusDataStore?
 
--------------------------------------------------------------------------------
-Installation
--------------------------------------------------------------------------------
+Roblox `DataStoreService` gives you the persistence primitives, but production games usually need more around them:
 
-Put the module somewhere on the server.
+- session ownership and stale-lock recovery;
+- autosaving;
+- retry handling with backoff;
+- request-budget awareness;
+- schema validation;
+- versioned migrations;
+- dirty-state tracking;
+- save prioritization;
+- safe transactions;
+- mutation journals;
+- runtime snapshots;
+- data diffing and patching;
+- compressed buffer persistence;
+- compression compatibility across schema versions;
+- cross-server messaging;
+- diagnostics and health metrics;
+- clean player-leave and shutdown handling.
 
-A simple layout is:
+NexusDataStore keeps those concerns in one place so gameplay systems work with a live **Session** instead of implementing their own persistence logic.
 
+---
+
+# Core Features
+
+| Feature | Purpose |
+|---|---|
+| Session ownership | Prevents multiple servers from casually owning the same player profile |
+| Stale lock recovery | Recovers expired session ownership |
+| Autosave | Queues dirty sessions automatically |
+| Manual saves | Save important changes immediately when required |
+| Save priorities | `low`, `normal`, `high`, and `critical` |
+| Budget awareness | Waits for Roblox DataStore request budget |
+| Retries | Retries transient failures with delay/backoff |
+| Heartbeats | Refreshes live session ownership |
+| Templates | Reconciles missing default fields |
+| Schema validation | Enforces expected data types and constraints |
+| Migrations | Upgrades older schema versions |
+| Transactions | Applies related changes atomically in memory |
+| Patching | Applies structured mutation lists |
+| Snapshots | Keeps limited in-memory rollback points |
+| Mutation journal | Records tracked changes |
+| Revision tracking | Tracks profile revisions and mutations |
+| Direct mutation detection | Detects supported `session.Data` edits |
+| Value bindings | Synchronizes Roblox `ValueBase` objects with session paths |
+| Compression | Schema-aware bit/buffer persistence |
+| Compression history | Decodes data written by older compression schemas |
+| Compression reports | Measures raw vs encoded storage cost |
+| Cross-server messages | Optional `MessagingService` integration |
+| Diagnostics | Health, metrics, data size, queues, budget and session state |
+| Lifecycle helpers | Automatic PlayerAdded / PlayerRemoving / BindToClose wiring |
+| No external dependencies | Single server-side ModuleScript |
+
+---
+
+# Requirements
+
+NexusDataStore is **server-only**.
+
+The module asserts that it is running on the server, so do not require it from a `LocalScript`.
+
+Recommended location:
+
+```text
 ServerScriptService
-|
-+-- Data
-|   |
-|   +-- NexusDataStore.lua
-|
-+-- PlayerData.server.lua
-|
-+-- Systems
-    |
-    +-- Inventory.lua
-    +-- Rewards.lua
-    +-- Quests.lua
-
-Require the module from a server script:
-
-local DataStore = require(script.Parent.Data.NexusDataStore)
-
-Do not require the module from a LocalScript.
-
--------------------------------------------------------------------------------
-Creating a Store
--------------------------------------------------------------------------------
-
-A basic store looks like this:
-```lua
-
-local DataStore = require(script.Parent.Data.NexusDataStore)
-
-local Store = DataStore.new({
-    Name = "PlayersData",
-
-    Template = {
-        Coins = 0,
-        Gems = 0,
-        Level = 1,
-        XP = 0,
-
-        Inventory = {},
-
-        Settings = {
-            Music = true,
-            SFX = true,
-        },
-    },
-
-    AutoSave = true,
-    AutoSaveInterval = 30,
-
-    LockTimeout = 120,
-
-    RetryAttempts = 6,
-
-    BudgetAware = true,
-})
+├── Data
+│   └── NexusDataStore
+├── PlayerData.server.lua
+└── Systems
+    ├── CurrencyService.lua
+    ├── InventoryService.lua
+    └── QuestService.lua
 ```
-The Name is the DataStore name used by the module.
 
-Template is the default data for a new player.
+---
 
-The other options control the save system.
+# Installation
 
--------------------------------------------------------------------------------
-Configuration
--------------------------------------------------------------------------------
-
-Name
-
-The name of the store.
+Place the ModuleScript somewhere only server code needs to access it.
 
 Example:
 
-Name = "PlayersData"
-
-Keep this stable once the game is in production.
-
-Changing it creates a different DataStore.
-
-Template
-
-The default data used when a player has no existing data.
-
-Example:
-
-Template = {
-    Coins = 0,
-    Gems = 0,
-    Level = 1,
-}
-
-AutoSave
-
-Turns automatic saving on or off.
-
-AutoSave = true
-
-AutoSaveInterval
-
-How often the autosave system checks for dirty sessions.
-
-AutoSaveInterval = 30
-
-LockTimeout
-
-How long a stale session can remain valid before it can be considered
-expired.
-
-LockTimeout = 120
-
-RetryAttempts
-
-Number of attempts used for operations that can be retried.
-
-RetryAttempts = 6
-
-BudgetAware
-
-When enabled, the save system takes DataStore request budget into account.
-
-BudgetAware = true
-
--------------------------------------------------------------------------------
-PlayerAdded
--------------------------------------------------------------------------------
-
-Open the session when the player joins.
 ```lua
-local Players = game:GetService("Players")
+local ServerScriptService = game:GetService("ServerScriptService")
 
-Players.PlayerAdded:Connect(function(player)
-
-    local session, err = Store:OpenPlayerAsync(player)
-
-    if not session then
-        warn("[DataStore] Failed to load:", player.Name, err)
-
-        player:Kick("Your data could not be loaded. Please rejoin.")
-
-        return
-    end
-
-    print("Loaded:", player.Name)
-    print("Coins:", session.Data.Coins)
-
-end)
+local NexusDataStore = require(
+	ServerScriptService.Data.NexusDataStore
+)
 ```
-If the session cannot be opened, it is normally better to kick the player
-than to start the game with empty data.
 
-Otherwise an empty save later could overwrite valid player data.
+No separate `Start()` call is required.
 
--------------------------------------------------------------------------------
-PlayerRemoving
--------------------------------------------------------------------------------
+Creating a store starts the internal store systems.
 
-Release the session when the player leaves.
+---
+
+# Five-Minute Quick Start
+
+## 1. Create the store
+
+For v6.2.1, `DataTemplate` is a clean way to keep the data version, template, strict mode, and schema together.
+
 ```lua
-Players.PlayerRemoving:Connect(function(player)
+local ServerScriptService = game:GetService("ServerScriptService")
 
-    local session = Store:GetSession(player)
-
-    if not session then
-        return
-    end
-
-    local success, err = Store:ReleaseAsync(session)
-
-    if not success then
-        warn(
-            "[DataStore] Failed to save:",
-            player.Name,
-            err
-        )
-    end
-
-end)
-```
-ReleaseAsync handles the final persistence step before the session is
-removed.
-
-Do not keep modifying a session after it has been released.
-
--------------------------------------------------------------------------------
-Server Shutdown
--------------------------------------------------------------------------------
-
-Always close the store when the server shuts down.
-```lua
-game:BindToClose(function()
-    Store:Close()
-end)
-```
-The store uses its shutdown path to deal with active sessions and pending
-saves.
-
--------------------------------------------------------------------------------
-The Session
--------------------------------------------------------------------------------
-
-A session is the live representation of one player's data.
-
-For example:
-```lua
-local session = Store:GetSession(player)
-
-if session then
-    print(session.Data.Coins)
-end
-```
-The session contains the data currently being used by the game.
-
-A typical flow is:
-
-Player joins
-    |
-    v
-OpenPlayerAsync
-    |
-    v
-Session
-    |
-    v
-session.Data
-    |
-    v
-Game systems
-    |
-    v
-Save
-    |
-    v
-Release
-
-The session should be treated as the source of truth while the player is
-in the server.
-
--------------------------------------------------------------------------------
-Reading Data
--------------------------------------------------------------------------------
-
-Direct reads are simple:
-```lua
-local coins = session.Data.Coins
-
-local level = session.Data.Level
-
-local music = session.Data.Settings.Music
-```
-You can also use the module's data access methods when you want changes
-to go through the mutation system.
-
--------------------------------------------------------------------------------
-Changing Data
--------------------------------------------------------------------------------
-
-For a simple change:
-
-session.Data.Coins += 100
-
-For a tracked change:
-
-Store:Set(session, "Coins", 100)
-
-Incrementing a value:
-
-Store:Increment(session, "Coins", 100)
-
-Subtracting:
-
-Store:Increment(session, "Coins", -100)
-
-For larger changes, transactions are usually a better option.
-
--------------------------------------------------------------------------------
-Using Sessions From Other Systems
--------------------------------------------------------------------------------
-
-A common mistake is creating a new DataStore session in every system.
-
-Don't do this.
-
-If Inventory.lua needs the player's data, use the existing session.
-
-For example, a central player data module can keep track of sessions:
-```lua
-local Sessions = {}
-
-Players.PlayerAdded:Connect(function(player)
-
-    local session, err = Store:OpenPlayerAsync(player)
-
-    if not session then
-        player:Kick("Data failed to load.")
-        return
-    end
-
-    Sessions[player] = session
-
-end)
-
-Players.PlayerRemoving:Connect(function(player)
-
-    local session = Sessions[player]
-
-    if session then
-        Store:ReleaseAsync(session)
-        Sessions[player] = nil
-    end
-
-end)
-```
-Then another server system can use:
-
-local session = Sessions[player]
-
-if session then
-    Store:Increment(session, "Coins", 250)
-end
-
-The important part is that there is still only one active session for
-that player.
-
--------------------------------------------------------------------------------
-A Better Way To Share Sessions
--------------------------------------------------------------------------------
-
-If you don't want other systems accessing the Sessions table directly,
-you can expose a function:
-
-local function GetSession(player)
-    return Store:GetSession(player)
-end
-
-Then:
-
-local session = GetSession(player)
-
-if session then
-    Store:Increment(session, "Coins", 250)
-end
-
-The store itself also provides session lookup methods.
-
--------------------------------------------------------------------------------
-Leaderstats
--------------------------------------------------------------------------------
-
-leaderstats should normally mirror your session.
-
-Example:
-```lua
-Players.PlayerAdded:Connect(function(player)
-
-    local session, err = Store:OpenPlayerAsync(player)
-
-    if not session then
-        player:Kick("Your data could not be loaded.")
-        return
-    end
-
-    local leaderstats = Instance.new("Folder")
-    leaderstats.Name = "leaderstats"
-    leaderstats.Parent = player
-
-    local coins = Instance.new("NumberValue")
-    coins.Name = "Coins"
-    coins.Value = session.Data.Coins
-    coins.Parent = leaderstats
-
-    coins:GetPropertyChangedSignal("Value"):Connect(function()
-
-        if not session:IsActive() then
-            return
-        end
-
-        Store:Set(
-            session,
-            "Coins",
-            coins.Value
-        )
-
-    end)
-
-end)
-```
-For a larger game, it can be cleaner to change the session first and
-update leaderstats from the data change event instead.
-
--------------------------------------------------------------------------------
-DataChanged
--------------------------------------------------------------------------------
-
-The store can notify systems when data changes.
-
-Example:
-```lua
-Store:On("DataChanged", function(
-    session,
-    path,
-    oldValue,
-    newValue
+local NexusDataStore = require(
+	ServerScriptService.Data.NexusDataStore
 )
 
-    print(
-        session.Player.Name,
-        path,
-        oldValue,
-        newValue
-    )
+local Store = NexusDataStore.new({
+	Name = "PlayersDataV2",
 
-end)
+	DataTemplate = {
+		Version = 1,
+
+		Data = {
+			Coins = 0,
+			Gems = 0,
+			Level = 1,
+			XP = 0,
+
+			Inventory = {},
+
+			Settings = {
+				Music = true,
+				SFX = true,
+			},
+		},
+
+		Strict = true,
+
+		Schema = {
+			Coins = {
+				Type = "number",
+				Required = true,
+				Integer = true,
+				Min = 0,
+				Encoding = "VarUInt",
+				OmitDefault = true,
+			},
+
+			Gems = {
+				Type = "number",
+				Required = true,
+				Integer = true,
+				Min = 0,
+				Encoding = "VarUInt",
+				OmitDefault = true,
+			},
+
+			Level = {
+				Type = "number",
+				Required = true,
+				Integer = true,
+				Min = 1,
+				Encoding = "VarUInt",
+			},
+
+			XP = {
+				Type = "number",
+				Required = true,
+				Integer = true,
+				Min = 0,
+				Encoding = "VarUInt",
+				OmitDefault = true,
+			},
+
+			Inventory = {
+				Type = "table",
+			},
+
+			Settings = {
+				Type = "table",
+
+				Children = {
+					Music = {
+						Type = "boolean",
+					},
+
+					SFX = {
+						Type = "boolean",
+					},
+				},
+			},
+		},
+	},
+
+	Compression = true,
+
+	AutoSave = true,
+	AutoSaveInterval = 30,
+
+	LockTimeout = 120,
+	RetryAttempts = 6,
+
+	BudgetAware = true,
+})
 ```
-This is useful when several systems need to react to the same change.
 
-For example:
+---
 
-Coins changed
-    |
-    +-- Leaderstats
-    +-- UI replication
-    +-- Analytics
-    +-- Achievement checks
+## 2. Attach the player lifecycle
 
-The exact event arguments depend on the module API.
+The simplest production bootstrap is:
 
--------------------------------------------------------------------------------
-Transactions
--------------------------------------------------------------------------------
-
-Transactions are useful when several changes belong together.
-
-Example:
 ```lua
-session:Transaction(function(tx)
+Store:AttachPlayerLifecycle(
+	"Your data could not be loaded. Please rejoin."
+)
 
-    tx:Require("Coins", function(coins)
-        return coins >= 500
-    end)
-
-    tx:Increment("Coins", -500)
-
-    tx:Insert("Inventory", {
-        Id = "Sword",
-        Quantity = 1,
-    })
-
-end)
+Store:BindToClose()
 ```
-The idea is that the purchase is treated as one operation.
 
-This is much safer than doing:
+`AttachPlayerLifecycle()`:
 
-Store:Increment(session, "Coins", -500)
+- opens a session when a player joins;
+- kicks the player if the session cannot be opened;
+- releases the session when the player leaves.
 
-and then hoping the inventory insert succeeds.
+`BindToClose()` connects the store's shutdown flow to `game:BindToClose()`.
 
--------------------------------------------------------------------------------
-Shop Example
--------------------------------------------------------------------------------
+---
 
-A shop purchase could look like:
+## 3. Wait for a session
+
+Other server systems can wait for the central data system:
+
 ```lua
-local success, err = session:Transaction(function(tx)
-
-    tx:Require("Coins", function(coins)
-        return coins >= 100
-    end)
-
-    tx:Increment("Coins", -100)
-
-    tx:Insert("Inventory", {
-        Id = "Potion",
-        Quantity = 1,
-    })
-
-end)
-
-if not success then
-    warn("Purchase failed:", err)
-end
-```
-For important game operations, validate everything on the server.
-
--------------------------------------------------------------------------------
-Snapshots
--------------------------------------------------------------------------------
-
-Snapshots are useful when you want to keep an in-memory copy of a state
-before doing something risky.
-
-For example:
-
-local snapshot = session:CreateSnapshot("BeforeTrade")
-
-Then perform the trade.
-
-If something goes wrong:
-
-session:RestoreSnapshot("BeforeTrade")
-
-Snapshots are most useful for systems such as:
-
-- Trading
-- Crafting
-- Inventory changes
-- Prestige
-- Large purchases
-- Character resets
-
-Snapshots are runtime tools. They are not a replacement for permanent
-backup storage.
-
--------------------------------------------------------------------------------
-Backups
--------------------------------------------------------------------------------
-
-The module supports backup-oriented workflows.
-
-A backup can be created before a destructive operation:
-
-local backup = session:CreateBackup()
-
-Then perform the operation.
-
-If needed, restore it using the corresponding session API.
-
-Do not treat runtime backups as a complete disaster recovery system.
-
-For a production game, important data should also have an external
-administration and recovery plan.
-
--------------------------------------------------------------------------------
-Migrations
--------------------------------------------------------------------------------
-
-Data changes over time.
-
-For example, an old version might have:
-```
-{
-    Coins = 100
-}
-```
-Later you add Gems:
-```
-{
-    Coins = 100,
-    Gems = 0
-}
-```
-Later you add Stats:
-```
-{
-    Coins = 100,
-    Gems = 0,
-
-    Stats = {
-        Level = 1,
-        XP = 0,
-    }
-}
-```
-Migrations handle these changes.
-
-Example:
-```
-Migrations = {
-
-    [2] = function(data)
-
-        data.Gems = data.Gems or 0
-
-        return data
-
-    end,
-
-    [3] = function(data)
-
-        data.Stats = data.Stats or {
-            Level = 1,
-            XP = 0,
-        }
-
-        return data
-
-    end,
-
-}
-```
-A migration should normally be safe to run against old data.
-
-Once a migration has been used in production, keep it around unless you
-are completely certain that no data using the old version remains.
-
--------------------------------------------------------------------------------
-Schema
--------------------------------------------------------------------------------
-
-A schema can be used to describe expected data.
-
-Example:
-```lua
-Schema = {
-
-    Coins = {
-        Type = "number",
-        Integer = true,
-        Min = 0,
-    },
-
-    Gems = {
-        Type = "number",
-        Integer = true,
-        Min = 0,
-    },
-
-    Level = {
-        Type = "number",
-        Integer = true,
-        Min = 1,
-    },
-
-}
-```
-Validation can catch things such as:
-
-- Wrong data types
-- Negative currency
-- Invalid values
-- Missing fields
-- Unexpected structures
-- Oversized data
-
-This is especially useful when the game has many systems modifying
-the same player profile.
-
--------------------------------------------------------------------------------
-Template vs Schema
--------------------------------------------------------------------------------
-
-The two serve different purposes.
-
-Template:
-
-    "What should a new player's data look like?"
-
-Schema:
-
-    "What is valid player data?"
-
-For example:
-```lua
-Template = {
-    Coins = 0,
-    Level = 1,
-}
-
-Schema = {
-    Coins = {
-        Type = "number",
-        Integer = true,
-        Min = 0,
-    },
-
-    Level = {
-        Type = "number",
-        Integer = true,
-        Min = 1,
-    },
-}
-```
--------------------------------------------------------------------------------
-Autosave
--------------------------------------------------------------------------------
-
-Enable autosaving:
-
-AutoSave = true,
-AutoSaveInterval = 30,
-
-The important part is that autosaving should work with dirty sessions.
-
-A typical flow is:
-
-Data changes
-    |
-    v
-Session becomes dirty
-    |
-    v
-Autosave checks session
-    |
-    v
-Save gets queued
-    |
-    v
-Budget check
-    |
-    v
-UpdateAsync
-
-There is usually no reason to save a player whose data has not changed.
-
--------------------------------------------------------------------------------
-Manual Saves
--------------------------------------------------------------------------------
-
-You can save a session manually when needed.
-
-Example:
-
-local success, err = session:Save()
-
-if not success then
-    warn("Save failed:", err)
-end
-
-Manual saves are useful after particularly important operations.
-
-For example:
-
-- Rare rewards
-- Purchases
-- Trading
-- Prestige
-- Large inventory changes
-
-They should not replace normal autosaving.
-
--------------------------------------------------------------------------------
-Save All
--------------------------------------------------------------------------------
-
-For server-wide operations:
-
-Store:SaveAllAsync()
-
-This can be useful before shutdown or other controlled server lifecycle
-events.
-
--------------------------------------------------------------------------------
-Save Queue
--------------------------------------------------------------------------------
-
-The store uses a queue instead of making every system immediately call
-the Roblox DataStore API.
-
-The general flow is:
-
-+----------------+
-| Dirty Session  |
-+-------+--------+
-        |
-        v
-+----------------+
-| Save Queue     |
-+-------+--------+
-        |
-        v
-+----------------+
-| Budget Check   |
-+-------+--------+
-        |
-        v
-+----------------+
-| Retry Pipeline |
-+-------+--------+
-        |
-        v
-+----------------+
-| UpdateAsync    |
-+----------------+
-
-This keeps DataStore traffic under the control of one system.
-
--------------------------------------------------------------------------------
-Budget Awareness
--------------------------------------------------------------------------------
-
-Roblox DataStore requests have budgets.
-
-If every player is saved at exactly the same time, a server can create
-unnecessary pressure on those budgets.
-
-BudgetAware = true
-
-allows the save pipeline to consider the available request budget before
-performing work.
-
-This becomes more important as the number of players grows.
-
--------------------------------------------------------------------------------
-Retries
--------------------------------------------------------------------------------
-
-Temporary failures happen.
-
-The module can retry operations rather than immediately treating the
-first failure as permanent.
-
-Configuration:
-
-RetryAttempts = 6
-
-A retry sequence should roughly look like:
-
-Attempt
-   |
-   X
-   |
-Backoff
-   |
-Attempt
-   |
-   X
-   |
-Backoff + jitter
-   |
-Attempt
-   |
-   OK
-
-Jitter helps avoid many servers retrying at exactly the same time.
-
--------------------------------------------------------------------------------
-Session Locking
--------------------------------------------------------------------------------
-
-A session represents ownership of a player's data while that player is
-being handled by a server.
-
-This matters when a player leaves one server and joins another quickly.
-
-The module tracks session information so an old server does not simply
-continue treating the player as active forever.
-
-The lock timeout controls when stale ownership can be considered expired.
-
-LockTimeout = 120
-
-Do not make this extremely short. A server that is still legitimately
-running should have enough time to maintain its session.
-
--------------------------------------------------------------------------------
-Session Status
--------------------------------------------------------------------------------
-
-You can inspect a session:
-
-print(session:GetStatus())
-
-You can also check:
-
-if session:IsActive() then
-    print("Session is active")
-end
-
-Other useful information includes:
-
-print(session:GetKey())
-print(session:GetPlayerUserId())
-print(session:GetAge())
-print(session:GetTimeSinceSave())
-print(session:GetMutationCount())
-
--------------------------------------------------------------------------------
-Finding Sessions
--------------------------------------------------------------------------------
-
-Get the current player session:
-
-local session = Store:GetSession(player)
-
-Get a session by its session ID:
-
-local session = Store:GetSessionById(sessionId)
-
-Get all active sessions:
-
-local sessions = Store:GetActiveSessions()
-
-Count them:
-
-local count = Store:CountSessions()
-
-Check whether a player has one:
-
-if Store:HasSession(player) then
-    print("Session exists")
-end
-
--------------------------------------------------------------------------------
-Waiting For a Session
--------------------------------------------------------------------------------
-
-Some systems may start before the player data system has finished loading.
-
-You can wait for the session:
-
 local session, err = Store:WaitForSession(player, 30)
 
 if not session then
-    warn("Session was not ready:", err)
-    return
+	warn("Data unavailable:", err)
+	return
 end
 
-This can be useful for systems that initialize independently.
+print(session.Data.Coins)
+```
 
--------------------------------------------------------------------------------
-Data Diff
--------------------------------------------------------------------------------
+---
 
-The module can compare the current data with the last persisted state.
+## 4. Change data
 
-Example:
+```lua
+session:Add("Coins", 100)
+session:Sub("Coins", 25)
 
-local changes = session:DiffFromPersisted()
+session:Set("Level", 10)
 
-This is useful when debugging things like:
+print(session:Get("Coins"))
+```
 
-    "Why did this player's Coins change?"
+Convenience currency methods are also available:
 
-or:
+```lua
+session:Award("Coins", 250)
 
-    "What did this server change before the last save?"
+local success, err = session:Spend("Coins", 100)
 
--------------------------------------------------------------------------------
-Mutation Journal
--------------------------------------------------------------------------------
-
-The session can keep a record of mutations.
-
-Example:
-
-local journal = session:GetJournal()
-
-for _, mutation in ipairs(journal) do
-    print(mutation)
+if not success then
+	warn("Could not spend coins:", err)
 end
-
-This is primarily useful for debugging and administration.
-
-Do not assume that a large permanent journal should be stored with every
-player. Keeping huge histories inside player data defeats the purpose of
-having compact player data.
-
--------------------------------------------------------------------------------
-Revisions
--------------------------------------------------------------------------------
-
-The session tracks revisions as its data changes.
-
-A simplified example:
-
-Revision 1
-    Coins = 100
-
-Revision 2
-    Coins = 250
-
-Revision 3
-    Coins = 150
-
-Revision tracking can help with:
-
-- Debugging
-- Conflict detection
-- Auditing
-- Rollbacks
-- Data inspection
-
--------------------------------------------------------------------------------
-Buffer Persistence
--------------------------------------------------------------------------------
-
-The persistence layer uses a buffer-oriented storage path.
-
-The basic idea is:
-
-Lua data
-   |
-   v
-Validation
-   |
-   v
-Serialization
-   |
-   v
-Buffer
-   |
-   v
-Persistence envelope
-   |
-   v
-DataStore
-
-The point of this layer is to keep the in-game data representation
-separate from the representation used for storage.
-
-This also leaves room for the storage format to evolve without requiring
-every game system to know how data is encoded.
-
-Do not access the encoded storage representation from gameplay code.
-
-Use:
-
-session.Data
-
-instead.
-
--------------------------------------------------------------------------------
-Data Size
--------------------------------------------------------------------------------
-
-Keep player data reasonably small.
-
-Avoid storing things like:
-
-- Huge chat histories
-- Thousands of unnecessary entries
-- Temporary state
-- Roblox Instances
-- Functions
-- Connections
-- Large debug logs
-- Data that can be regenerated
-
-A player's DataStore profile should contain the information needed to
-restore their progress, not the entire state of the game server.
-
--------------------------------------------------------------------------------
-Events
--------------------------------------------------------------------------------
-
-Events are useful when several systems need to react to the same data
-operation.
-
-Example:
-```lua
-Store:On("DataChanged", function(
-    session,
-    path,
-    oldValue,
-    newValue
-)
-
-    print(
-        session.Player.Name,
-        path,
-        oldValue,
-        newValue
-    )
-
-end)
 ```
-Save failure:
-```lua
-Store:On("SaveFailed", function(session, err)
 
-    warn(
-        "Save failed:",
-        session.Player.Name,
-        err
-    )
+---
 
-end)
+# Recommended Architecture
+
+A larger game should normally have **one place that opens player sessions**.
+
+Other systems should reuse the existing session.
+
+```text
+                    ┌─────────────────────┐
+Player joins ──────►│   NexusDataStore    │
+                    │     Open session    │
+                    └──────────┬──────────┘
+                               │
+                               ▼
+                     ┌───────────────────┐
+                     │   Live Session    │
+                     │   session.Data    │
+                     └─────────┬─────────┘
+                               │
+          ┌────────────────────┼────────────────────┐
+          ▼                    ▼                    ▼
+   Currency System      Inventory System      Quest System
+          │                    │                    │
+          └────────────────────┼────────────────────┘
+                               ▼
+                    Validation / Journal
+                               ▼
+                       Save Queue / Retry
+                               ▼
+                         DataStoreService
 ```
-Session loss:
+
+Do **not** open a separate session from every gameplay system.
+
+---
+
+# Store Creation
+
+Two configuration styles are supported.
+
+## `DataTemplate` style
+
 ```lua
-Store:On("SessionLost", function(session, err)
+local Store = NexusDataStore.new({
+	Name = "PlayersData",
 
-    warn(
-        "Session lost:",
-        session.Player.Name,
-        err
-    )
+	DataTemplate = {
+		Version = 3,
 
-end)
+		Data = {
+			Coins = 0,
+			Level = 1,
+		},
+
+		Strict = true,
+
+		Schema = {
+			Coins = {
+				Type = "number",
+				Integer = true,
+				Min = 0,
+			},
+
+			Level = {
+				Type = "number",
+				Integer = true,
+				Min = 1,
+			},
+		},
+	},
+})
 ```
-Events are a good way to keep systems separate.
 
-For example:
+## Separate template style
 
-Currency system
-       |
-       v
-Session
-       |
-       v
-DataChanged
-   /    |    \
-  v     v     v
-UI   Leaderstats  Analytics
+```lua
+local Store = NexusDataStore.new({
+	Name = "PlayersData",
 
--------------------------------------------------------------------------------
-Store Diagnostics
--------------------------------------------------------------------------------
+	Template = {
+		Coins = 0,
+		Level = 1,
+	},
 
-For debugging:
+	SchemaVersion = 3,
 
-print(Store:GetHealth())
+	Strict = true,
 
-print(Store:GetMetrics())
+	Schema = {
+		Coins = {
+			Type = "number",
+			Integer = true,
+			Min = 0,
+		},
 
-print(Store:DumpDiagnostics())
+		Level = {
+			Type = "number",
+			Integer = true,
+			Min = 1,
+		},
+	},
+})
+```
 
-These are useful when testing the module in Studio or trying to find out
-why saves are taking longer than expected.
+---
 
--------------------------------------------------------------------------------
-Session Diagnostics
--------------------------------------------------------------------------------
+# Player Lifecycle
 
-You can inspect a session:
+## Automatic lifecycle
 
-print(session:GetStatus())
-print(session:GetStats())
+```lua
+Store:AttachPlayerLifecycle()
+Store:BindToClose()
+```
 
-Check whether the session is healthy:
+This is the shortest setup.
 
-if session:IsHealthy() then
-    print("Session looks healthy")
-end
+---
 
--------------------------------------------------------------------------------
-DataTemplate API
--------------------------------------------------------------------------------
+## Manual lifecycle
 
-The store exposes its configured template:
+Use this if you need custom load/release behavior.
 
-local template = Store:GetTemplate()
-
-The returned value should be treated as a copy rather than something to
-mutate directly.
-
-You can also inspect the schema:
-
-local schema = Store:GetSchema()
-
--------------------------------------------------------------------------------
-Schema Version
--------------------------------------------------------------------------------
-
-A store can keep track of the current schema version.
-
-Example:
-
-Store:SetSchemaVersion(3)
-
-The version should correspond to the migration path used by the game.
-
-A typical production setup is:
-
-Version 1
-    |
-    v
-Version 2
-    |
-    v
-Version 3
-    |
-    v
-Current
-
-Avoid skipping migration logic unless the old data is guaranteed not to
-exist.
-
--------------------------------------------------------------------------------
-Player Data Script
--------------------------------------------------------------------------------
-
-A clean project will usually have one script responsible for opening and
-releasing sessions.
-
-Example:
 ```lua
 local Players = game:GetService("Players")
 
-local DataStore = require(script.Parent.NexusDataStore)
-
-local Store = DataStore.new({
-    Name = "PlayersData",
-
-    Template = {
-        Coins = 0,
-        Gems = 0,
-        Level = 1,
-        XP = 0,
-        Inventory = {},
-    },
-
-    AutoSave = true,
-    AutoSaveInterval = 30,
-    LockTimeout = 120,
-    RetryAttempts = 6,
-    BudgetAware = true,
-})
-
 Players.PlayerAdded:Connect(function(player)
+	local session, err = Store:OpenPlayerAsync(player)
 
-    local session, err = Store:OpenPlayerAsync(player)
+	if not session then
+		warn(
+			"[NexusDataStore] load failed:",
+			player.Name,
+			err
+		)
 
-    if not session then
-        warn(
-            "[DataStore] Failed to load:",
-            player.Name,
-            err
-        )
+		player:Kick(
+			"Your data could not be loaded. Please rejoin."
+		)
 
-        player:Kick(
-            "Your data could not be loaded. Please rejoin."
-        )
+		return
+	end
 
-        return
-    end
-
-    print(
-        "[DataStore] Loaded",
-        player.Name,
-        session.Data.Coins
-    )
-
+	print(
+		"[NexusDataStore] loaded:",
+		player.Name
+	)
 end)
 
 Players.PlayerRemoving:Connect(function(player)
+	local session = Store:GetSession(player)
 
-    local session = Store:GetSession(player)
+	if not session then
+		return
+	end
 
-    if not session then
-        return
-    end
+	local success, err = Store:ReleaseAsync(session)
 
-    local success, err = Store:ReleaseAsync(session)
-
-    if not success then
-        warn(
-            "[DataStore] Failed to save:",
-            player.Name,
-            err
-        )
-    end
-
+	if not success then
+		warn(
+			"[NexusDataStore] release failed:",
+			player.Name,
+			err
+		)
+	end
 end)
 
 game:BindToClose(function()
-
-    Store:Close()
-
+	Store:Close()
 end)
 ```
--------------------------------------------------------------------------------
-Inventory Example
--------------------------------------------------------------------------------
 
-An inventory system should work with the player's existing session.
+---
 
-Example:
+# Sessions
+
+A session is the live source of truth for one player while that profile is owned by the current server.
+
 ```lua
-local function GiveItem(player, itemId, amount)
+local session = Store:GetSession(player)
 
-    local session = Store:GetSession(player)
-
-    if not session then
-        return false, "NO_SESSION"
-    end
-
-    amount = amount or 1
-
-    return session:Transaction(function(tx)
-
-        tx:Insert("Inventory", {
-            Id = itemId,
-            Quantity = amount,
-        })
-
-    end)
-
+if session and session:IsActive() then
+	print(session.Data)
 end
 ```
-The important part is that GiveItem does not open another session.
 
--------------------------------------------------------------------------------
-Currency Example
--------------------------------------------------------------------------------
+Important session fields include:
+
+```text
+Store
+Player
+Key
+Data
+Revision
+SchemaVersion
+SessionId
+Active
+Dirty
+```
+
+Use:
+
 ```lua
-local function GiveCoins(player, amount)
-
-    local session = Store:GetSession(player)
-
-    if not session then
-        return false, "NO_SESSION"
-    end
-
-    if amount <= 0 then
-        return false, "INVALID_AMOUNT"
-    end
-
-    return Store:Increment(
-        session,
-        "Coins",
-        amount
-    )
-
-end
+session:IsActive()
 ```
--------------------------------------------------------------------------------
-Trading Example
--------------------------------------------------------------------------------
 
-Trading is one of the areas where session-based data is particularly
-useful.
+before work that must only happen on an owned session.
 
-A trade should generally involve the sessions of both players.
+---
 
-Conceptually:
+# Paths
 
-Player A Session
-       |
-       | remove item
-       v
-Trade Transaction
-       ^
-       | add item
-       |
-Player B Session
+Most mutation APIs accept a path.
 
-Before committing a trade, check:
+A path can be:
 
-- Both sessions are active
-- Both players still own the items
-- Quantities are valid
-- The trade has not expired
-- The players are still allowed to trade
-
-Do not trust the client to tell the server which items it owns.
-
--------------------------------------------------------------------------------
-Purchases
--------------------------------------------------------------------------------
-
-For purchases that change persistent data:
-
-1. Validate the request on the server.
-2. Validate the player's current data.
-3. Perform the mutation.
-4. Mark the session dirty.
-5. Let the normal save system handle persistence.
-6. Use a priority/manual save when the operation warrants it.
-
-Do not use the client as the source of truth for currency or inventory.
-
--------------------------------------------------------------------------------
-What Should Go In Player Data?
--------------------------------------------------------------------------------
-
-Good candidates:
-
-- Currency
-- Level
-- XP
-- Inventory
-- Unlocks
-- Settings
-- Quest progress
-- Permanent statistics
-- Purchased content
-- Achievement state
-
-Bad candidates:
-
-- Instances
-- Parts
-- Connections
-- Temporary effects
-- Current combat targets
-- Render state
-- Server-only objects
-- Large logs
-- Cached objects that can be rebuilt
-
-If something can be recreated when the player joins, it probably does not
-need to live in the persistent profile.
-
--------------------------------------------------------------------------------
-What Not To Do
--------------------------------------------------------------------------------
-
-Do not do this:
 ```lua
-local DataStoreService = game:GetService("DataStoreService")
-
-local Store = DataStoreService:GetDataStore("Players")
-
-Players.PlayerAdded:Connect(function(player)
-
-    local data = Store:GetAsync(player.UserId)
-
-    -- game code
-
-    Store:SetAsync(player.UserId, data)
-
-end)
+"Coins"
 ```
-That approach leaves every system responsible for its own loading,
-saving, error handling, and shutdown behavior.
 
-Do not do this either:
+or:
+
 ```lua
-Players.PlayerAdded:Connect(function(player)
-
-    local session = Store:OpenPlayerAsync(player)
-
-    -- later another system:
-    local otherSession = Store:OpenPlayerAsync(player)
-
-end)
-```
-There should be one active session.
-
--------------------------------------------------------------------------------
-Recommended Game Structure
--------------------------------------------------------------------------------
-
-For a larger game, something like this works well:
-
-ServerScriptService
-|
-+-- Data
-|   |
-|   +-- NexusDataStore.lua
-|   +-- PlayerData.server.lua
-|
-+-- Systems
-|   |
-|   +-- Currency.lua
-|   +-- Inventory.lua
-|   +-- Quests.lua
-|   +-- Trading.lua
-|   +-- Rewards.lua
-|   +-- Settings.lua
-|
-+-- Services
-    |
-    +-- MatchService.lua
-    +-- ShopService.lua
-    +-- QuestService.lua
-
-PlayerData.server.lua owns the session lifecycle.
-
-Other systems use the active session.
-
--------------------------------------------------------------------------------
-Lifecycle
--------------------------------------------------------------------------------
-
-The full player lifecycle is roughly:
-
-```mermaid
-sequenceDiagram
-    participant P as Player
-    participant S as NexusDataStore
-    participant D as Roblox DataStore
-
-    P->>S: Join
-    S->>D: Load / UpdateAsync
-    D-->>S: Stored Data
-    S-->>P: Session Ready
-
-    loop During Session
-        P->>S: Gameplay changes
-        S->>S: Mark dirty
-        S->>S: Queue save
-    end
-
-    P->>S: Leave
-    S->>D: Final save
-    D-->>S: Success
-    S->>S: Release session
+{"Stats", "Level"}
 ```
 
-The session exists between loading and releasing.
+or include numeric indexes:
 
--------------------------------------------------------------------------------
-Error Handling
--------------------------------------------------------------------------------
-
-Always check the result of important operations.
+```lua
+{"Inventory", 1, "Quantity"}
+```
 
 Example:
+
 ```lua
-local success, err = Store:Increment(
-    session,
-    "Coins",
-    100
+session:Set(
+	{"Settings", "Music"},
+	false
 )
 
-if not success then
-    warn("Could not change coins:", err)
+local musicEnabled = session:Get(
+	{"Settings", "Music"}
+)
+```
+
+---
+
+# Reading Data
+
+## Read through the session
+
+```lua
+local coins = session:Get("Coins")
+```
+
+`Get()` returns a cloned value.
+
+Check existence:
+
+```lua
+if session:Has("Coins") then
+	print("Coins exists")
 end
 ```
-Likewise for loading:
+
+Fallback value:
+
 ```lua
-local session, err = Store:OpenPlayerAsync(player)
+local title = session:GetOr(
+	"Title",
+	"Rookie"
+)
+```
+
+---
+
+## Read through the store
+
+```lua
+local coins, err = Store:Read(
+	player,
+	"Coins"
+)
+```
+
+The store helper accepts either a `Player` or a session object.
+
+---
+
+## Get the entire profile
+
+```lua
+local data, err = Store:GetData(player)
+```
+
+By default this returns a copy.
+
+To request the live table:
+
+```lua
+local liveData, err = Store:GetData(
+	player,
+	false
+)
+```
+
+Treat the live table carefully.
+
+---
+
+# Mutating Data
+
+Tracked mutation methods should be your default choice.
+
+## Set
+
+```lua
+local success, err = session:Set(
+	"Coins",
+	500
+)
+```
+
+---
+
+## Increment
+
+```lua
+session:Increment(
+	"Coins",
+	100
+)
+```
+
+Alias:
+
+```lua
+session:Add(
+	"Coins",
+	100
+)
+```
+
+Subtract:
+
+```lua
+session:Sub(
+	"Coins",
+	50
+)
+```
+
+---
+
+## Increment with limits
+
+```lua
+session:IncrementClamped(
+	"Level",
+	1,
+	1,
+	100
+)
+```
+
+---
+
+## Delete
+
+```lua
+session:Delete("TemporaryFlag")
+```
+
+---
+
+## Insert
+
+```lua
+session:Insert(
+	"Inventory",
+	{
+		Id = "Potion",
+		Quantity = 1,
+	}
+)
+```
+
+Alias:
+
+```lua
+session:Append(
+	"Inventory",
+	item
+)
+```
+
+---
+
+## Remove array entry
+
+```lua
+session:RemoveAt(
+	"Inventory",
+	2
+)
+```
+
+---
+
+## Toggle boolean
+
+```lua
+session:Toggle(
+	{"Settings", "Music"}
+)
+```
+
+---
+
+# Direct `session.Data` Changes
+
+v6.2.1 enables direct-change detection by default:
+
+```lua
+DetectDirectChanges = true
+```
+
+This means code such as:
+
+```lua
+session.Data.Coins += 100
+```
+
+can be detected when NexusDataStore checks the session.
+
+When a valid direct change is found, NexusDataStore can:
+
+- mark the session dirty;
+- add a journal entry;
+- increment the mutation counter;
+- emit `DirectMutationDetected`;
+- emit `DataChanged` for discovered differences.
+
+If the direct edit produces invalid data, the module restores the previously observed snapshot and emits `DirectMutationRejected`.
+
+Tracked methods such as:
+
+```lua
+session:Set(...)
+session:Increment(...)
+session:Transaction(...)
+```
+
+are still recommended because they validate and record intent immediately.
+
+---
+
+# Transactions
+
+Transactions are designed for changes that should succeed or fail together.
+
+Example purchase:
+
+```lua
+local success, result = session:Transaction(function(tx)
+	tx:Require(
+		"Coins",
+		function(coins)
+			return coins >= 500
+		end
+	)
+
+	tx:Increment(
+		"Coins",
+		-500
+	)
+
+	tx:Insert(
+		"Inventory",
+		{
+			Id = "Sword",
+			Quantity = 1,
+		}
+	)
+end)
+
+if not success then
+	warn("Purchase failed:", result)
+end
+```
+
+The live session is not replaced until the transaction callback succeeds and the resulting data passes validation.
+
+---
+
+## Reject a transaction
+
+Returning `false` rolls the transaction back:
+
+```lua
+local success, err = session:Transaction(function(tx)
+	if not canPurchase then
+		return false
+	end
+
+	tx:Increment("Coins", -100)
+end)
+```
+
+Errors thrown inside the callback also roll the transaction back.
+
+---
+
+## Transaction helpers
+
+```lua
+tx:Get(path)
+
+tx:Set(path, value)
+tx:Delete(path)
+
+tx:Increment(path, amount)
+tx:IncrementClamped(path, amount, minimum, maximum)
+
+tx:Insert(path, value)
+tx:RemoveAt(path, index)
+
+tx:Require(path, expectedOrPredicate)
+tx:CompareAndSet(path, expected, value)
+
+tx:Savepoint(name)
+tx:RollbackTo(name)
+
+tx:Diff()
+tx:Validate()
+
+tx:Commit()
+tx:Rollback()
+```
+
+For normal usage, let `session:Transaction()` handle final commit/rollback behavior.
+
+---
+
+# Patches
+
+You can apply a list of mutations through one transaction.
+
+```lua
+local success, err = session:Patch({
+	{
+		Op = "Increment",
+		Path = "Coins",
+		Amount = 100,
+	},
+
+	{
+		Op = "Set",
+		Path = {"Settings", "Music"},
+		Value = false,
+	},
+
+	{
+		Op = "Insert",
+		Path = "Inventory",
+		Value = {
+			Id = "Potion",
+			Quantity = 1,
+		},
+	},
+})
+```
+
+Supported patch operations include:
+
+```text
+Set
+Replace
+Add
+Delete
+Remove
+Increment
+Insert
+```
+
+---
+
+# Snapshots
+
+Snapshots are in-memory rollback points owned by the store.
+
+Create one:
+
+```lua
+local snapshot = session:Snapshot(
+	"BeforeTrade"
+)
+```
+
+Restore it:
+
+```lua
+local success, err = session:Restore(
+	snapshot
+)
+```
+
+You can also use the store API:
+
+```lua
+local snapshot = Store:CreateSnapshot(
+	session,
+	"BeforeTrade"
+)
+
+local snapshots = Store:GetSnapshots(
+	session
+)
+
+Store:RestoreSnapshot(
+	session,
+	snapshot
+)
+```
+
+The number kept per session is limited by:
+
+```lua
+MaxSnapshots = 10
+```
+
+Snapshots are runtime tools, not permanent off-site backups.
+
+---
+
+# Data Diffing
+
+Compare current data against another table:
+
+```lua
+local changes = session:Diff(otherData)
+```
+
+Compare current data against the last persisted snapshot:
+
+```lua
+local changes = session:DiffFromPersisted()
+```
+
+A change entry contains information such as:
+
+```text
+Path
+Before
+After
+Operation
+```
+
+This is useful for diagnostics, administration, and auditing game-side changes.
+
+---
+
+# Mutation Journal
+
+Tracked mutations are stored in the session journal.
+
+```lua
+local journal = session:GetJournal()
+
+for _, entry in ipairs(journal) do
+	print(
+		entry.Id,
+		entry.Operation,
+		entry.Path
+	)
+end
+```
+
+Clear it:
+
+```lua
+session:ClearJournal()
+```
+
+Journal size is bounded by:
+
+```lua
+MaxJournalEntries = 1000
+```
+
+The journal is primarily an in-memory diagnostic feature. Avoid turning player profiles into permanent giant debug logs.
+
+---
+
+# Schema Validation
+
+Schemas define what valid player data is allowed to contain.
+
+Example:
+
+```lua
+Schema = {
+	Coins = {
+		Type = "number",
+		Required = true,
+		Integer = true,
+		Min = 0,
+	},
+
+	Name = {
+		Type = "string",
+		Required = true,
+		MinLength = 1,
+		MaxLength = 32,
+	},
+
+	Class = {
+		Type = "string",
+
+		Enum = {
+			"Warrior",
+			"Mage",
+			"Rogue",
+		},
+
+		Encoding = "Enum",
+
+		Values = {
+			"Warrior",
+			"Mage",
+			"Rogue",
+		},
+	},
+
+	Inventory = {
+		Type = "table",
+
+		ArrayOf = {
+			Type = "table",
+
+			Children = {
+				Id = {
+					Type = "string",
+				},
+
+				Quantity = {
+					Type = "number",
+					Integer = true,
+					Min = 1,
+				},
+			},
+		},
+	},
+}
+```
+
+---
+
+## Schema rule fields
+
+v6.2.1 supports schema-rule fields including:
+
+```text
+Type
+Required
+Integer
+Min
+Max
+MinLength
+MaxLength
+Bits
+Encoding
+Values
+Enum
+Children
+ArrayOf
+AllowUnknown
+OmitDefault
+Optional
+Validate
+```
+
+Custom validator:
+
+```lua
+Coins = {
+	Type = "number",
+	Integer = true,
+	Min = 0,
+
+	Validate = function(value, path)
+		if value > 1_000_000_000 then
+			return "currency exceeds game limit"
+		end
+
+		return true
+	end,
+}
+```
+
+A validator can return:
+
+```text
+true
+false
+"custom error text"
+```
+
+---
+
+# Strict Mode
+
+Enable:
+
+```lua
+Strict = true
+```
+
+or inside `DataTemplate`:
+
+```lua
+DataTemplate = {
+	Strict = true,
+	Data = {...},
+	Schema = {...},
+}
+```
+
+Strict mode rejects fields that are not defined by the schema where unknown fields are not allowed.
+
+Use strict schemas for important production profiles where accidental fields should be caught early.
+
+---
+
+# Template vs Schema
+
+They solve different problems.
+
+**Template**
+
+> What should a new player's profile contain?
+
+**Schema**
+
+> What profile values are valid?
+
+Example:
+
+```lua
+Data = {
+	Coins = 0,
+	Level = 1,
+}
+
+Schema = {
+	Coins = {
+		Type = "number",
+		Integer = true,
+		Min = 0,
+	},
+
+	Level = {
+		Type = "number",
+		Integer = true,
+		Min = 1,
+	},
+}
+```
+
+---
+
+# Compression
+
+Compression is enabled by default:
+
+```lua
+Compression = true
+```
+
+NexusDataStore v6.2.1 builds a schema-aware compressed persistence format from your template and schema.
+
+This means your in-game data remains normal Luau data:
+
+```lua
+session.Data
+```
+
+while the persistence layer can store an encoded buffer.
+
+You should not build gameplay logic around the internal buffer layout.
+
+---
+
+## Common compression encodings
+
+Schemas can explicitly choose an encoding:
+
+```lua
+Coins = {
+	Type = "number",
+	Integer = true,
+	Min = 0,
+	Encoding = "VarUInt",
+}
+```
+
+Supported encoding names include forms of:
+
+| Encoding | Typical use |
+|---|---|
+| `Bit` / `Bool` / `Boolean` | Booleans |
+| `VarUInt` / `UInt` | Non-negative integers |
+| `VarInt` / `SInt` / `ZigZag` | Signed integers |
+| `UIntRange` / `Range` | Integer bounded by `Min` / `Max` |
+| `Float32` | 32-bit floating point |
+| `Float64` / `Number` | 64-bit floating point |
+| `Quantized` / `QuantizedFloat` | Bounded lossy float |
+| `Enum` | One value from a known list |
+| `String` / `RawString` | UTF-8 strings |
+| `Array` | Dense arrays |
+| `Map` | Tables/maps |
+
+If no encoding is supplied, NexusDataStore chooses an encoding from the rule and default value.
+
+---
+
+## Range encoding
+
+For a value with a known range:
+
+```lua
+Level = {
+	Type = "number",
+	Integer = true,
+	Min = 1,
+	Max = 100,
+	Encoding = "UIntRange",
+}
+```
+
+The codec can use only enough bits to represent that range.
+
+---
+
+## Explicit bit width
+
+```lua
+Level = {
+	Type = "number",
+	Integer = true,
+	Min = 0,
+	Max = 255,
+	Encoding = "UIntRange",
+	Bits = 8,
+}
+```
+
+`Bits` must still be large enough to represent the configured range.
+
+---
+
+## Quantized values
+
+```lua
+Volume = {
+	Type = "number",
+	Min = 0,
+	Max = 1,
+	Encoding = "Quantized",
+	Bits = 8,
+}
+```
+
+Quantization trades precision for a smaller bounded representation.
+
+Only use it where small precision loss is acceptable.
+
+---
+
+## Enum encoding
+
+```lua
+Class = {
+	Type = "string",
+
+	Encoding = "Enum",
+
+	Values = {
+		"Warrior",
+		"Mage",
+		"Rogue",
+	},
+}
+```
+
+---
+
+## Omit defaults
+
+For fields that often remain at their default:
+
+```lua
+Rebirths = {
+	Type = "number",
+	Integer = true,
+	Min = 0,
+	Encoding = "VarUInt",
+	OmitDefault = true,
+}
+```
+
+The codec can store a compact marker instead of the full field value when it matches the template default.
+
+---
+
+## Optional values
+
+```lua
+Title = {
+	Type = "string",
+	Required = false,
+	Optional = true,
+}
+```
+
+Optional fields include presence information in the compressed representation.
+
+---
+
+# Compression Reports
+
+You can measure a profile without saving it.
+
+```lua
+local report, err = Store:GetCompressionReport(
+	session
+)
+
+if not report then
+	warn(err)
+	return
+end
+
+print("Raw bytes:", report.RawBytes)
+print("Encoded bytes:", report.EncodedBytes)
+print("Saved bytes:", report.SavedBytes)
+print("Savings:", report.SavingsPercent)
+print("Ratio:", report.Ratio)
+```
+
+Reports include:
+
+```text
+RawBytes
+RawBits
+EncodedBytes
+EncodedBits
+PayloadBytes
+PayloadBits
+HeaderBytes
+SavedBytes
+SavedBits
+Ratio
+SavingsPercent
+Fields
+```
+
+---
+
+## Print a compression report
+
+```lua
+Store:PrintCompressionReport(session)
+```
+
+---
+
+## Measure key usage
+
+```lua
+local measurement, err =
+	Store:MeasureCompressedData(session.Data)
+
+if measurement then
+	print(
+		"Record bytes:",
+		measurement.RecordBytes
+	)
+
+	print(
+		"Remaining bytes:",
+		measurement.RemainingBytes
+	)
+
+	print(
+		"Percent of key limit:",
+		measurement.PercentOfKeyLimit
+	)
+end
+```
+
+---
+
+## Encode / decode manually
+
+For tooling or tests:
+
+```lua
+local encoded, err = Store:EncodeCompressed(
+	session.Data
+)
+
+if encoded then
+	local decoded, record =
+		Store:DecodeCompressed(encoded)
+end
+```
+
+Do not normally use these methods for gameplay persistence. The store already handles encoding internally.
+
+---
+
+# Compression History
+
+Changing a compression schema can make older compressed records impossible to interpret unless the old schema is still known.
+
+`CompressionHistory` lets v6.2.1 keep older schema definitions available for decoding.
+
+Example:
+
+```lua
+local Store = NexusDataStore.new({
+	Name = "PlayersData",
+
+	DataTemplate = {
+		Version = 3,
+		Data = CurrentTemplate,
+		Schema = CurrentSchema,
+		Strict = true,
+	},
+
+	CompressionHistory = {
+		[1] = {
+			Data = Version1Template,
+			Schema = Version1Schema,
+			Strict = true,
+		},
+
+		[2] = {
+			Data = Version2Template,
+			Schema = Version2Schema,
+			Strict = true,
+		},
+	},
+})
+```
+
+Keep historical compression definitions for old schema versions that may still exist in production.
+
+---
+
+# Migrations
+
+Schema versions and migrations let data evolve safely.
+
+Example:
+
+```lua
+local Store = NexusDataStore.new({
+	Name = "PlayersData",
+
+	DataTemplate = {
+		Version = 3,
+
+		Data = {
+			Coins = 0,
+			Gems = 0,
+
+			Stats = {
+				Level = 1,
+				XP = 0,
+			},
+		},
+	},
+
+	Migrations = {
+		[2] = function(data, context)
+			data.Gems = data.Gems or 0
+			return data
+		end,
+
+		[3] = function(data, context)
+			data.Stats = data.Stats or {
+				Level = 1,
+				XP = 0,
+			}
+
+			return data
+		end,
+	},
+})
+```
+
+The migration map is indexed by the target version.
+
+Keep migrations that may still be needed by old live data.
+
+---
+
+# Saving
+
+## Autosave
+
+Enabled by default:
+
+```lua
+AutoSave = true
+AutoSaveInterval = 30
+```
+
+Only dirty sessions need to be queued for autosave.
+
+---
+
+## Manual save
+
+```lua
+local success, err = session:Save()
+
+if not success then
+	warn("Save failed:", err)
+end
+```
+
+Store equivalent:
+
+```lua
+Store:Save(
+	player,
+	"high"
+)
+```
+
+---
+
+## Save priorities
+
+Supported names:
+
+```text
+low
+normal
+high
+critical
+```
+
+Example:
+
+```lua
+session:Save("critical")
+```
+
+Internally, queued saves can be promoted when a higher priority request arrives for the same profile.
+
+---
+
+## When to manually save
+
+Useful cases include:
+
+- expensive purchases;
+- rare rewards;
+- prestige/rebirth;
+- major inventory operations;
+- admin edits;
+- important progression checkpoints.
+
+Do not manually save every small mutation.
+
+Autosave should still handle normal persistence.
+
+---
+
+# Save Queue
+
+The save pipeline centralizes persistence work:
+
+```text
+Dirty Session
+     │
+     ▼
+Priority Save Queue
+     │
+     ▼
+Budget Check
+     │
+     ▼
+Retry Pipeline
+     │
+     ▼
+UpdateAsync
+     │
+     ▼
+Revision / Dirty State Update
+```
+
+This keeps gameplay systems from racing each other with independent `UpdateAsync()` calls.
+
+---
+
+# Budget Awareness
+
+Enabled by default:
+
+```lua
+BudgetAware = true
+```
+
+The store considers:
+
+```lua
+DataStoreService:GetRequestBudgetForRequestType(
+	Enum.DataStoreRequestType.UpdateAsync
+)
+```
+
+before performing budget-sensitive work.
+
+Default budget wait timeout:
+
+```lua
+BudgetWaitTimeout = 10
+```
+
+---
+
+# Retry Handling
+
+Defaults:
+
+```lua
+RetryAttempts = 6
+RetryBaseDelay = 0.5
+RetryMaxDelay = 10
+```
+
+Transient failures such as throttling and temporary service errors can be retried instead of being treated as immediately permanent.
+
+---
+
+# Session Locking
+
+When a player profile is opened, the record includes session ownership information.
+
+A second server cannot simply take a non-expired session.
+
+Default lock timeout:
+
+```lua
+LockTimeout = 120
+```
+
+The default heartbeat interval is derived from the lock timeout and is clamped to at least 15 seconds.
+
+With the default lock timeout, this resolves to approximately:
+
+```text
+40 seconds
+```
+
+---
+
+## Stale session recovery
+
+When stored ownership has expired, NexusDataStore can recover it and emits:
+
+```text
+StaleSessionRecovered
+```
+
+Do not set lock timeouts extremely low. Legitimate servers need time to maintain ownership.
+
+---
+
+# Heartbeats
+
+Active sessions periodically refresh ownership when required.
+
+Related events include:
+
+```text
+SessionHeartbeat
+HeartbeatDeferred
+HeartbeatFailed
+SessionLost
+```
+
+If ownership is lost, the session is no longer safe to use as an active profile.
+
+---
+
+# Session Lookup
+
+Get a session:
+
+```lua
+local session = Store:GetSession(player)
+```
+
+Alias:
+
+```lua
+local session = Store:Get(player)
+```
+
+Wait:
+
+```lua
+local session, err = Store:WaitForSession(
+	player,
+	30
+)
+```
+
+Alias:
+
+```lua
+local session, err = Store:Wait(
+	player,
+	30
+)
+```
+
+Find by session ID:
+
+```lua
+local session = Store:GetSessionById(
+	sessionId
+)
+```
+
+Get all active sessions:
+
+```lua
+local sessions =
+	Store:GetActiveSessions()
+```
+
+Count:
+
+```lua
+local count =
+	Store:CountSessions()
+```
+
+---
+
+# Value Bindings
+
+NexusDataStore can bind a session path to a Roblox `ValueBase`.
+
+Example:
+
+```lua
+local leaderstats = Instance.new("Folder")
+leaderstats.Name = "leaderstats"
+leaderstats.Parent = player
+
+local coins = Instance.new("IntValue")
+coins.Name = "Coins"
+coins.Parent = leaderstats
+
+local binding = session:BindValue(
+	"Coins",
+	coins
+)
+```
+
+The binding initially pushes the session value into the `ValueBase`.
+
+By default it is two-way.
+
+Disable ValueBase -> session writes:
+
+```lua
+local binding = session:BindValue(
+	"Coins",
+	coins,
+	{
+		TwoWay = false,
+	}
+)
+```
+
+Destroy a binding manually:
+
+```lua
+binding:Destroy()
+```
+
+Session-scoped bindings are also cleaned up with the session.
+
+---
+
+# Events
+
+Listen with:
+
+```lua
+local connection = Store:On(
+	"DataChanged",
+	function(
+		session,
+		path,
+		oldValue,
+		newValue,
+		entry
+	)
+		print(
+			session.Player.Name,
+			path,
+			oldValue,
+			newValue
+		)
+	end
+)
+```
+
+One-time listener:
+
+```lua
+Store:Once(
+	"SessionOpened",
+	function(session)
+		print(
+			"Opened:",
+			session.Player.Name
+		)
+	end
+)
+```
+
+Disconnect:
+
+```lua
+connection:Disconnect()
+```
+
+---
+
+## Store event names
+
+v6.2.1 emits events including:
+
+```text
+BindingRejected
+CompressionReport
+CrossServer
+DataChanged
+DirectMutationDetected
+DirectMutationRejected
+HeartbeatDeferred
+HeartbeatFailed
+MigrationCompleted
+MigrationStarted
+PlayerLoadFailed
+PlayerLoaded
+SaveCompleted
+SaveFailed
+SaveQueued
+SaveStarted
+SessionAborted
+SessionHeartbeat
+SessionLost
+SessionOpened
+SessionReleased
+ShutdownStarted
+SnapshotCreated
+SnapshotRestored
+StaleSessionRecovered
+TransactionCommitted
+TransactionRolledBack
+TransactionStarted
+UpdateFailed
+```
+
+Use events to keep systems decoupled.
+
+For example:
+
+```text
+DataChanged
+    ├── Leaderstats
+    ├── UI replication
+    ├── Achievement checks
+    └── Analytics
+```
+
+---
+
+# Cross-Server Messages
+
+Cross-server support is optional.
+
+Enable it:
+
+```lua
+local Store = NexusDataStore.new({
+	Name = "PlayersData",
+
+	Template = {
+		Coins = 0,
+	},
+
+	EnableCrossServer = true,
+})
+```
+
+Default topic:
+
+```text
+NexusDataStore:<StoreName>
+```
+
+Override:
+
+```lua
+CrossServerTopic = "MyGame:PlayerData"
+```
+
+Publish:
+
+```lua
+local success, err = Store:Publish(
+	"GlobalRefresh",
+	{
+		UserId = player.UserId,
+	}
+)
+```
+
+Incoming messages are exposed through the `CrossServer` store event.
+
+This uses `MessagingService`; it is not a replacement for persistent storage.
+
+---
+
+# Diagnostics
+
+## Store health
+
+```lua
+local health = Store:GetHealth()
+
+print("Version:", health.Version)
+print("Active:", health.ActiveSessions)
+print("Dirty:", health.DirtySessions)
+print("Queued:", health.QueuedSaves)
+print("Budget:", health.UpdateBudget)
+```
+
+Health contains:
+
+```text
+Version
+Closed
+Closing
+JobId
+ActiveSessions
+DirtySessions
+QueuedSaves
+UpdateBudget
+Metrics
+```
+
+---
+
+## Metrics
+
+```lua
+local metrics = Store:GetMetrics()
+
+print(metrics.Opened)
+print(metrics.Saved)
+print(metrics.SaveFailed)
+print(metrics.Retries)
+print(metrics.Mutations)
+print(metrics.Transactions)
+print(metrics.Rollbacks)
+print(metrics.ActiveSessions)
+print(metrics.QueuedSaves)
+```
+
+Metrics include counters for:
+
+```text
+Opened
+Released
+LoadsFailed
+Saved
+SaveFailed
+Retries
+Mutations
+Transactions
+Rollbacks
+Heartbeats
+LocksRecovered
+SessionLost
+TypeErrors
+BytesEncoded
+LoadTime
+SaveTime
+ActiveSessions
+QueuedSaves
+SaveWorkerRunning
+AverageLoadTime
+AverageSaveTime
+```
+
+---
+
+## Session status
+
+```lua
+local status = session:GetStatus()
+
+print(status.Active)
+print(status.Revision)
+print(status.Dirty)
+print(status.JournalSize)
+print(status.LastSaveAge)
+```
+
+Session status includes information such as:
+
+```text
+Exists
+Active
+Key
+SessionId
+Revision
+SchemaVersion
+Dirty
+MutationId
+Age
+LastTouchedAge
+LastSaveAge
+LastHeartbeatAge
+LastSaveError
+JournalSize
+Bindings
+```
+
+---
+
+## Data stats
+
+```lua
+local stats = session:GetStats()
+
+print("Valid:", stats.Valid)
+print("Bytes:", stats.Bytes)
+print("Nodes:", stats.Nodes)
+print("Revision:", stats.Revision)
+```
+
+---
+
+# Validation
+
+Validate arbitrary data using the current store rules:
+
+```lua
+local valid, err, details =
+	Store:Validate(data)
+
+if not valid then
+	warn(err)
+end
+```
+
+The module also validates:
+
+- node count;
+- encoded-size estimate;
+- schema requirements;
+- custom rules.
+
+---
+
+# Persistent Value Types
+
+The generic persistence layer supports:
+
+- `nil`;
+- booleans;
+- finite numbers;
+- valid UTF-8 strings;
+- dense arrays;
+- map-like tables;
+- string and number table keys.
+
+Avoid storing unsupported runtime objects such as:
+
+- Roblox Instances;
+- functions;
+- threads;
+- connections;
+- userdata that is not explicitly serialized by your own layer;
+- circular tables.
+
+Keep persistent data focused on information required to restore progression.
+
+---
+
+# Configuration Reference
+
+| Option | Default | Description |
+|---|---:|---|
+| `Name` | required | Roblox DataStore name |
+| `Scope` | `"Global"` | DataStore scope |
+| `Template` | — | Default profile table |
+| `Schema` | `nil` | Validation/compression schema |
+| `Strict` | `false` | Strict schema handling |
+| `DataTemplate` | `nil` | Combined version/data/schema definition |
+| `SchemaVersion` | `1` | Current data schema version |
+| `Migrations` | `{}` | Version migration callbacks |
+| `Compression` | `true` | Use compressed persistence |
+| `CompressionReports` | `false` | Emit compression reports during encoding |
+| `CompressionHistory` | `{}` | Historical compression schemas |
+| `AutoSave` | `true` | Enable automatic saving |
+| `AutoSaveInterval` | `30` | Autosave interval; minimum 10 |
+| `LockTimeout` | `120` | Session lock timeout; minimum 45 |
+| `HeartbeatInterval` | `LockTimeout / 3` | Heartbeat interval; minimum 15 |
+| `RetryAttempts` | `6` | Retry count |
+| `RetryBaseDelay` | `0.5` | Initial retry delay |
+| `RetryMaxDelay` | `10` | Maximum retry delay |
+| `BudgetAware` | `true` | Respect DataStore request budget |
+| `BudgetWaitTimeout` | `10` | Maximum budget wait |
+| `MinimumSaveInterval` | `3` | Minimum save spacing |
+| `MaxDataNodes` | `50000` | Maximum validated data-node count |
+| `MaxDataBytes` | `3900000` | Maximum estimated encoded data size |
+| `MaxJournalEntries` | `1000` | Mutation journal cap |
+| `MaxSnapshots` | `10` | Snapshot cap per profile |
+| `LoadTimeout` | `30` | Load timeout setting |
+| `SaveTimeout` | `30` | Manual save wait timeout |
+| `EnableCrossServer` | `false` | Enable MessagingService integration |
+| `CrossServerTopic` | `"NexusDataStore:<Name>"` | MessagingService topic |
+| `DetectDirectChanges` | `true` | Detect supported direct session table edits |
+| `Debug` | `false` | Debug logging |
+
+---
+
+# Store API Reference
+
+## Construction
+
+```lua
+NexusDataStore.new(config)
+```
+
+---
+
+## Session lifecycle
+
+```lua
+Store:OpenPlayerAsync(player)
+Store:Open(player)
+
+Store:GetSession(player)
+Store:Get(player)
+
+Store:GetSessionById(sessionId)
+Store:GetActiveSessions()
+Store:CountSessions()
+
+Store:WaitForSession(player, timeout)
+Store:Wait(player, timeout)
+
+Store:ReleaseAsync(session)
+Store:Release(playerOrSession)
+
+Store:AbortSession(session, {
+	Confirmed = true,
+})
+
+Store:ReleaseAllAsync()
+```
+
+`AbortSession` intentionally requires:
+
+```lua
+Confirmed = true
+```
+
+because it releases ownership without normal session save semantics.
+
+---
+
+## Data access
+
+```lua
+Store:Read(playerOrSession, path)
+Store:Write(playerOrSession, path, value)
+
+Store:GetData(playerOrSession, copy?)
+
+Store:Set(session, path, value)
+Store:Delete(session, path)
+Store:Increment(session, path, amount?)
+Store:IncrementClamped(session, path, amount, minimum?, maximum?)
+Store:Insert(session, path, value)
+Store:RemoveAt(session, path, index)
+Store:Update(session, callback)
+Store:Transaction(session, callback)
+Store:Patch(session, patches)
+```
+
+Convenience:
+
+```lua
+Store:Add(playerOrSession, path, amount?)
+Store:Sub(playerOrSession, path, amount?)
+Store:Mutate(playerOrSession, callback)
+```
+
+---
+
+## Saving
+
+```lua
+Store:SaveAsync(session, priority?)
+Store:Save(playerOrSession, priority?)
+
+Store:FlushAsync(timeout?)
+Store:ReleaseAllAsync()
+
+Store:Close()
+```
+
+---
+
+## Snapshots
+
+```lua
+Store:CreateSnapshot(session, label?)
+Store:GetSnapshots(session)
+Store:RestoreSnapshot(session, snapshot)
+```
+
+---
+
+## Validation / metadata
+
+```lua
+Store:Validate(data)
+
+Store:GetTemplate()
+Store:GetSchema()
+Store:GetVersion()
+
+Store:GetSessionStatus(session)
+Store:GetDataStats(session)
+
+Store:GetMetrics()
+Store:GetHealth()
+```
+
+---
+
+## Compression
+
+```lua
+Store:GetCompressionSchema()
+
+Store:EncodeCompressed(data)
+Store:DecodeCompressed(buffer)
+
+Store:GetCompressionReport(dataOrSession)
+Store:PrintCompressionReport(dataOrSession)
+Store:MeasureCompressedData(data)
+```
+
+The module also exposes:
+
+```lua
+NexusDataStore.Compression.Version
+NexusDataStore.Compression.BuildSchema
+NexusDataStore.Compression.BitWriter
+NexusDataStore.Compression.BitReader
+```
+
+These are lower-level codec tools.
+
+---
+
+## Lifecycle / events / cross-server
+
+```lua
+Store:On(eventName, callback)
+Store:Once(eventName, callback)
+
+Store:AttachPlayerLifecycle(loadFailureMessage?)
+Store:BindToClose()
+
+Store:Publish(eventName, payload)
+```
+
+---
+
+# Session API Reference
+
+```lua
+session:IsActive()
+
+session:Get(path)
+session:Read(path)
+session:Has(path)
+session:GetOr(path, fallback)
+
+session:Set(path, value)
+session:Write(path, value)
+
+session:Delete(path)
+
+session:Increment(path, amount?)
+session:Add(path, amount?)
+session:Sub(path, amount?)
+session:IncrementClamped(path, amount, minimum?, maximum?)
+
+session:Insert(path, value)
+session:Append(path, value)
+session:RemoveAt(path, index)
+
+session:Toggle(path)
+
+session:Award(path, amount)
+session:Spend(path, amount)
+
+session:Update(callback)
+
+session:Transaction(callback)
+session:Mutate(callback)
+session:Patch(patches)
+
+session:Snapshot(label?)
+session:Restore(snapshot)
+
+session:Diff(otherData)
+session:DiffFromPersisted()
+
+session:GetJournal()
+session:ClearJournal()
+
+session:Save(priority?)
+session:Release()
+session:Abort(options)
+
+session:GetStatus()
+session:GetStats()
+
+session:GetKey()
+session:GetSessionId()
+session:GetAge()
+session:GetLastSaveAge()
+
+session:MarkDirty()
+session:IsDirty()
+
+session:BindValue(path, valueObject, options?)
+```
+
+---
+
+# Transaction API Reference
+
+```lua
+tx:Get(path)
+
+tx:Set(path, value)
+tx:Delete(path)
+
+tx:Increment(path, amount?)
+tx:IncrementClamped(path, amount, minimum?, maximum?)
+
+tx:Insert(path, value)
+tx:RemoveAt(path, index)
+
+tx:Require(path, expectedOrPredicate)
+tx:CompareAndSet(path, expected, value)
+
+tx:Savepoint(name)
+tx:RollbackTo(name)
+
+tx:Diff()
+tx:Validate()
+
+tx:Commit()
+tx:Rollback()
+```
+
+---
+
+# Convenience API Example
+
+v6.2.1 includes a shorter API for common game code:
+
+```lua
+local session, err = Store:Open(player)
 
 if not session then
-    warn("Load failed:", err)
-    player:Kick("Data failed to load.")
-    return
+	return
+end
+
+Store:Write(
+	player,
+	"Coins",
+	100
+)
+
+Store:Add(
+	player,
+	"Coins",
+	50
+)
+
+Store:Sub(
+	player,
+	"Coins",
+	25
+)
+
+Store:Mutate(
+	player,
+	function(tx)
+		tx:Increment(
+			"Coins",
+			100
+		)
+	end
+)
+
+Store:Save(
+	player,
+	"high"
+)
+
+Store:Release(player)
+```
+
+The full session API is still recommended when a system repeatedly accesses the same player.
+
+---
+
+# Example: Currency System
+
+```lua
+local function GiveCoins(
+	player,
+	amount
+)
+	if amount <= 0 then
+		return false,
+			"INVALID_AMOUNT"
+	end
+
+	local session = Store:GetSession(
+		player
+	)
+
+	if not session
+		or not session:IsActive() then
+		return false,
+			"NO_SESSION"
+	end
+
+	return session:Award(
+		"Coins",
+		amount
+	)
 end
 ```
-Do not silently ignore DataStore errors.
 
--------------------------------------------------------------------------------
-Testing
--------------------------------------------------------------------------------
+Spend:
+
+```lua
+local function BuyUpgrade(
+	player,
+	price
+)
+	local session = Store:GetSession(
+		player
+	)
+
+	if not session then
+		return false,
+			"NO_SESSION"
+	end
+
+	return session:Spend(
+		"Coins",
+		price
+	)
+end
+```
+
+---
+
+# Example: Inventory Purchase
+
+```lua
+local function BuyItem(
+	player,
+	itemId,
+	price
+)
+	local session = Store:GetSession(
+		player
+	)
+
+	if not session then
+		return false,
+			"NO_SESSION"
+	end
+
+	return session:Transaction(function(tx)
+		tx:Require(
+			"Coins",
+			function(coins)
+				return coins >= price
+			end
+		)
+
+		tx:Increment(
+			"Coins",
+			-price
+		)
+
+		tx:Insert(
+			"Inventory",
+			{
+				Id = itemId,
+				Quantity = 1,
+			}
+		)
+	end)
+end
+```
+
+Always validate item IDs, prices, ownership, permissions, and gameplay rules on the server.
+
+---
+
+# Example: Leaderstats
+
+```lua
+local function CreateLeaderstats(
+	player,
+	session
+)
+	local leaderstats =
+		Instance.new("Folder")
+
+	leaderstats.Name = "leaderstats"
+	leaderstats.Parent = player
+
+	local coins =
+		Instance.new("IntValue")
+
+	coins.Name = "Coins"
+	coins.Parent = leaderstats
+
+	session:BindValue(
+		"Coins",
+		coins
+	)
+end
+```
+
+This avoids writing a second copy of the persistence system just to keep leaderstats synchronized.
+
+---
+
+# Error Handling
 
-When testing in Studio, test more than just:
+Most operational APIs return a result plus an error string.
 
-    Player joins
-    Player leaves
+Example:
 
-Also test:
+```lua
+local success, err =
+	session:Set(
+		"Coins",
+		-100
+	)
 
-- Joining with no existing data
-- Joining with existing data
-- Leaving normally
-- Server shutdown
-- Rejoining quickly
-- Multiple players
-- Repeated mutations
-- Save failures
-- Retry behavior
-- Invalid data
-- Migration from older versions
-- Large inventories
-- Transaction failures
-- Session loss
-- Multiple servers
+if not success then
+	warn(
+		"Mutation rejected:",
+		err
+	)
+end
+```
 
-A DataStore system can appear to work perfectly during normal testing
-and still fail under unusual server conditions.
+Load:
 
--------------------------------------------------------------------------------
-Production Checklist
--------------------------------------------------------------------------------
+```lua
+local session, err =
+	Store:OpenPlayerAsync(
+		player
+	)
 
-Before releasing:
+if not session then
+	warn(
+		"Load failed:",
+		err
+	)
+end
+```
 
-[ ] DataStore name is correct
+Potential operational errors include conditions such as:
 
-[ ] Template contains all required defaults
+```text
+SESSION_LOCKED:<owner>
+SESSION_INACTIVE
+SESSION_NOT_FOUND
+STORE_CLOSED
+BUDGET_TIMEOUT
+SAVE_TIMEOUT
+FLUSH_TIMEOUT
+SESSION_OWNERSHIP_LOST
+TRANSACTION_PRECONDITION_FAILED
+CROSS_SERVER_DISABLED
+```
 
-[ ] PlayerAdded handles failed loads
+Treat returned errors as data. Do not silently continue with a fresh empty profile after a failed load.
 
-[ ] PlayerRemoving releases sessions
+---
 
-[ ] BindToClose is configured
+# Production Safety
 
-[ ] Autosave is enabled
+## Never trust the client
 
-[ ] Retry handling is enabled
+NexusDataStore protects persistence mechanics. It does not make client requests trustworthy.
 
-[ ] Budget awareness is enabled
+The server must still validate:
 
-[ ] Currency is server-authoritative
+- purchases;
+- currency changes;
+- inventory ownership;
+- item IDs;
+- rewards;
+- trade state;
+- cooldowns;
+- permissions;
+- admin actions;
+- progression requirements.
 
-[ ] Inventory changes are server-authoritative
+---
 
-[ ] Migrations have been tested
+## Never replace failed data with empty data
 
-[ ] Schema validation has been tested
+Bad:
 
-[ ] Transactions have failure tests
+```lua
+local session = Store:OpenPlayerAsync(
+	player
+)
 
-[ ] Large data has been tested
+if not session then
+	-- create fake empty data and continue
+end
+```
 
-[ ] Session locking has been tested
+This can lead to valid player data being overwritten later.
 
-[ ] Shutdown saving has been tested
+Prefer failing the join or disabling persistent gameplay until a real session is available.
 
-[ ] No system opens duplicate sessions
+---
 
--------------------------------------------------------------------------------
-API
--------------------------------------------------------------------------------
+## Keep one session per player
 
-Store
+Bad design:
 
-    DataStore.new(config)
+```text
+Currency opens a session
+Inventory opens a session
+Quests open a session
+Trading opens a session
+```
 
-    OpenPlayerAsync(player)
+Preferred design:
 
-    GetSession(player)
+```text
+One NexusDataStore session
+        │
+        ├── Currency
+        ├── Inventory
+        ├── Quests
+        └── Trading
+```
 
-    GetSessionById(sessionId)
+---
 
-    GetActiveSessions()
+## Keep data bounded
 
-    WaitForSession(player, timeout)
+Avoid placing these in a player profile:
 
-    HasSession(player)
+- giant histories;
+- unnecessary logs;
+- server-only temporary state;
+- Instances;
+- connections;
+- cached objects that can be rebuilt;
+- enormous arrays with no practical limit.
 
-    CountSessions()
+The profile should contain what is needed to restore persistent progress.
 
-    Set(session, path, value)
+---
 
-    Increment(session, path, amount)
+# Troubleshooting
 
-    QueueSave(session, priority, reason)
+## Player is kicked because data did not load
 
-    SaveAsync(session)
+Inspect the error from:
 
-    SaveAllAsync(timeout)
+```lua
+local session, err =
+	Store:OpenPlayerAsync(player)
 
-    FlushAsync(timeout)
+print(err)
+```
 
-    ReleaseAsync(session)
+Common causes can include:
 
-    Close()
+- another server still owns the session;
+- request-budget timeout;
+- malformed or incompatible stored data;
+- migration failure;
+- schema failure;
+- compression schema history missing for older data;
+- DataStore service failure.
 
-    On(eventName, callback)
+Also inspect:
 
-    GetHealth()
+```lua
+print(Store:GetHealth())
+print(Store:GetMetrics())
+```
 
-    GetMetrics()
+---
 
-    DumpDiagnostics()
+## `SESSION_LOCKED`
 
-    GetSchema()
+Another live server still owns the stored session.
 
-    GetTemplate()
+Do not bypass the lock by loading empty data.
 
-    SetSchemaVersion(version)
+The session can become available when ownership is released or the lock becomes stale.
 
-    GetMigrationHistory()
+---
 
-Session
+## Compression data fails after a schema update
 
-    IsActive()
+If old records were written under an older schema version, keep that schema in:
 
-    GetPlayerUserId()
+```lua
+CompressionHistory
+```
 
-    GetKey()
+and make sure your normal `Migrations` path can still upgrade the decoded profile.
 
-    GetAge()
+---
 
-    GetTimeSinceSave()
+## Direct table edit was rejected
 
-    GetMutationCount()
+When:
 
-    GetJournal()
+```lua
+DetectDirectChanges = true
+```
 
-    ClearDirty()
+NexusDataStore validates discovered direct edits.
 
-    MarkDirty()
+If the edit violates the schema or limits, it restores the previously observed data and emits:
 
-    Save()
+```text
+DirectMutationRejected
+```
 
-    Flush()
+Use tracked mutation methods to catch problems closer to the code that caused them.
 
-    Health()
+---
 
-    DiffFromPersisted()
+## Saves are slow
 
-    IsHealthy()
+Check:
 
-    Replace(data)
+```lua
+local health = Store:GetHealth()
+local metrics = Store:GetMetrics()
 
-    Update(callback)
+print(health.UpdateBudget)
+print(health.QueuedSaves)
+print(metrics.AverageSaveTime)
+print(metrics.Retries)
+```
 
-    Transaction(callback)
+A queue can grow when producers request saves faster than the configured save/budget path can process them.
 
-Transaction
+---
 
-    Get(path)
+# Production Checklist
 
-    Set(path, value)
+Before shipping a game with NexusDataStore:
 
-    SetIf(path, predicate, value)
+- [ ] Keep NexusDataStore server-only.
+- [ ] Use one active session per player.
+- [ ] Use a stable `Name`.
+- [ ] Define a real template.
+- [ ] Add a schema for important production data.
+- [ ] Use `DataTemplate.Version` or `SchemaVersion`.
+- [ ] Keep migrations for older live data.
+- [ ] Keep `CompressionHistory` when compression schemas change.
+- [ ] Validate the template at startup.
+- [ ] Keep `BudgetAware = true` unless you have a measured reason not to.
+- [ ] Release sessions on `PlayerRemoving`.
+- [ ] Bind shutdown handling.
+- [ ] Never trust the client for persistent mutations.
+- [ ] Never replace a failed load with empty data.
+- [ ] Use transactions for multi-field purchases/trades.
+- [ ] Keep player profiles below configured size/node limits.
+- [ ] Watch `GetHealth()` and `GetMetrics()` during stress tests.
+- [ ] Test server hopping and stale locks.
+- [ ] Test migration from old live versions.
+- [ ] Test compression decode compatibility.
+- [ ] Test shutdown with active dirty sessions.
 
-    Delete(path)
+---
 
-    DeleteIf(path, predicate)
+# v6.2.1 Summary
 
-    Increment(path, amount)
+NexusDataStore v6.2.1 combines the session/store architecture with the newer schema-aware compression path and convenience APIs.
 
-    Insert(path, value)
+Key v6.2.1 capabilities documented here include:
 
-    Remove(path, value)
+- `NexusDataStore.Version = "6.2.1"`;
+- codec/compression version `621`;
+- `DataTemplate`;
+- schema-aware compression;
+- `CompressionHistory`;
+- compression size reports;
+- direct session-data mutation detection;
+- store convenience methods such as `Open`, `Get`, `Wait`, `Read`, `Write`, `Add`, `Sub`, `Mutate`, `Save`, and `Release`;
+- session convenience methods such as `GetOr`, `Toggle`, `Append`, `Award`, `Spend`, and `Mutate`;
+- session locking and heartbeats;
+- priority save queues;
+- transactions, patches, snapshots, diffs, and journals;
+- optional cross-server messages;
+- lifecycle helpers;
+- store/session diagnostics.
 
-    Require(path, predicate)
+---
 
-    Count(path)
+# Design Summary
 
-    Contains(path, value)
+A healthy production setup looks like this:
 
-    Touch()
+```text
+                        NexusDataStore v6.2.1
+                                  │
+                                  ▼
+                        ┌───────────────────┐
+                        │ OpenPlayerAsync() │
+                        └─────────┬─────────┘
+                                  │
+                                  ▼
+                        ┌───────────────────┐
+                        │   Active Session  │
+                        │   session.Data    │
+                        └─────────┬─────────┘
+                                  │
+              ┌───────────────────┼───────────────────┐
+              │                   │                   │
+              ▼                   ▼                   ▼
+        Tracked Mutations   Transactions        Direct Changes
+              │                   │                   │
+              └───────────────────┼───────────────────┘
+                                  ▼
+                          Schema Validation
+                                  │
+                                  ▼
+                     Dirty State / Journal / Diff
+                                  │
+                                  ▼
+                     Priority Save Queue / Budget
+                                  │
+                                  ▼
+                         Retry + UpdateAsync
+                                  │
+                                  ▼
+                       Compressed Buffer Record
+                                  │
+                                  ▼
+                         Roblox DataStore
+```
 
--------------------------------------------------------------------------------
-Version
--------------------------------------------------------------------------------
+The goal is not to call DataStore more often.
 
-NexusDataStore V6.1
-
-The V6.1 rewrite focuses on keeping the public API large without
-duplicating the same functions in multiple places.
-
-The module is intentionally kept as a single ModuleScript.
-
--------------------------------------------------------------------------------
-Notes
--------------------------------------------------------------------------------
-
-NexusDataStore does not remove Roblox DataStore limits.
-
-It does not make DataStoreService unlimited.
-
-It does not guarantee that Roblox services can never fail.
-
-What it does is keep those problems in one place so the rest of the game
-can work with a normal in-memory player session.
-
-The recommended pattern is:
-
-    Open
-      |
-      v
-    Session
-      |
-      +-- Read
-      +-- Update
-      +-- Transaction
-      +-- Events
-      +-- Autosave
-      |
-      v
-    Release
-
-Keep the player session alive for the entire time the player is in the
-server and let the store handle the persistence side.
-
--------------------------------------------------------------------------------
-License
--------------------------------------------------------------------------------
-
-Free to use
-
--------------------------------------------------------------------------------
+The goal is to make persistent player data **predictable, validated, recoverable, observable, and centralized**.
