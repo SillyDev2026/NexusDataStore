@@ -1,123 +1,848 @@
 # DataStore
 
-![Version](https://img.shields.io/badge/version-v1.7.1-4c8bf5)
+![Version](https://img.shields.io/badge/version-v1.8.4-4c8bf5)
 ![Language](https://img.shields.io/badge/language-Luau-00A2FF)
 ![Platform](https://img.shields.io/badge/platform-Roblox-111111)
 ![Runtime](https://img.shields.io/badge/runtime-server--only-orange)
-![Storage Format](https://img.shields.io/badge/storage%20format-v5-2ea44f)
-![Compression](https://img.shields.io/badge/compression-v2.6.4-6f42c1)
+![Storage Format](https://img.shields.io/badge/storage%20format-v6-2ea44f)
+![Compression](https://img.shields.io/badge/compression-v2.6.7-6f42c1)
+![BufferUtil](https://img.shields.io/badge/BufferUtil-v1.1.0-8a2be2)
 
-**DataStore v1.7.1** is a server-side Roblox persistence module with player profile sessions, MemoryStore session locking, autosave, retries, budget awareness, migrations, reconciliation, validation, and adaptive compressed buffer storage.
+**DataStore v1.8.4** is a server-side Roblox persistence module with profile sessions, MemoryStore session locking, autosave, retries, budget awareness, migrations, reconciliation, validation, compact player keys, exact-size BufferUtil writers, adaptive Compression v2.6.7 storage, and the new **SchemaBuffer** codec.
 
-The v1.7 storage pipeline integrates **Compression v2.6.4** directly with the player `DataTemplate`. Instead of always serializing a table into the older DataStore buffer format first, v1.7 can let Compression inspect the original table structure and choose a better representation.
+The main v1.8.4 change is that a readable runtime profile such as:
 
-> Current release: **v1.7.1**  
-> Storage format: **5**  
-> Required Compression version: **2.6.4**
-
----
-
-# What's New in v1.7.1
-
-v1.7.1 is a correctness and organization update on top of the v1.7 compression upgrade.
-
-- fixed local helper ordering so compression helpers are declared before they are used;
-- keeps the v1.7 adaptive table-first compression path;
-- requires Compression v2.6.4;
-- keeps legacy BufferV1/SDSB decoding for older stored data;
-- compares native table compression against the older BufferV1 path when configured;
-- exposes compression version and storage-format information through the public API;
-- keeps profile storage statistics available through `Profile:GetStorageInfo()`.
-
----
-
-# How Storage Works
-
-With the default `StorageMode = "Buffer"`, v1.7.1 evaluates the profile as a versioned `DataTemplate`:
-
-```text
+```lua
 {
-    Version = <data version>,
-    Data = <player data>
+    Rebirths = 1,
+    Clicks = 2234,
 }
 ```
 
-The save path can evaluate multiple candidates:
+does **not** need to store the strings `"Rebirths"` and `"Clicks"` for every player.
+
+When the configured `DataTemplate` is eligible for SchemaBuffer, DataStore uses the template itself as the schema and stores only:
+
+- the schema/data version;
+- a schema fingerprint;
+- a presence bitmap telling DataStore which fields differ from the template defaults;
+- the changed values;
+- a checksum.
+
+On load, DataStore reconstructs the normal named table automatically.
+
+> Current release: **v1.8.4**  
+> Storage format: **6**  
+> SchemaBuffer format: **1**  
+> Session format: **1**  
+> Required Compression: **v2.6.7**  
+> Required BufferUtil: **v1.1.0**
+
+---
+
+# What’s New in v1.8.4
+
+v1.8.4 focuses on reducing the amount of repeated structure written for fixed player-data templates.
+
+Major changes:
+
+- added the **SchemaBuffer** positional storage codec;
+- removes repeated field-name strings from eligible player saves;
+- removes generic per-value type tags when the template already defines the type;
+- omits fields that are still equal to their template defaults;
+- packs changed non-negative integers as `VarUInt`;
+- packs changed signed integers as `VarInt`;
+- stores changed booleans with the presence bit alone when possible;
+- uses BufferUtil exact-size writers so unused working capacity is not passed forward;
+- optionally runs `Compression.CompressBufferSmart()` over the SchemaBuffer candidate;
+- compares SchemaBuffer against the generic SDSB and Compression table candidates;
+- saves whichever candidate is actually smaller;
+- automatically falls back to the generic codec for unsupported or dynamic data;
+- fingerprints the schema, including defaults, to prevent an incompatible template from decoding old positional data silently;
+- supports `SchemaHistory` for older SchemaBuffer template versions;
+- keeps compact Base62 player keys from v1.8.2;
+- keeps the compact 19-byte default MemoryStore session frame;
+- keeps v1.8.x and older storage decoding paths;
+- storage format is now **6**.
+
+---
+
+# Why SchemaBuffer Exists
+
+A normal map stores both names and values conceptually:
+
+```lua
+{
+    Rebirths = 1,
+    Clicks = 2234,
+}
+```
+
+The strings are useful to your game code, but they are redundant in persistent storage when every player follows the same known template.
+
+Your game already knows:
+
+```lua
+DataTemplate = {
+    Version = 1,
+
+    Data = {
+        Rebirths = 0,
+        Clicks = 0,
+    },
+}
+```
+
+That means DataStore can compile a permanent schema from the template.
+
+The runtime API stays readable:
+
+```lua
+profile.Data.Rebirths
+profile.Data.Clicks
+
+profile:Set("Rebirths", 1)
+profile:Set("Clicks", 2234)
+```
+
+but the storage codec can operate positionally.
+
+---
+
+# What v1.8.4 Actually Saves
+
+This is the most important v1.8.4 example.
+
+## Runtime template
+
+```lua
+DataTemplate = {
+    Version = 1,
+
+    Data = {
+        Rebirths = 0,
+        Clicks = 0,
+    },
+}
+```
+
+## Runtime player data
+
+```lua
+{
+    Rebirths = 1,
+    Clicks = 2234,
+}
+```
+
+## Compiled schema
+
+SchemaBuffer sorts fixed map keys deterministically.
+
+For this template the schema becomes conceptually:
 
 ```text
-DataTemplate
-    │
-    ├── Legacy raw BufferV1 / SDSB
-    │
-    ├── Legacy BufferV1 + Compression v2.6.4 buffer compression
-    │
-    └── Compression v2.6.4 native adaptive table compression
-                    │
-                    ▼
-              smallest result
-                    │
-                    ▼
-             DataStoreService
+DataTemplate version: 1
+
+Field 1: Clicks
+    Type: unsigned integer
+    Default: 0
+
+Field 2: Rebirths
+    Type: unsigned integer
+    Default: 0
 ```
+
+The field names belong to the **server-side schema**. They are not written as strings in every player payload.
+
+## Difference from defaults
+
+The player has:
+
+```text
+Clicks   = 2234   changed
+Rebirths = 1      changed
+```
+
+Both fields differ from their defaults, so the two presence bits are:
+
+```text
+11
+```
+
+The values are then written in schema order:
+
+```text
+2234
+1
+```
+
+`2234` fits in a two-byte VarUInt.
+
+`1` fits in a one-byte VarUInt.
+
+So the value portion is only:
+
+```text
+3 bytes
+```
+
+The complete raw SchemaBuffer frame also contains its small version/fingerprint/bitmap/checksum framing.
+
+For this exact two-field example, the raw frame is approximately:
+
+```text
+Schema magic             1 B
+Schema codec version     1 B
+DataTemplate version     1 B
+Schema fingerprint       4 B
+Presence bitmap          1 B
+Clicks = 2234 VarUInt    2 B
+Rebirths = 1 VarUInt     1 B
+Checksum                 4 B
+--------------------------------
+Raw SchemaBuffer        15 B
+```
+
+That is the actual idea behind v1.8.4.
+
+It is **not** saving:
+
+```lua
+{
+    "Rebirths",
+    1,
+    "Clicks",
+    2234,
+}
+```
+
+and it is not saving a Lua table containing the field-name strings.
+
+---
+
+# What Happens on Load
+
+Suppose Roblox gives DataStore this positional SchemaBuffer:
+
+```text
+version = 1
+bitmap  = 11
+values  = [2234, 1]
+```
+
+DataStore looks up the version-1 schema and starts from a copy of the template:
+
+```lua
+{
+    Rebirths = 0,
+    Clicks = 0,
+}
+```
+
+Then it applies the present values:
+
+```lua
+{
+    Rebirths = 1,
+    Clicks = 2234,
+}
+```
+
+Your game receives the normal named profile:
+
+```lua
+print(profile.Data.Rebirths) -- 1
+print(profile.Data.Clicks)   -- 2234
+```
+
+Your gameplay code never needs to know that the stored form was positional.
+
+---
+
+# Default-Value Elision
+
+SchemaBuffer does not write a value when the value still equals the template default.
+
+Example:
+
+```lua
+DataTemplate = {
+    Version = 1,
+
+    Data = {
+        Rebirths = 0,
+        Clicks = 0,
+        Gems = 0,
+        Prestige = 0,
+    },
+}
+```
+
+Player:
+
+```lua
+{
+    Rebirths = 5,
+    Clicks = 1000,
+    Gems = 0,
+    Prestige = 0,
+}
+```
+
+Only the changed fields need payload bytes.
+
+Conceptually:
+
+```text
+Rebirths changed
+Clicks changed
+Gems default
+Prestige default
+```
+
+The defaults are rebuilt from the template on load.
+
+This matters because a large template containing many fields that are still at their defaults can remain very small on disk.
+
+---
+
+# Boolean Packing
+
+Booleans are especially cheap.
+
+Template:
+
+```lua
+DataTemplate = {
+    Version = 1,
+
+    Data = {
+        Music = true,
+        SFX = true,
+    },
+}
+```
+
+If the player has:
+
+```lua
+{
+    Music = false,
+    SFX = true,
+}
+```
+
+SchemaBuffer already knows:
+
+```text
+Music default = true
+SFX default   = true
+```
+
+A present `Music` bit means the value differs from the default.
+
+Because a boolean has only two states, DataStore can reconstruct:
+
+```text
+not true = false
+```
+
+without writing a separate boolean payload byte.
+
+So changed booleans use their presence bit to carry the full value.
+
+---
+
+# Nested Template Example
+
+SchemaBuffer supports fixed nested string-keyed maps.
+
+Template:
+
+```lua
+DataTemplate = {
+    Version = 1,
+
+    Data = {
+        Coins = 0,
+
+        Settings = {
+            Music = true,
+            SFX = true,
+        },
+
+        Stats = {
+            Rebirths = 0,
+            Clicks = 0,
+        },
+    },
+}
+```
+
+The compiled fields become deterministic paths similar to:
+
+```text
+Coins
+Settings.Music
+Settings.SFX
+Stats.Clicks
+Stats.Rebirths
+```
+
+You still use:
+
+```lua
+profile.Data.Settings.Music
+profile.Data.Stats.Rebirths
+```
+
+normally.
+
+The path strings are used by the schema compiler, not repeatedly persisted for every player.
+
+---
+
+# SchemaBuffer Supported Leaf Types
+
+A fixed template leaf can currently compile as:
+
+- non-negative safe integer → `VarUInt`;
+- safe signed integer → `VarInt`;
+- other finite number → `f64`;
+- boolean;
+- string;
+- buffer;
+- `Vector2`;
+- `Vector3`;
+- `Color3`;
+- `CFrame`;
+- `UDim`;
+- `UDim2`.
+
+The type is inferred from the **template default**.
+
+Example:
+
+```lua
+DataTemplate = {
+    Version = 1,
+
+    Data = {
+        Coins = 0,             -- VarUInt
+        Debt = -1,             -- VarInt
+        Multiplier = 1.5,      -- f64
+        Music = true,          -- bool
+        Title = "",            -- string
+        Spawn = Vector3.zero,  -- Vector3
+    },
+}
+```
+
+Keep the template type stable for the lifetime of that schema version.
+
+---
+
+# When SchemaBuffer Falls Back
+
+SchemaBuffer intentionally does **not** try to encode every possible table shape.
+
+The generic Compression codec remains available for data that is not appropriate for a positional fixed schema.
+
+Examples that cause the SchemaBuffer candidate to be unavailable include:
+
+- non-empty array template nodes;
+- empty/dynamic table template nodes;
+- non-string map keys;
+- unsupported template leaf types;
+- an unknown runtime field not present in the template;
+- a nested schema table being replaced by another type;
+- a field changing to an incompatible runtime type;
+- an inferred integer field receiving a value outside the supported exact integer range.
 
 With the default:
 
 ```lua
-CompressionCompareLegacyBuffer = true
+SchemaFallbackToGeneric = true
 ```
 
-the module keeps the old encoded-buffer path as a size safety net while also testing the newer table-aware Compression path.
+DataStore does not throw away that data.
 
-This is useful because Compression can see table keys, integers, strings, arrays, nested values, and supported Roblox datatypes before the DataStore's legacy serializer turns everything into generic bytes.
+Instead:
+
+```text
+SchemaBuffer candidate
+        │
+        ├── compatible → compare candidate size
+        │
+        └── incompatible
+                  ↓
+        generic Compression codec
+```
+
+This is important for safety.
+
+---
+
+# Example: Dynamic Inventory
+
+This template is intentionally dynamic:
+
+```lua
+DataTemplate = {
+    Version = 1,
+
+    Data = {
+        Inventory = {},
+    },
+}
+```
+
+An empty table means its future key/value shape is not defined by the template.
+
+SchemaBuffer will not guess an order for it.
+
+A runtime inventory such as:
+
+```lua
+{
+    Inventory = {
+        Sword = 2,
+        Potion = 10,
+        RareItem = 1,
+    },
+}
+```
+
+is saved by the generic adaptive Compression path instead.
+
+This lets one DataStore support both:
+
+- highly compact fixed progression/settings data;
+- flexible dynamic data.
+
+---
+
+# Candidate Selection
+
+With `StorageMode = "Buffer"`, DataStore can compare several valid storage candidates.
+
+```text
+Named DataTemplate
+        │
+        ├── SchemaBuffer
+        │      └── optional CompressBufferSmart
+        │
+        ├── generic SDSB / BufferV1-compatible candidate
+        │      └── optional Compression buffer codec
+        │
+        └── Compression v2.6.7 native table candidate
+                       │
+                       ▼
+                smallest valid result
+                       │
+                       ▼
+                DataStoreService
+```
+
+SchemaBuffer is not forced just because it is enabled.
+
+The module still selects the smallest candidate.
+
+That means a profile can report:
+
+```text
+SchemaCandidateAvailable = true
+SchemaSelected = false
+```
+
+if another codec happened to be smaller for that exact value.
+
+---
+
+# BufferUtil’s Job
+
+BufferUtil and Compression solve different problems.
+
+## BufferUtil
+
+BufferUtil prevents unused **working capacity** from being passed to the next stage.
+
+Example:
+
+```text
+writer backing buffer = 64 B
+actually written      = 19 B
+unused capacity       = 45 B
+```
+
+Before the data is handed onward, DataStore compacts it to:
+
+```text
+19 B
+```
+
+The unused 45 bytes are not part of the stored payload.
+
+## Compression
+
+Compression reduces the actual representation when a codec can make it smaller.
+
+Example:
+
+```text
+exact SchemaBuffer = 40 B
+Compression Smart  = 31 B
+```
+
+then DataStore can use the 31-byte candidate.
+
+But if:
+
+```text
+exact SchemaBuffer = 19 B
+compressed result  = 25 B
+```
+
+DataStore keeps the 19-byte raw SchemaBuffer.
+
+This is why:
+
+```text
+LastBufferCompressed = false
+```
+
+can still be the best result.
+
+---
+
+# Compact Player Keys
+
+v1.8.4 keeps the compact player-key system introduced in v1.8.2.
+
+Default:
+
+```lua
+CompactPlayerKeys = true
+CompactKeyPrefix = "p"
+```
+
+Instead of:
+
+```text
+Player_10800269681
+```
+
+the UserId is encoded as Base62 and can become something like:
+
+```text
+pBmupW5
+```
+
+For that example:
+
+```text
+legacy key: 18 characters
+compact key: 7 characters
+saved:       11 characters
+```
+
+You can inspect this:
+
+```lua
+local info = Store:GetKeyInfo(player)
+
+print("Key:", info.Key)
+print("Key bytes:", info.KeyBytes)
+
+print("Legacy key:", info.LegacyKey)
+print("Legacy key bytes:", info.LegacyKeyBytes)
+
+print("Saved bytes:", info.SavedBytes)
+print("Savings:", info.SavingsPercent)
+```
+
+---
+
+# Compact-Key Migration
+
+Existing saves under:
+
+```text
+Player_<UserId>
+```
+
+can still load.
+
+Defaults:
+
+```lua
+MigrateLegacyPlayerKeys = true
+DeleteLegacyPlayerKeys = true
+```
+
+Load behavior:
+
+```text
+try compact key
+      │
+      ├── found → load
+      │
+      └── missing
+             ↓
+       try legacy key
+             ↓
+           found
+             ↓
+       load old profile
+             ↓
+       successful compact-key save
+             ↓
+       remove legacy key
+```
+
+The old key is not deleted before the new write succeeds.
+
+---
+
+# Session Lock Storage
+
+Player profile data and session ownership are separate systems.
+
+Persistent player data is stored in:
+
+```text
+DataStoreService
+```
+
+Session locks are stored in:
+
+```text
+MemoryStoreService
+```
+
+Default session configuration:
+
+```lua
+SessionLocking = true
+SessionLockTimeout = 180
+
+SessionCompressionEnabled = true
+SessionStoreDiagnostics = false
+```
+
+With diagnostics disabled and a standard Roblox GUID session ID, the active raw session frame is typically:
+
+```text
+magic      1 B
+version    1 B
+flags      1 B
+session ID 16 B
+----------------
+total      19 B
+```
+
+Compression Smart may report:
+
+```text
+Session compressed: false
+Session raw bytes: 19
+Session stored bytes: 19
+```
+
+That is a successful result.
+
+A 19-byte high-entropy session GUID often cannot be compressed further without expansion.
+
+---
+
+# Roblox Creator Hub Size vs Buffer Size
+
+`buffer.len()` and Creator Hub storage usage are different measurements.
+
+Example:
+
+```text
+DataStore buffer.len(value) = 25 B
+Creator Hub may report      = a larger number
+```
+
+The Creator Hub number can include Roblox's own storage representation and per-entry/platform overhead.
+
+DataForage or another editor may also display a buffer as:
+
+```text
+Array (25)
+```
+
+or Base64.
+
+Those are viewer representations of the same buffer.
+
+Use:
+
+```lua
+profile:GetStorageInfo()
+```
+
+to inspect the codec payload sizes produced by this module.
+
+Then use Creator Hub to compare the final platform-level result.
 
 ---
 
 # Requirements
 
-DataStore v1.7.1 is **server-only**.
+DataStore v1.8.4 is **server-only**.
 
-It requires a child ModuleScript named:
-
-```text
-Compression
-```
-
-and that module must report:
+The DataStore ModuleScript requires two child modules:
 
 ```text
-2.6.4
+DataStore
+├── Compression
+└── BufferUtil
 ```
 
-Recommended layout:
+Required versions:
+
+```text
+Compression = 2.6.7
+BufferUtil  = 1.1.0
+```
+
+Recommended server layout:
 
 ```text
 ServerScriptService
 └── Data
     └── DataStore
-        └── Compression
+        ├── Compression
+        └── BufferUtil
 ```
 
 Example:
 
 ```lua
-local ServerScriptService = game:GetService("ServerScriptService")
+local ServerScriptService =
+    game:GetService("ServerScriptService")
 
 local DataStore = require(
     ServerScriptService.Data.DataStore
 )
 ```
 
-Do not require the module from a `LocalScript`.
+Do not require DataStore from a `LocalScript`.
 
 ---
 
 # Quick Start
 
-## Create a store
-
 ```lua
-local ServerScriptService = game:GetService("ServerScriptService")
-local Players = game:GetService("Players")
+local Players =
+    game:GetService("Players")
+
+local ServerScriptService =
+    game:GetService("ServerScriptService")
 
 local DataStore = require(
     ServerScriptService.Data.DataStore
@@ -130,15 +855,27 @@ local Store = DataStore.new({
         Version = 1,
 
         Data = {
-            Coins = 0,
-            Level = 10,
-            Xp = 400,
-            Rebirths = 13,
+            Rebirths = 0,
+            Clicks = 0,
+
+            Settings = {
+                Music = true,
+                SFX = true,
+            },
         },
     },
 
     StorageMode = "Buffer",
+
+    SchemaBufferEnabled = true,
+    SchemaBufferCompress = true,
+    SchemaFallbackToGeneric = true,
+
+    BufferUtilEnabled = true,
+
     CompressionEnabled = true,
+
+    CompactPlayerKeys = true,
 
     AutoSave = true,
     AutoSaveInterval = 60,
@@ -148,13 +885,10 @@ local Store = DataStore.new({
 
     BudgetAware = true,
 })
-```
 
-## Open player profiles
-
-```lua
 Players.PlayerAdded:Connect(function(player)
-    local profile, err = Store:OpenPlayerAsync(player)
+    local profile, err =
+        Store:OpenPlayerAsync(player)
 
     if not profile then
         warn(
@@ -171,82 +905,95 @@ Players.PlayerAdded:Connect(function(player)
     end
 
     print(
-        "[DataStore] loaded:",
+        "Loaded:",
         player.Name
     )
 
-    print("Coins:", profile.Data.Coins)
+    print(
+        "Rebirths:",
+        profile.Data.Rebirths
+    )
+
+    print(
+        "Clicks:",
+        profile.Data.Clicks
+    )
 end)
 ```
 
-`DataStore.new()` already installs internal `Players.PlayerRemoving` and `game:BindToClose()` handling.
+`DataStore.new()` installs its own player-removal and shutdown release handling.
 
-You normally do **not** need to create a second `PlayerRemoving` or `BindToClose` handler just to release profiles.
+You normally do **not** need another `Players.PlayerRemoving` handler just to release profiles.
 
 ---
 
-# Reading and Updating Data
-
-A loaded profile exposes its live data through:
-
-```lua
-profile.Data
-```
-
-For tracked mutations, prefer the profile methods.
+# Updating Player Data
 
 ## Get
 
 ```lua
-local coins = profile:Get("Coins")
+local clicks =
+    profile:Get("Clicks")
 ```
 
 ## Set
 
 ```lua
-profile:Set("Coins", 500)
+profile:Set(
+    "Rebirths",
+    10
+)
 ```
 
 ## Increment
 
 ```lua
-profile:Increment("Coins", 100)
+profile:Increment(
+    "Clicks",
+    100
+)
 ```
 
-Default increment:
+Default amount:
 
 ```lua
-profile:Increment("Coins")
+profile:Increment("Clicks")
 ```
 
-is equivalent to adding `1`.
+adds `1`.
 
 ## Update
 
 ```lua
-profile:Update("Coins", function(current)
-    return (current or 0) * 2
-end)
+profile:Update(
+    "Clicks",
+    function(current)
+        return (current or 0) * 2
+    end
+)
 ```
 
-## Overwrite the entire data table
+## Overwrite
 
 ```lua
 profile:Overwrite({
-    Coins = 0,
-    Level = 1,
-    Xp = 0,
     Rebirths = 0,
+    Clicks = 0,
+
+    Settings = {
+        Music = true,
+        SFX = true,
+    },
 })
 ```
 
-## Reconcile against the template
+## Reconcile
 
 ```lua
 profile:Reconcile()
 ```
 
-Reconciliation fills missing map fields from the configured template.
+Reconciliation fills missing fixed map fields from the configured template.
 
 ---
 
@@ -255,40 +1002,46 @@ Reconciliation fills missing map fields from the configured template.
 ## Manual save
 
 ```lua
-local success, err = profile:SaveAsync()
+local success, err =
+    profile:SaveAsync()
 
 if not success then
-    warn("Save failed:", err)
+    warn(
+        "Save failed:",
+        err
+    )
 end
 ```
 
 Store equivalent:
 
 ```lua
-local success, err = Store:SavePlayerAsync(player)
+local success, err =
+    Store:SavePlayerAsync(player)
 ```
 
 ## Autosave
 
-Autosave is enabled by default:
+Enabled by default:
 
 ```lua
 AutoSave = true
 AutoSaveInterval = 60
 ```
 
-`AutoSaveInterval` must be at least `10` seconds.
-
-The autosave loop spreads profile saves over the configured interval instead of attempting to save every loaded profile at exactly the same moment.
+`AutoSaveInterval` must be at least `10`.
 
 ---
 
 # Releasing Profiles
 
-Release a profile manually when necessary:
+Manual release:
 
 ```lua
-local success, err = profile:ReleaseAsync("ManualRelease")
+local success, err =
+    profile:ReleaseAsync(
+        "ManualRelease"
+    )
 
 if not success then
     warn(err)
@@ -304,150 +1057,198 @@ Store:ReleasePlayerAsync(
 )
 ```
 
-`ReleaseAsync()` saves the profile before releasing its MemoryStore session lock.
-
-The store also performs release handling automatically when a player leaves.
-
----
-
-# Session Locking
-
-Session locking is enabled by default:
-
-```lua
-SessionLocking = true
-SessionLockTimeout = 180
-```
-
-Locks are stored in `MemoryStoreService`.
-
-The lock identifies the current session and is refreshed during saves.
-
-`SessionLockTimeout` must be at least:
-
-```text
-2 × AutoSaveInterval
-```
-
-For the default autosave interval of `60`, the default timeout of `180` satisfies this requirement.
+`ReleaseAsync()` saves before releasing the MemoryStore session lock.
 
 ---
 
 # Lock Modes
 
-`OpenPlayerAsync()` supports a lock behavior through `options.Locked`.
+`OpenPlayerAsync()` supports:
+
+```text
+Wait
+Cancel
+Steal
+```
 
 ## Wait
 
 Default:
 
 ```lua
-local profile, err = Store:OpenPlayerAsync(player, {
-    Locked = "Wait",
-})
+local profile, err =
+    Store:OpenPlayerAsync(
+        player,
+        {
+            Locked = "Wait",
+        }
+    )
 ```
-
-The loader retries until the profile becomes available or `LoadTimeout` is reached.
 
 ## Cancel
 
 ```lua
-local profile, err = Store:OpenPlayerAsync(player, {
-    Locked = "Cancel",
-})
+local profile, err =
+    Store:OpenPlayerAsync(
+        player,
+        {
+            Locked = "Cancel",
+        }
+    )
 ```
-
-Returns immediately when another session owns the lock.
 
 ## Steal
 
 ```lua
-local profile, err = Store:OpenPlayerAsync(player, {
-    Locked = "Steal",
-})
+local profile, err =
+    Store:OpenPlayerAsync(
+        player,
+        {
+            Locked = "Steal",
+        }
+    )
 ```
 
-Attempts to replace the existing lock.
-
-Use lock stealing carefully. It can invalidate another live server's ownership.
+Use `Steal` carefully because another live server may still believe it owns the profile.
 
 ---
 
-# Loading an Existing Profile
+# DataTemplate Versions
 
-```lua
-local profile, err = Store:OpenPlayerAsync(player)
-```
-
-Alias:
-
-```lua
-local profile, err = Store:LoadPlayerAsync(player)
-```
-
-If the profile is already active in this store, the existing profile object is returned.
-
-A failed load returns `nil` and an error value.
-
-Do not replace a failed load with empty player data and continue saving under the same key.
-
----
-
-# Getting an Active Profile
-
-```lua
-local profile = Store:GetProfile(player)
-
-if profile and profile:IsActive() then
-    print(profile.Data)
-end
-```
-
-A numeric positive integer UserId can also be used where the module accepts a player subject.
-
----
-
-# DataTemplate and Versions
-
-Recommended configuration:
+Recommended:
 
 ```lua
 DataTemplate = {
     Version = 1,
 
     Data = {
-        Coins = 0,
-        Level = 1,
+        Rebirths = 0,
+        Clicks = 0,
     },
 }
 ```
 
-The module internally stores the version together with the data.
+The version is especially important with SchemaBuffer because a positional frame is reconstructed using the template associated with that version.
 
-You can also use the older separate style:
+---
+
+# Schema History
+
+If players have already been saved with SchemaBuffer and you later change the schema/defaults, bump `DataTemplate.Version`.
+
+Preserve the old template in `SchemaHistory`.
+
+Example version 1:
+
+```lua
+local V1 = {
+    Rebirths = 0,
+    Clicks = 0,
+}
+```
+
+New version 2:
+
+```lua
+local V2 = {
+    Rebirths = 0,
+    Clicks = 0,
+    Gems = 0,
+}
+```
+
+Configure:
 
 ```lua
 local Store = DataStore.new({
     Name = "PlayersData",
 
-    Template = {
-        Coins = 0,
-        Level = 1,
+    DataTemplate = {
+        Version = 2,
+        Data = V2,
     },
 
-    DataVersion = 1,
+    SchemaHistory = {
+        [1] = V1,
+    },
+
+    Migrations = {
+        [2] = function(data)
+            data.Gems =
+                data.Gems or 0
+
+            return data
+        end,
+    },
 })
 ```
 
-`DataTemplate` is recommended because the version and default data remain together.
+`SchemaHistory` can also contain a DataTemplate-shaped entry:
+
+```lua
+SchemaHistory = {
+    [1] = {
+        Version = 1,
+
+        Data = {
+            Rebirths = 0,
+            Clicks = 0,
+        },
+    },
+}
+```
+
+The version key is what identifies the old schema.
+
+---
+
+# Why the Schema Fingerprint Matters
+
+SchemaBuffer includes a fingerprint made from:
+
+- field paths;
+- inferred leaf kinds;
+- template defaults.
+
+Suppose version 1 was originally:
+
+```lua
+{
+    Coins = 0,
+}
+```
+
+and you silently change the same version to:
+
+```lua
+{
+    Coins = 100,
+}
+```
+
+An old SchemaBuffer save may have omitted `Coins` because it equaled the old default `0`.
+
+Without fingerprint validation, the same payload could incorrectly reconstruct `100`.
+
+v1.8.4 detects that mismatch and errors instead.
+
+Correct approach:
+
+```text
+change schema/default
+        ↓
+bump DataTemplate.Version
+        ↓
+keep old template in SchemaHistory
+        ↓
+run migration if needed
+```
 
 ---
 
 # Migrations
 
-Use `Migrations` to upgrade older player data.
-
-The migration table is indexed by the **target version**.
+Migrations remain indexed by the target version.
 
 ```lua
 local Store = DataStore.new({
@@ -467,15 +1268,26 @@ local Store = DataStore.new({
     },
 
     Migrations = {
-        [2] = function(data, fromVersion, toVersion)
-            data.Gems = data.Gems or 0
+        [2] = function(
+            data,
+            fromVersion,
+            toVersion
+        )
+            data.Gems =
+                data.Gems or 0
+
             return data
         end,
 
-        [3] = function(data, fromVersion, toVersion)
-            data.Stats = data.Stats or {
-                Level = 1,
-            }
+        [3] = function(
+            data,
+            fromVersion,
+            toVersion
+        )
+            data.Stats =
+                data.Stats or {
+                    Level = 1,
+                }
 
             return data
         end,
@@ -483,58 +1295,344 @@ local Store = DataStore.new({
 })
 ```
 
-A migration may mutate the supplied table and return `nil`, or return a replacement table.
-
-If stored data has a newer version than the configured version and:
-
-```lua
-RejectFutureDataVersion = true
-```
-
-loading is rejected.
+A migration can mutate and return `nil`, or return a replacement table.
 
 ---
 
-# Reconciliation
+# Inspecting the Compiled Schema
 
-Enabled by default:
-
-```lua
-Reconcile = true
-```
-
-After loading and migrations, missing fields are copied from the configured template.
-
-Example template:
+Use:
 
 ```lua
-{
-    Coins = 0,
+local info =
+    Store:GetSchemaInfo()
 
-    Settings = {
-        Music = true,
-        SFX = true,
-    },
-}
+print("Enabled:", info.Enabled)
+print("Eligible:", info.Eligible)
+print("Reason:", info.Reason)
+
+print(
+    "Schema format:",
+    info.FormatVersion
+)
+
+print(
+    "Data version:",
+    info.DataVersion
+)
+
+if info.Eligible then
+    print(
+        "Field count:",
+        info.FieldCount
+    )
+
+    print(
+        "Bitmap bytes:",
+        info.BitmapBytes
+    )
+
+    print(
+        "Fingerprint:",
+        info.Fingerprint
+    )
+
+    for _, field in ipairs(info.Fields) do
+        print(
+            field.Index,
+            field.Path,
+            field.Kind
+        )
+    end
+end
 ```
 
-If an older save does not contain `Settings.SFX`, reconciliation adds it.
+Example:
 
-Dense array templates are not recursively reconciled as map templates.
+```text
+Enabled: true
+Eligible: true
+Field count: 5
+Bitmap bytes: 1
+
+1 Coins uint
+2 Settings.Music bool
+3 Settings.SFX bool
+4 Stats.Clicks uint
+5 Stats.Rebirths uint
+```
+
+---
+
+# Storage Information
+
+After a successful save:
+
+```lua
+local info =
+    profile:GetStorageInfo()
+```
+
+## Player key
+
+```lua
+print(
+    "Player key:",
+    info.PlayerKey
+)
+
+print(
+    "Player key bytes:",
+    info.PlayerKeyBytes
+)
+
+print(
+    "Legacy key bytes:",
+    info.LegacyPlayerKeyBytes
+)
+
+print(
+    "Key bytes saved:",
+    info.PlayerKeySavedBytes
+)
+```
+
+## Final codec
+
+```lua
+print(
+    "Generic baseline:",
+    info.LastRawBufferBytes
+)
+
+print(
+    "Stored payload:",
+    info.LastBufferBytes
+)
+
+print(
+    "Codec:",
+    info.LastCompressionMode
+)
+
+print(
+    "Compressed:",
+    info.LastBufferCompressed
+)
+```
+
+## SchemaBuffer
+
+```lua
+print(
+    "Schema eligible:",
+    info.SchemaEligible
+)
+
+print(
+    "Schema candidate available:",
+    info.SchemaCandidateAvailable
+)
+
+print(
+    "Schema selected:",
+    info.SchemaSelected
+)
+
+print(
+    "Schema candidate bytes:",
+    info.LastSchemaCandidateBytes
+)
+
+print(
+    "Schema candidate mode:",
+    info.LastSchemaCandidateMode
+)
+
+print(
+    "Schema raw bytes:",
+    info.LastSchemaRawBytes
+)
+
+print(
+    "Schema field count:",
+    info.SchemaFieldCount
+)
+
+print(
+    "Changed fields stored:",
+    info.LastSchemaPresentFields
+)
+
+print(
+    "Default fields omitted:",
+    info.LastSchemaDefaultFieldsOmitted
+)
+```
+
+## BufferUtil exact-size stats
+
+```lua
+print(
+    "Working bytes:",
+    info.LastWorkingBufferBytes
+)
+
+print(
+    "Compacted bytes:",
+    info.LastCompactedPayloadBytes
+)
+
+print(
+    "Unused working bytes removed:",
+    info.LastUnusedWorkingBytesRemoved
+)
+
+print(
+    "Schema working bytes:",
+    info.LastSchemaWorkingBufferBytes
+)
+
+print(
+    "Schema compacted bytes:",
+    info.LastSchemaCompactedPayloadBytes
+)
+
+print(
+    "Schema unused bytes removed:",
+    info.LastSchemaUnusedWorkingBytesRemoved
+)
+```
+
+## Session
+
+```lua
+print(
+    "Session raw bytes:",
+    info.LastSessionRawBytes
+)
+
+print(
+    "Session stored bytes:",
+    info.LastSessionLockBytes
+)
+
+print(
+    "Session codec:",
+    info.LastSessionCompressionMode
+)
+
+print(
+    "Session working bytes:",
+    info.LastSessionWorkingBufferBytes
+)
+
+print(
+    "Session compacted bytes:",
+    info.LastSessionCompactedPayloadBytes
+)
+```
+
+---
+
+# Example v1.8.4 Size Test
+
+```lua
+Players.PlayerAdded:Connect(function(player)
+    local profile, err =
+        Store:OpenPlayerAsync(player)
+
+    if not profile then
+        warn(err)
+        player:Kick(
+            "Data failed to load."
+        )
+        return
+    end
+
+    profile:Set(
+        "Rebirths",
+        1
+    )
+
+    profile:Set(
+        "Clicks",
+        2234
+    )
+
+    local success, saveErr =
+        profile:SaveAsync()
+
+    if not success then
+        warn(saveErr)
+        return
+    end
+
+    local info =
+        profile:GetStorageInfo()
+
+    print(
+        "Stored codec:",
+        info.LastCompressionMode
+    )
+
+    print(
+        "Generic raw baseline:",
+        info.LastRawBufferBytes,
+        "B"
+    )
+
+    print(
+        "Schema raw:",
+        info.LastSchemaRawBytes,
+        "B"
+    )
+
+    print(
+        "Schema candidate:",
+        info.LastSchemaCandidateBytes,
+        "B"
+    )
+
+    print(
+        "Final stored:",
+        info.LastBufferBytes,
+        "B"
+    )
+
+    print(
+        "Defaults omitted:",
+        info.LastSchemaDefaultFieldsOmitted
+    )
+
+    print(
+        "Schema selected:",
+        info.SchemaSelected
+    )
+end)
+```
+
+For the simple two-`VarUInt` example, a raw SchemaBuffer around `15 B` is expected before Roblox platform-level overhead.
+
+Always use the actual printed result as the authoritative measurement for the current data.
 
 ---
 
 # Compression
 
-Compression is enabled by default:
+Compression remains enabled by default:
 
 ```lua
 CompressionEnabled = true
 ```
 
-v1.7.1 requires **Compression v2.6.4**.
+Required:
 
-The primary table settings are:
+```text
+Compression v2.6.7
+```
+
+Primary settings:
 
 ```lua
 CompressionTableStrategy = "Auto"
@@ -558,74 +1656,19 @@ CompressionAllowExpansion = false
 CompressionCompareLegacyBuffer = true
 ```
 
-For normal DataStore usage, the recommended strategy is:
-
-```lua
-"Auto"
-```
-
-This lets Compression choose the representation appropriate for the current profile instead of forcing one codec on every player's data.
-
----
-
-# Table Compression Strategies
-
-```lua
-CompressionTableStrategy = "Auto"
-```
-
-Supported values:
-
-```text
-Auto
-Compact
-Dynamic
-```
-
-### Auto
-
-Lets Compression compare supported table representations and choose automatically.
-
-### Compact
-
-Prefers the compact table encoder when possible.
-
-### Dynamic
-
-Uses the dynamic typed table encoding path.
-
-For general player profiles, `Auto` is recommended.
-
----
-
-# String Compression Strategies
-
-```lua
-CompressionStringStrategy = "Auto"
-```
-
-Supported values:
+Supported string strategies include:
 
 ```text
 Auto
 Raw
 LZ
 ASCII7
+LowASCII5
 Identifier6
 Numeric4
 ```
 
-Unless your stored strings have a very predictable format, keep this set to `Auto`.
-
----
-
-# Buffer Compression Strategies
-
-```lua
-CompressionBufferStrategy = "Auto"
-```
-
-Supported values:
+Supported buffer strategies:
 
 ```text
 Auto
@@ -635,32 +1678,7 @@ Sparse
 Nibble
 ```
 
-These settings are used for nested buffers and for the legacy BufferV1 comparison path.
-
-Default buffer tuning:
-
-```lua
-CompressionMinBufferBytes = 16
-CompressionMinSavingsBytes = 1
-
-CompressionBufferMinLength = 6
-CompressionBufferSearchDepth = 32
-CompressionBufferWindowSize = 32767
-CompressionBufferMaxMatch = 66
-```
-
----
-
-# Entropy Coding
-
-Default:
-
-```lua
-CompressionEntropyCoding = true
-CompressionEntropyStrategy = "Auto"
-```
-
-Supported strategies:
+Supported entropy strategies:
 
 ```text
 Auto
@@ -668,25 +1686,36 @@ Huffman
 None
 ```
 
-`Auto` is recommended because entropy coding is only useful when its total encoded form is actually beneficial.
-
 ---
 
-# Legacy Storage Compatibility
+# BufferUtil
 
-v1.7.1 keeps decoding support for older DataStore formats.
+Required:
 
-The loader can handle:
+```text
+BufferUtil v1.1.0
+```
 
-- v1.7 native Compression v2.6.4 table buffers;
-- legacy raw BufferV1/SDSB buffers;
-- legacy BufferV1 data wrapped in Compression buffer compression;
-- legacy table records supported by the module;
-- raw legacy table values.
+Default:
 
-This allows existing data to be loaded and then written back using the current v1.7 storage selection path.
+```lua
+BufferUtilEnabled = true
+BufferWriterInitialCapacity = 32
+```
 
-Do not remove the legacy decoder until you are certain no production keys still depend on it.
+DataStore uses BufferUtil internally for exact-size working buffers.
+
+You normally do not need to call BufferUtil yourself just to save a profile.
+
+Public DataStore helper:
+
+```lua
+local exact =
+    DataStore.CompactBufferExact(
+        someBuffer,
+        usedBytes
+    )
+```
 
 ---
 
@@ -694,13 +1723,13 @@ Do not remove the legacy decoder until you are certain no production keys still 
 
 ## Buffer
 
-Default and recommended:
+Default and recommended for v1.8.4:
 
 ```lua
 StorageMode = "Buffer"
 ```
 
-Supports compressed DataTemplate storage and the supported Roblox datatypes listed below.
+This enables the candidate selection system including SchemaBuffer.
 
 ## Table
 
@@ -708,436 +1737,117 @@ Supports compressed DataTemplate storage and the supported Roblox datatypes list
 StorageMode = "Table"
 ```
 
-Stores a normal copied DataTemplate table instead of the compressed buffer path.
+Stores a normal copied DataTemplate table.
 
-Some Roblox datatypes require `Buffer` storage.
-
----
-
-# Supported Persistent Values
-
-The v1.7.1 validator supports:
-
-- `nil`;
-- booleans;
-- finite numbers;
-- strings;
-- buffers;
-- dense arrays;
-- string-keyed map tables;
-- `Vector2`;
-- `Vector3`;
-- `Color3`;
-- `CFrame`;
-- `UDim`;
-- `UDim2`.
-
-Tables cannot be circular.
-
-A table cannot mix string keys and numeric array keys.
-
-Numeric arrays must be dense and use positive integer indexes starting from `1`.
-
-When `StorageMode = "Table"`, strings and string table keys must be valid UTF-8.
-
----
-
-# Storage Limits
-
-Defaults:
-
-```lua
-MaxBufferBytes = 3800000
-MaxDepth = 64
-MaxTableEntries = 100000
-```
-
-`MaxBufferBytes` protects the encoded buffer path from exceeding the configured storage limit.
-
-`MaxDepth` limits nested tables.
-
-`MaxTableEntries` limits the total number of validated table entries.
-
-Keep player profiles intentionally bounded even when compression is effective.
-
----
-
-# Storage Information
-
-After a successful save:
-
-```lua
-local info = profile:GetStorageInfo()
-
-print("Mode:", info.Mode)
-print("Version:", info.Version)
-
-print("Raw bytes:", info.LastRawBufferBytes)
-print("Stored bytes:", info.LastBufferBytes)
-
-print(
-    "Saved bytes:",
-    info.LastCompressionSavedBytes
-)
-
-print(
-    "Savings:",
-    info.LastCompressionSavingsPercent
-)
-
-print(
-    "Compressed:",
-    info.LastBufferCompressed
-)
-
-print(
-    "Codec:",
-    info.LastCompressionMode
-)
-
-print(
-    "Compression version:",
-    info.CompressionVersion
-)
-
-print(
-    "Storage format:",
-    info.StorageFormatVersion
-)
-```
-
-Important:
-
-`LastRawBufferBytes` is the size of the module's legacy raw BufferV1/SDSB baseline used for comparison. It is **not** a measurement of Luau heap memory.
-
----
-
-# Example Compression Result Test
-
-```lua
-Players.PlayerAdded:Connect(function(player)
-    local profile, err = Store:OpenPlayerAsync(player)
-
-    if not profile then
-        warn(
-            "[DataStore] load failed:",
-            player.Name,
-            err
-        )
-
-        player:Kick(
-            "Your data could not be loaded. Please rejoin."
-        )
-
-        return
-    end
-
-    profile:Set(
-        "Coins",
-        profile.Data.Coins + 100
-    )
-
-    local success, saveErr =
-        profile:SaveAsync()
-
-    if not success then
-        warn(
-            "[DataStore] save failed:",
-            saveErr
-        )
-
-        return
-    end
-
-    local info =
-        profile:GetStorageInfo()
-
-    print(
-        "Raw Bytes:",
-        info.LastRawBufferBytes
-    )
-
-    print(
-        "Stored Bytes:",
-        info.LastBufferBytes
-    )
-
-    print(
-        "Saved Bytes:",
-        info.LastCompressionSavedBytes
-    )
-
-    print(
-        "Savings:",
-        string.format(
-            "%.2f%%",
-            info.LastCompressionSavingsPercent
-        )
-    )
-
-    print(
-        "Codec:",
-        info.LastCompressionMode
-    )
-end)
-```
-
----
-
-# Profile Signals
-
-Each loaded profile contains:
-
-```lua
-profile.Changed
-profile.Saved
-profile.Released
-```
-
-## Changed
-
-```lua
-profile.Changed:Connect(function(
-    key,
-    newValue,
-    oldValue
-)
-    print(
-        "Changed:",
-        key,
-        oldValue,
-        "->",
-        newValue
-    )
-end)
-```
-
-For whole-table operations such as `Overwrite()` and `Reconcile()`, the key is `nil`.
-
-## Saved
-
-```lua
-profile.Saved:Connect(function(storageInfo)
-    print(
-        "Stored bytes:",
-        storageInfo.LastBufferBytes
-    )
-end)
-```
-
-## Released
-
-```lua
-profile.Released:Connect(function(reason)
-    print("Released:", reason)
-end)
-```
-
----
-
-# Store Signals
-
-A store exposes:
-
-```lua
-Store.ProfileLoaded
-Store.ProfileReleased
-Store.Issue
-```
-
-## ProfileLoaded
-
-```lua
-Store.ProfileLoaded:Connect(function(profile)
-    print("Loaded:", profile.UserId)
-end)
-```
-
-## ProfileReleased
-
-```lua
-Store.ProfileReleased:Connect(function(
-    profile,
-    reason
-)
-    print(
-        "Released:",
-        profile.UserId,
-        reason
-    )
-end)
-```
-
-## Issue
-
-`Issue` reports operational problems.
-
-```lua
-Store.Issue:Connect(function(
-    issueType,
-    ...
-)
-    warn(
-        "[DataStore Issue]",
-        issueType,
-        ...
-    )
-end)
-```
-
-Issue names used by the module include conditions such as:
-
-```text
-LoadFailed
-DecodeFailed
-MigrationFailed
-InvalidLoadedData
-SessionLost
-SaveFailed
-AutoSaveFailed
-ViewDecodeFailed
-```
+SchemaBuffer is a buffer-storage optimization, so use `StorageMode = "Buffer"` when you want v1.8.4's compact storage path.
 
 ---
 
 # Viewing Data Without Opening a Session
 
-## View the full DataTemplate
+## Full DataTemplate
 
 ```lua
 local dataTemplate, source =
     Store:ViewTemplateAsync(userId)
 
 if dataTemplate then
-    print(dataTemplate.Version)
-    print(dataTemplate.Data)
+    print(
+        dataTemplate.Version
+    )
+
+    print(
+        dataTemplate.Data
+    )
 end
 ```
 
-## View only player data
+## Data only
 
 ```lua
 local data, version, source =
     Store:ViewAsync(userId)
 
 if data then
-    print("Version:", version)
+    print(
+        "Version:",
+        version
+    )
+
     print(data)
 end
 ```
 
-These functions read stored data without creating an active profile session.
-
-Use them for diagnostics or tooling, not as a replacement for normal session ownership during gameplay.
+A SchemaBuffer value is decoded back into the normal named DataTemplate before these functions return it.
 
 ---
 
-# Inspecting Stored Values
-
-## Exact stored payload
+# Inspecting the Actual Stored Value
 
 ```lua
 local payload, payloadType =
     Store:GetStoredPayloadAsync(userId)
 
-print(payloadType)
+print(
+    payloadType
+)
+
+if typeof(payload) == "buffer" then
+    print(
+        "Actual buffer bytes:",
+        buffer.len(payload)
+    )
+end
 ```
 
-This returns a copy of the value currently stored under the player key when possible.
-
-## Buffer-oriented inspection
-
-```lua
-local value, err =
-    Store:GetStoredBufferAsync(userId)
-```
-
-Use `GetStoredPayloadAsync()` when you specifically need to know whether the actual stored value is a `buffer`, `table`, or another legacy value.
+This is useful when comparing what DataForage displays with the actual buffer payload.
 
 ---
 
-# Manual Compression Helpers
-
-These helpers are useful for testing and tooling.
-
-## Compress a DataTemplate
+# Session Lock Inspection
 
 ```lua
-local packet =
-    DataStore.CompressDataTemplate({
-        Version = 1,
-
-        Data = {
-            Coins = 0,
-            Level = 10,
-            Xp = 400,
-            Rebirths = 13,
-        },
-    })
-
-print(packet.Bytes)
-print(packet.Codec)
-```
-
-The function returns the Compression packet.
-
-Its encoded buffer is:
-
-```lua
-packet.Data
-```
-
-## Decompress a DataTemplate
-
-```lua
-local decoded =
-    DataStore.DecompressDataTemplate(
-        packet.Data
+local lockInfo, err =
+    Store:GetSessionLockInfoAsync(
+        userId
     )
 
-print(decoded.Version)
-print(decoded.Data.Coins)
+if not lockInfo then
+    warn(err)
+else
+    print(
+        lockInfo
+    )
+end
 ```
 
 ---
 
-# Legacy Buffer Helpers
+# Public Key Helpers
 
-## Encode using the DataStore BufferV1 codec
-
-```lua
-local rawBuffer =
-    DataStore.Encode(data)
-```
-
-## Decode BufferV1
+Encode the numeric UserId portion:
 
 ```lua
-local decoded =
-    DataStore.Decode(rawBuffer)
-```
-
-## Compress a raw buffer
-
-```lua
-local packed, compressed, stats =
-    DataStore.CompressStorageBuffer(
-        rawBuffer
+local encoded =
+    DataStore.EncodeUserIdKey(
+        10800269681
     )
+
+print(encoded)
 ```
 
-## Decompress a storage buffer
+Decode it:
 
 ```lua
-local raw =
-    DataStore.DecompressStorageBuffer(
-        packed
+local userId =
+    DataStore.DecodeUserIdKey(
+        encoded
     )
+
+print(userId)
 ```
 
-These helpers exist primarily for compatibility, testing, and storage analysis.
-
-Normal player saving already chooses the storage path internally.
+`CompactKeyPrefix` is applied by the Store separately.
 
 ---
 
@@ -1152,7 +1862,7 @@ print(
 Returns:
 
 ```text
-1.7.1
+1.8.4
 ```
 
 Storage format:
@@ -1166,7 +1876,7 @@ print(
 Returns:
 
 ```text
-5
+6
 ```
 
 Compression:
@@ -1180,8 +1890,54 @@ print(
 Returns:
 
 ```text
-2.6.4
+2.6.7
 ```
+
+BufferUtil:
+
+```lua
+print(
+    DataStore.BufferUtilVersion()
+)
+```
+
+Returns:
+
+```text
+1.1.0
+```
+
+Schema format:
+
+```lua
+print(
+    DataStore.SchemaFormatVersion
+)
+```
+
+Session format:
+
+```lua
+print(
+    DataStore.SessionFormatVersion
+)
+```
+
+---
+
+# Legacy Compatibility
+
+v1.8.4 keeps compatibility paths for older stored data, including:
+
+- current SchemaBuffer format;
+- Compression v2.6.7 table frames;
+- generic SDSB / BufferV1 values;
+- compressed legacy BufferV1 values;
+- older supported DataStore records;
+- normal legacy table values;
+- legacy `Player_<UserId>` player keys when compact-key migration is enabled.
+
+An old profile can load through a legacy decoder and then be rewritten using the new v1.8.4 selection path.
 
 ---
 
@@ -1191,53 +1947,65 @@ Returns:
 |---|---:|---|
 | `Name` | required | Roblox DataStore name |
 | `Scope` | `nil` | Optional DataStore scope |
-| `KeyPrefix` | `"Player_"` | Prefix placed before UserIds |
-| `DataTemplate.Version` | `1` | Current data version |
-| `DataTemplate.Data` | `{}` | Default profile data |
-| `Template` | `{}` | Legacy/separate template style |
-| `DataVersion` | `1` | Legacy/separate version style |
+| `KeyPrefix` | `"Player_"` | Legacy player key prefix |
+| `CompactPlayerKeys` | `true` | Use compact Base62 player keys |
+| `CompactKeyPrefix` | `"p"` | Prefix for compact player keys |
+| `MigrateLegacyPlayerKeys` | `true` | Load old `Player_<UserId>` keys when compact key is missing |
+| `DeleteLegacyPlayerKeys` | `true` | Remove old key after a successful compact-key save |
+| `DataTemplate.Version` | `1` | Current data/schema version |
+| `DataTemplate.Data` | `{}` | Default player data |
+| `Template` | `{}` | Legacy separate template style |
+| `DataVersion` | `1` | Legacy separate version style |
 | `Migrations` | `nil` | Target-version migration callbacks |
-| `RejectFutureDataVersion` | `true` | Reject data newer than the configured version |
-| `Reconcile` | `true` | Fill missing template fields after load |
-| `AutoSave` | `true` | Enable autosaving |
-| `AutoSaveInterval` | `60` | Autosave interval; minimum `10` |
-| `SessionLocking` | `true` | Use MemoryStore profile locks |
-| `SessionLockTimeout` | `180` | Lock TTL; must be at least 2× autosave interval |
-| `LoadTimeout` | `30` | Maximum wait for a locked profile in Wait mode |
+| `RejectFutureDataVersion` | `true` | Reject newer stored data versions |
+| `Reconcile` | `true` | Fill missing fixed map fields |
+| `AutoSave` | `true` | Enable autosave |
+| `AutoSaveInterval` | `60` | Autosave interval, minimum `10` |
+| `SessionLocking` | `true` | Enable MemoryStore ownership locks |
+| `SessionLockTimeout` | `180` | Lock TTL |
+| `LoadTimeout` | `30` | Maximum wait for a locked profile |
 | `LockRetryInterval` | `1` | Delay between lock attempts |
-| `MemoryLockRetryAttempts` | `4` | MemoryStore lock operation attempts |
+| `MemoryLockRetryAttempts` | `4` | MemoryStore operation retry count |
+| `SessionCompressionEnabled` | `true` | Allow Smart compression of compact session frames |
+| `SessionStoreDiagnostics` | `false` | Add JobId/PlaceId/timestamp diagnostics to session frame |
 | `RetryAttempts` | `5` | DataStore request attempts |
-| `RetryDelay` | `0.75` | Base request retry delay |
+| `RetryDelay` | `0.75` | Base retry delay |
 | `MaxRetryDelay` | `8` | Maximum retry delay |
-| `ShutdownTimeout` | `25` | Maximum shutdown release window |
-| `BudgetAware` | `true` | Wait for Roblox request budget |
-| `BudgetWaitTimeout` | `10` | Maximum budget wait per request attempt |
+| `ShutdownTimeout` | `25` | Shutdown profile-release window |
+| `BudgetAware` | `true` | Wait for DataStore request budget |
+| `BudgetWaitTimeout` | `10` | Maximum budget wait |
 | `StorageMode` | `"Buffer"` | `"Buffer"` or `"Table"` |
-| `CompressionEnabled` | `true` | Enable compressed buffer candidate selection |
+| `BufferUtilEnabled` | `true` | Use BufferUtil exact-size writer pipeline |
+| `BufferWriterInitialCapacity` | `32` | Initial writer working capacity |
+| `SchemaBufferEnabled` | `true` | Enable positional SchemaBuffer candidate |
+| `SchemaBufferCompress` | `true` | Try Compression Smart on SchemaBuffer |
+| `SchemaFallbackToGeneric` | `true` | Fall back instead of failing on unsupported schema data |
+| `SchemaHistory` | `nil` | Older templates keyed by DataTemplate version |
+| `CompressionEnabled` | `true` | Enable Compression candidates |
 | `CompressionTableStrategy` | `"Auto"` | `Auto`, `Compact`, or `Dynamic` |
 | `CompressionCompressStrings` | `true` | Enable string compression |
 | `CompressionStringStrategy` | `"Auto"` | String codec strategy |
-| `CompressionUseStringDictionary` | `true` | Allow repeated-string dictionaries |
-| `CompressionHomogeneousArrays` | `true` | Allow homogeneous array encodings |
-| `CompressionDeltaArrays` | `true` | Allow delta array encodings |
-| `CompressionRunLengthArrays` | `true` | Allow run-length array encodings |
-| `CompressionCompactMapKeys` | `true` | Allow compact map keys |
-| `CompressionTableKeyMapping` | `true` | Allow repeated key mapping |
-| `CompressionEntropyCoding` | `true` | Enable entropy coding |
-| `CompressionEntropyStrategy` | `"Auto"` | `Auto`, `Huffman`, or `None` |
-| `CompressionAllowExpansion` | `false` | Do not intentionally choose expanding compression forms |
-| `CompressionCompareLegacyBuffer` | `true` | Compare native table result with legacy buffer candidates |
-| `CompressionMinBufferBytes` | `16` | Minimum raw buffer size before legacy buffer compression |
-| `CompressionMinSavingsBytes` | `1` | Required savings before accepting a compressed candidate |
-| `CompressionBufferStrategy` | `"Auto"` | `Auto`, `Raw`, `LZ`, `Sparse`, or `Nibble` |
-| `CompressionBufferMinLength` | `6` | Buffer compression minimum length |
-| `CompressionBufferSearchDepth` | `32` | Buffer match-search depth |
+| `CompressionUseStringDictionary` | `true` | Repeated-string dictionary |
+| `CompressionHomogeneousArrays` | `true` | Homogeneous array codecs |
+| `CompressionDeltaArrays` | `true` | Delta array codecs |
+| `CompressionRunLengthArrays` | `true` | RLE array codecs |
+| `CompressionCompactMapKeys` | `true` | Compact map keys |
+| `CompressionTableKeyMapping` | `true` | Repeated-key mapping |
+| `CompressionEntropyCoding` | `true` | Entropy-coding candidates |
+| `CompressionEntropyStrategy` | `"Auto"` | `Auto`, `Huffman`, `None` |
+| `CompressionAllowExpansion` | `false` | Reject intentionally expanding compression |
+| `CompressionCompareLegacyBuffer` | `true` | Compare legacy buffer candidate |
+| `CompressionMinBufferBytes` | `16` | Minimum size before legacy buffer compression |
+| `CompressionMinSavingsBytes` | `1` | Minimum accepted savings |
+| `CompressionBufferStrategy` | `"Auto"` | Buffer codec strategy |
+| `CompressionBufferMinLength` | `6` | Buffer match minimum |
+| `CompressionBufferSearchDepth` | `32` | Buffer match search depth |
 | `CompressionBufferWindowSize` | `32767` | Buffer search window |
-| `CompressionBufferMaxMatch` | `66` | Maximum buffer match length |
-| `MaxBufferBytes` | `3800000` | Maximum encoded buffer size |
+| `CompressionBufferMaxMatch` | `66` | Maximum buffer match |
+| `MaxBufferBytes` | `3800000` | Maximum encoded buffer |
 | `MaxDepth` | `64` | Maximum nested table depth |
-| `MaxTableEntries` | `100000` | Maximum total table entries |
-| `Debug` | `false` | Enable debug warnings |
+| `MaxTableEntries` | `100000` | Maximum validated table entries |
+| `Debug` | `false` | Debug warnings |
 
 ---
 
@@ -1261,9 +2029,14 @@ Store:SavePlayerAsync(subject)
 Store:ReleasePlayerAsync(subject, reason?)
 ```
 
-`subject` can be a `Player` or positive integer UserId where supported.
+## Schema and key inspection
 
-## Read-only stored-data inspection
+```lua
+Store:GetSchemaInfo()
+Store:GetKeyInfo(subject)
+```
+
+## Stored data
 
 ```lua
 Store:ViewTemplateAsync(subject)
@@ -1271,6 +2044,8 @@ Store:ViewAsync(subject)
 
 Store:GetStoredBufferAsync(subject)
 Store:GetStoredPayloadAsync(subject)
+
+Store:GetSessionLockInfoAsync(subject)
 ```
 
 ## Shutdown
@@ -1311,7 +2086,7 @@ profile:GetStorageInfo()
 
 ---
 
-# Static Utility API Reference
+# Static Utility API
 
 ```lua
 DataStore.CompressDataTemplate(
@@ -1344,80 +2119,183 @@ DataStore.DecompressStorageBuffer(
     options?
 )
 
+DataStore.CompactBufferExact(
+    dataBuffer,
+    usedBytes?
+)
+
+DataStore.EncodeUserIdKey(userId)
+DataStore.DecodeUserIdKey(encoded)
+
 DataStore.Version()
 DataStore.FormatVersion()
 DataStore.CompressionVersion()
+DataStore.BufferUtilVersion()
 ```
 
-The module also exposes:
+Also exposed:
 
 ```lua
 DataStore.Profile
 DataStore.Signal
 DataStore.BufferEncoding
+DataStore.SessionFormatVersion
+DataStore.SchemaFormatVersion
+```
+
+---
+
+# Profile Signals
+
+Each profile exposes:
+
+```lua
+profile.Changed
+profile.Saved
+profile.Released
+```
+
+## Changed
+
+```lua
+profile.Changed:Connect(function(
+    key,
+    newValue,
+    oldValue
+)
+    print(
+        key,
+        oldValue,
+        "->",
+        newValue
+    )
+end)
+```
+
+## Saved
+
+```lua
+profile.Saved:Connect(function(info)
+    print(
+        "Stored:",
+        info.LastBufferBytes,
+        "B"
+    )
+
+    print(
+        "Codec:",
+        info.LastCompressionMode
+    )
+end)
+```
+
+## Released
+
+```lua
+profile.Released:Connect(function(reason)
+    print(
+        "Released:",
+        reason
+    )
+end)
+```
+
+---
+
+# Store Signals
+
+```lua
+Store.ProfileLoaded
+Store.ProfileReleased
+Store.Issue
+```
+
+Example:
+
+```lua
+Store.Issue:Connect(function(
+    issueType,
+    ...
+)
+    warn(
+        "[DataStore Issue]",
+        issueType,
+        ...
+    )
+end)
+```
+
+Common issue conditions include:
+
+```text
+LoadFailed
+DecodeFailed
+MigrationFailed
+InvalidLoadedData
+SessionLost
+SaveFailed
+AutoSaveFailed
+ViewDecodeFailed
 ```
 
 ---
 
 # Production Safety
 
-## Keep one active profile per player
+## Keep one owner for a profile
 
-Use the store as the central owner of a player's persistent data.
+Do not run multiple unrelated profile systems that all believe they own the same player persistence key.
 
-Do not create independent DataStore systems for currency, inventory, progression, and settings that all attempt to own the same persistence key.
+## Never trust client values
 
-## Never trust the client
+The persistence module validates storage structure, not gameplay legitimacy.
 
-The module validates persistence structure, not gameplay intent.
+Validate server-side:
 
-The server must still validate:
-
-- purchases;
 - currency rewards;
-- inventory operations;
+- purchases;
+- inventory changes;
 - progression;
 - permissions;
 - item IDs;
 - cooldowns;
-- admin actions.
+- admin operations.
 
 ## Do not replace failed loads with empty data
 
 Bad:
 
 ```lua
-local profile = Store:OpenPlayerAsync(player)
+local profile =
+    Store:OpenPlayerAsync(player)
 
 if not profile then
-    -- continue with fake empty data
+    -- Do not save fake empty data here.
 end
 ```
 
-A later save could overwrite valid existing data.
+A later save could overwrite valid player data.
 
-Prefer kicking the player or disabling persistent gameplay until a valid profile is loaded.
+## Keep profiles bounded
 
-## Keep data bounded
+Compression and SchemaBuffer reduce representation size.
 
-Avoid giant histories, unlimited arrays, cached temporary state, or objects that can be rebuilt.
-
-Compression reduces storage size. It does not make unbounded profile growth safe.
+They do not make unlimited inventories, histories, logs, or cached temporary data safe.
 
 ---
 
 # Troubleshooting
 
-## `DataStore v1.7 requires a child ModuleScript named Compression v2.6.4`
+## `requires Compression v2.6.7`
 
-Make sure the DataStore ModuleScript contains:
+Make sure:
 
 ```text
 DataStore
 └── Compression
 ```
 
-and:
+exists and:
 
 ```lua
 Compression.Version()
@@ -1426,64 +2304,106 @@ Compression.Version()
 returns:
 
 ```text
-2.6.4
+2.6.7
 ```
 
-## `SessionLocked`
+## `requires BufferUtil v1.1.0`
 
-Another session currently owns the player's MemoryStore lock.
+Make sure:
 
-Use the default `"Wait"` mode unless you have a specific reason to cancel or steal ownership.
+```text
+DataStore
+└── BufferUtil
+```
 
-## `SessionLost`
+exists and:
 
-The profile could no longer refresh its lock.
+```lua
+BufferUtil.VERSION
+```
 
-The module deactivates the profile because saving under uncertain ownership is unsafe.
+is:
 
-## Migration failure
+```text
+1.1.0
+```
 
-Check the migration registered for the target version.
-
-A migration should return a table or `nil`.
-
-## Invalid loaded data
-
-The decoded profile violated one of the DataStore validation rules such as:
-
-- unsupported value type;
-- circular table;
-- mixed numeric/string keys;
-- sparse numeric array;
-- excessive depth;
-- excessive entry count;
-- non-finite number.
-
-## Save is larger than expected
+## SchemaBuffer says the template is not eligible
 
 Inspect:
 
 ```lua
 local info =
-    profile:GetStorageInfo()
+    Store:GetSchemaInfo()
 
-print(info.LastRawBufferBytes)
-print(info.LastBufferBytes)
-print(info.LastCompressionMode)
+warn(info.Reason)
 ```
 
-Remember that very small profiles have fixed framing/metadata overhead, so compression percentage becomes more meaningful as the profile grows.
+Common causes:
+
+- empty dynamic table;
+- array template;
+- unsupported leaf type;
+- non-string map key.
+
+With:
+
+```lua
+SchemaFallbackToGeneric = true
+```
+
+the generic codec can still save the profile.
+
+## Schema fingerprint mismatch
+
+Do not change a released template/default while keeping the same `DataTemplate.Version`.
+
+Instead:
+
+1. preserve the old template in `SchemaHistory`;
+2. increment `DataTemplate.Version`;
+3. add a migration if needed.
+
+## SessionLocked
+
+Another server currently owns the MemoryStore lock.
+
+Use `"Wait"` unless you specifically need different behavior.
+
+## SessionLost
+
+The server could not prove it still owns the session lock.
+
+The profile is deactivated to avoid unsafe writes.
+
+## Save looks larger in Creator Hub
+
+Check:
+
+```lua
+local info =
+    profile:GetStorageInfo()
+
+print(
+    "Actual payload:",
+    info.LastBufferBytes
+)
+```
+
+Creator Hub measures Roblox's platform-level stored entry, which can be larger than the raw Luau buffer.
+
+A DataForage array display or Base64 representation is also not the same thing as `buffer.len()`.
 
 ---
 
-# Recommended Simple Player Script
+# Recommended Player Script
 
 ```lua
-local ServerScriptService =
-    game:GetService("ServerScriptService")
-
 local Players =
     game:GetService("Players")
+
+local ServerScriptService =
+    game:GetService("ServerScriptService")
 
 local DataStore = require(
     ServerScriptService.Data.DataStore
@@ -1496,25 +2416,39 @@ local Store = DataStore.new({
         Version = 1,
 
         Data = {
-            Coins = 0,
-            Level = 10,
-            Xp = 400,
-            Rebirths = 13,
+            Rebirths = 0,
+            Clicks = 0,
+
+            Settings = {
+                Music = true,
+                SFX = true,
+            },
         },
     },
 
     StorageMode = "Buffer",
 
+    SchemaBufferEnabled = true,
+    SchemaBufferCompress = true,
+    SchemaFallbackToGeneric = true,
+
+    BufferUtilEnabled = true,
+
     CompressionEnabled = true,
     CompressionTableStrategy = "Auto",
+    CompressionStringStrategy = "Auto",
     CompressionEntropyStrategy = "Auto",
-    CompressionCompareLegacyBuffer = true,
+
+    CompactPlayerKeys = true,
 
     AutoSave = true,
     AutoSaveInterval = 60,
 
     SessionLocking = true,
     SessionLockTimeout = 180,
+
+    SessionCompressionEnabled = true,
+    SessionStoreDiagnostics = false,
 
     BudgetAware = true,
 })
@@ -1528,6 +2462,34 @@ print(
     "Compression:",
     DataStore.CompressionVersion()
 )
+
+print(
+    "BufferUtil:",
+    DataStore.BufferUtilVersion()
+)
+
+local schema =
+    Store:GetSchemaInfo()
+
+print(
+    "Schema eligible:",
+    schema.Eligible
+)
+
+if schema.Eligible then
+    print(
+        "Schema fields:",
+        schema.FieldCount
+    )
+
+    for _, field in ipairs(schema.Fields) do
+        print(
+            field.Index,
+            field.Path,
+            field.Kind
+        )
+    end
+end
 
 Players.PlayerAdded:Connect(function(player)
     local profile, err =
@@ -1553,7 +2515,7 @@ Players.PlayerAdded:Connect(function(player)
     )
 
     profile:Increment(
-        "Coins",
+        "Clicks",
         100
     )
 
@@ -1574,47 +2536,82 @@ Players.PlayerAdded:Connect(function(player)
         profile:GetStorageInfo()
 
     print(
+        "Key:",
+        info.PlayerKey,
+        "(" .. tostring(
+            info.PlayerKeyBytes
+        ) .. " B)"
+    )
+
+    print(
         "Codec:",
         info.LastCompressionMode
     )
 
     print(
-        "Raw:",
+        "Generic baseline:",
         info.LastRawBufferBytes,
-        "Stored:",
-        info.LastBufferBytes
+        "B"
     )
 
     print(
-        "Savings:",
-        string.format(
-            "%.2f%%",
-            info.LastCompressionSavingsPercent
-        )
+        "Schema candidate:",
+        info.LastSchemaCandidateBytes,
+        "B"
+    )
+
+    print(
+        "Final stored:",
+        info.LastBufferBytes,
+        "B"
+    )
+
+    print(
+        "Schema selected:",
+        info.SchemaSelected
+    )
+
+    print(
+        "Defaults omitted:",
+        info.LastSchemaDefaultFieldsOmitted
+    )
+
+    print(
+        "Session:",
+        info.LastSessionLockBytes,
+        "B"
     )
 end)
 ```
-
-The store itself handles player removal and server shutdown release behavior.
 
 ---
 
 # Release Summary
 
-**DataStore v1.7.1**
+**DataStore v1.8.4**
 
-- Storage format **5**
-- Compression **2.6.4**
-- adaptive table-first compression
-- legacy BufferV1 comparison
-- legacy save decoding
-- MemoryStore session locking
-- autosave
-- migrations
-- reconciliation
-- request retries
-- budget awareness
-- profile mutation tracking
-- storage statistics
-- fixed helper declaration ordering
-
+- storage format **6**;
+- SchemaBuffer format **1**;
+- session format **1**;
+- Compression **2.6.7**;
+- BufferUtil **1.1.0**;
+- positional schema storage for fixed templates;
+- field-name removal from SchemaBuffer payloads;
+- default-value omission;
+- presence-bit boolean packing;
+- VarUInt/VarInt integer packing;
+- schema fingerprint validation;
+- `SchemaHistory` support;
+- adaptive fallback to generic Compression;
+- exact-size working buffers;
+- compact Base62 player keys;
+- legacy key migration;
+- compact MemoryStore session locks;
+- autosave;
+- profile session ownership;
+- migrations;
+- reconciliation;
+- validation;
+- budget-aware retries;
+- legacy save decoding;
+- detailed key/schema/compression/session storage statistics.
