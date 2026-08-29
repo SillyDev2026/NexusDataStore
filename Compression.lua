@@ -2,9 +2,12 @@
 --!optimize 2
 
 local Compression = {}
+local INTERNAL: any = {}
+
+Compression.VERSION = "2.6.7"
 
 export type Mode = "Binary" | "BinaryWithHash"
-export type StringStrategy = "Auto" | "Raw" | "LZ" | "ASCII7" | "Identifier6" | "Numeric4"
+export type StringStrategy = "Auto" | "Raw" | "LZ" | "ASCII7" | "LowASCII5" | "Identifier6" | "Numeric4"
 export type TableStrategy = "Auto" | "Compact" | "Dynamic"
 export type BufferStrategy = "Auto" | "Raw" | "LZ" | "Sparse" | "Nibble"
 export type EntropyStrategy = "Auto" | "Huffman" | "None"
@@ -155,7 +158,7 @@ type SchemaObject = {
 local FMT = {
 	MAGIC_A = 0x43,
 	MAGIC_B = 0x50,
-	VERSION = 25,
+	VERSION = 27,
 	HUFFMAN_MAGIC_A = 0x48,
 	HUFFMAN_MAGIC_B = 0x55,
 	HUFFMAN_MAGIC_C = 0x46,
@@ -1156,10 +1159,16 @@ local NUMERIC4_DECODE = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "-", 
 
 -- Handles raw string packet.
 local function rawStringPacket(value: string): buffer
-	if #value == 0 then return buffer.create(0) end
+	local length = #value
+	if length == 0 then return buffer.create(0) end
+	if length == 1 then
+		local raw = buffer.create(1)
+		buffer.writeu8(raw, 0, string.byte(value, 1))
+		return raw
+	end
 	local first = string.byte(value, 1)
 	if first > STR.RAW_V3 and not FMT.StringStartsHuffmanMagic(value) then
-		local raw = buffer.create(#value)
+		local raw = buffer.create(length)
 		buffer.writestring(raw, 0, value)
 		return raw
 	end
@@ -1176,7 +1185,7 @@ end
 -- Returns the exact raw-string fallback size without allocating it.
 local function rawStringPacketByteLength(value: string): number
 	local length = #value
-	if length == 0 then return 0 end
+	if length <= 1 then return length end
 	local first = string.byte(value, 1)
 	if first > STR.RAW_V3 and not FMT.StringStartsHuffmanMagic(value) then return length end
 	return length + 1
@@ -1187,6 +1196,9 @@ type StringAnalysis = {
 	Numeric4: boolean,
 	Identifier6: boolean,
 	ASCII7: boolean,
+	LowASCII5: boolean,
+	AllSame: boolean,
+	FirstByte: number?,
 }
 
 -- Scans string codec eligibility once so Auto does not rescan for Numeric4, Identifier6, and ASCII7.
@@ -1195,14 +1207,28 @@ local function analyzeString(value: string): StringAnalysis
 	local numeric = length > 0
 	local identifier = length > 0
 	local ascii = length > 0
+	local lowASCII = length > 0
+	local allSame = length > 0
+	local firstByte = length > 0 and string.byte(value, 1) or nil
+
 	for i = 1, length do
 		local byte = string.byte(value, i)
 		if numeric and NUMERIC4_ENCODE[byte] == nil then numeric = false end
 		if identifier and IDENTIFIER_ENCODE[byte] == nil then identifier = false end
 		if ascii and byte > 127 then ascii = false end
-		if not numeric and not identifier and not ascii then break end
+		if lowASCII and byte > 31 then lowASCII = false end
+		if allSame and byte ~= firstByte then allSame = false end
 	end
-	return {Length = length, Numeric4 = numeric, Identifier6 = identifier, ASCII7 = ascii}
+
+	return {
+		Length = length,
+		Numeric4 = numeric,
+		Identifier6 = identifier,
+		ASCII7 = ascii,
+		LowASCII5 = lowASCII,
+		AllSame = allSame,
+		FirstByte = firstByte,
+	}
 end
 
 -- Returns the exact Numeric4 encoded size for an eligible non-empty string.
@@ -1218,6 +1244,133 @@ end
 -- Returns the exact ASCII7 encoded size for an eligible string.
 local function estimatedASCII7Bytes(length: number): number
 	return 1 + varUIntByteLength(length) + math.ceil(length * 7 / 8)
+end
+
+-- Tiny fill packets reuse legacy LZ-v1 packet lengths that were never valid outputs.
+-- 2 bytes: [LZ_V1, byte] means byte x2.
+-- 3 bytes: [LZ_V1, byte, countMinus2] means byte x3..x257.
+-- This is backwards-safe because valid LZ-v1 frames require both lengths and payload data.
+local function estimatedTinyFillBytes(length: number, firstByte: number?): number?
+	if length == 2 then return 2 end
+	if length >= 3 and length <= 257 then
+		-- Zero gets an even denser two-byte frame using truncated legacy RAW.
+		if firstByte == 0 then return 2 end
+		return 3
+	end
+	return nil
+end
+
+local function tinyFillPacket(value: string, analysis: StringAnalysis?): buffer?
+	local info = analysis or analyzeString(value)
+	if info.Length < 2 or info.Length > 257 or not info.AllSame or info.FirstByte == nil then return nil end
+	if info.Length == 2 then
+		local result = buffer.create(2)
+		buffer.writeu8(result, 0, STR.LZ_V1)
+		buffer.writeu8(result, 1, info.FirstByte)
+		return result
+	end
+	if info.FirstByte == 0 then
+		local result = buffer.create(2)
+		buffer.writeu8(result, 0, STR.RAW)
+		buffer.writeu8(result, 1, info.Length - 2)
+		return result
+	end
+	local result = buffer.create(3)
+	buffer.writeu8(result, 0, STR.LZ_V1)
+	buffer.writeu8(result, 1, info.FirstByte)
+	buffer.writeu8(result, 2, info.Length - 2)
+	return result
+end
+
+-- Compact fill extension: [LZ_V2, 0, byte, VarUInt(length)].
+-- An old decoder sees originalLength=0 followed by trailing bytes, which was invalid.
+local function estimatedCompactFillBytes(length: number, firstByte: number?): number
+	-- Zero can reuse [RAW, 0, VarUInt(length)] and saves one extra byte.
+	return (firstByte == 0 and 2 or 3) + varUIntByteLength(length)
+end
+
+local function compactFillPacket(value: string, analysis: StringAnalysis?): buffer?
+	local info = analysis or analyzeString(value)
+	if info.Length < 258 or not info.AllSame or info.FirstByte == nil then return nil end
+	local w = newWriter(estimatedCompactFillBytes(info.Length, info.FirstByte))
+	if info.FirstByte == 0 then
+		writeByte(w, STR.RAW)
+		writeByte(w, 0)
+		writeVarUInt(w, info.Length)
+	else
+		writeByte(w, STR.LZ_V2)
+		writeByte(w, 0)
+		writeByte(w, info.FirstByte)
+		writeVarUInt(w, info.Length)
+	end
+	return finish(w)
+end
+
+-- Short LowASCII5 frame: [RAW, length, packed5].
+-- For lengths 6..127, the payload is no larger than source bytes and shorter than a valid legacy RAW frame,
+-- so older decoders would reject it as truncated instead of mis-decoding it.
+local function estimatedCompactLowASCII5Bytes(length: number): number?
+	if length < 6 or length > 127 then return nil end
+	return 2 + math.ceil(length * 5 / 8)
+end
+
+local function compactLowASCII5Packet(value: string, analysis: StringAnalysis?): buffer?
+	local info = analysis or analyzeString(value)
+	if not info.LowASCII5 then return nil end
+	local estimated = estimatedCompactLowASCII5Bytes(info.Length)
+	if estimated == nil then return nil end
+	local w = newWriter(estimated)
+	writeByte(w, STR.RAW)
+	writeByte(w, info.Length)
+	for i = 1, info.Length do
+		writeBits(w, string.byte(value, i), 5)
+	end
+	return finish(w)
+end
+
+-- LZ-v2 reserves impossible distance=0 back-references as extension frames.
+-- This keeps the top-level string marker stable while allowing newer codecs.
+local LZ_EXT_LOW_ASCII5_TOKEN = 192
+local LZ_EXT_FILL_TOKEN = 193
+
+-- Returns the exact LowASCII5 encoded size for bytes 0-31.
+local function estimatedLowASCII5Bytes(length: number): number
+	return 1 + varUIntByteLength(length) + 2 + math.ceil(length * 5 / 8)
+end
+
+-- Returns the exact compact fill-frame size for a non-empty repeated-byte string.
+local function estimatedStringFillBytes(length: number): number
+	return 1 + varUIntByteLength(length) + 3
+end
+
+-- Packs bytes 0-31 at five bits each inside an LZ-v2 extension frame.
+local function lowASCII5Packet(value: string, analysis: StringAnalysis?): buffer?
+	local info = analysis or analyzeString(value)
+	if info.Length == 0 or not info.LowASCII5 then return nil end
+
+	local w = newWriter(math.max(8, estimatedLowASCII5Bytes(info.Length)))
+	writeByte(w, STR.LZ_V2)
+	writeVarUInt(w, info.Length)
+	writeByte(w, LZ_EXT_LOW_ASCII5_TOKEN)
+	writeVarUInt(w, 0)
+	for i = 1, info.Length do
+		writeBits(w, string.byte(value, i), 5)
+	end
+	return finish(w)
+end
+
+-- Packs a long single-byte string into a constant-size LZ-v2 extension frame.
+local function stringFillPacket(value: string, analysis: StringAnalysis?): buffer?
+	local info = analysis or analyzeString(value)
+	if info.Length == 0 or not info.AllSame or info.FirstByte == nil then return nil end
+
+	local w = newWriter(math.max(8, estimatedStringFillBytes(info.Length)))
+	writeByte(w, STR.LZ_V2)
+	writeVarUInt(w, info.Length)
+	writeByte(w, LZ_EXT_FILL_TOKEN)
+	writeVarUInt(w, 0)
+	writeByte(w, info.FirstByte)
+	return finish(w)
 end
 
 -- Handles numeric4 packet.
@@ -1266,6 +1419,20 @@ local function stringIndexKey(value: string, position: number, length: number): 
 	if position + 2 > length then return nil end
 	local a, b, c = string.byte(value, position, position + 2)
 	return (a :: number) + (b :: number) * 256 + (c :: number) * 65536
+end
+
+-- Short strings below the normal LZ threshold are cheap to inspect for a repeated 3-byte seed.
+local function shortStringHasLZPotential(value: string, length: number): boolean
+	if length < 8 then return false end
+	local seen: {[number]: boolean} = {}
+	for position = 1, length - 2 do
+		local key = stringIndexKey(value, position, length)
+		if key ~= nil then
+			if seen[key] then return true end
+			seen[key] = true
+		end
+	end
+	return false
 end
 
 -- Adds a string position to the LZ index using allocation-free numeric keys.
@@ -1408,12 +1575,24 @@ function Compression.CompressString(value: string, options: Options?): buffer
 		local candidate = ascii7Packet(value)
 		if candidate == nil then fail("ASCII7 strategy only supports ASCII bytes 0-127", 2) end
 		best = candidate
+	elseif strategy == "LowASCII5" then
+		local analysis = analyzeString(value)
+		local candidate = compactLowASCII5Packet(value, analysis) or lowASCII5Packet(value, analysis)
+		if candidate == nil then fail("LowASCII5 strategy only supports bytes 0-31", 2) end
+		best = candidate
 	elseif strategy == "LZ" then
-		best = lzV2Packet(value, options)
+		local analysis = analyzeString(value)
+		local fill = tinyFillPacket(value, analysis) or compactFillPacket(value, analysis)
+		if fill == nil and analysis.AllSame and analysis.Length >= 67 then
+			fill = stringFillPacket(value, analysis)
+		end
+		best = fill or lzV2Packet(value, options)
 	elseif strategy == "Auto" then
 		local analysis = analyzeString(value)
 		local bestCandidate: buffer? = nil
-		local bestBytes = rawStringPacketByteLength(value)
+		-- A codec only counts as compression when it beats the original source bytes.
+		-- Self-contained RAW framing is only a fallback when no true compression wins.
+		local bestBytes = analysis.Length
 
 		if analysis.Numeric4 then
 			local bytes = estimatedNumeric4Bytes(analysis.Length)
@@ -1439,8 +1618,49 @@ function Compression.CompressString(value: string, options: Options?): buffer
 			end
 		end
 
+		if analysis.LowASCII5 then
+			local compactBytes = estimatedCompactLowASCII5Bytes(analysis.Length)
+			if compactBytes ~= nil and compactBytes <= bestBytes then
+				bestCandidate = compactLowASCII5Packet(value, analysis)
+				bestBytes = bestCandidate and buffer.len(bestCandidate) or bestBytes
+			end
+			local bytes = estimatedLowASCII5Bytes(analysis.Length)
+			if bytes < bestBytes then
+				bestCandidate = lowASCII5Packet(value, analysis)
+				bestBytes = bestCandidate and buffer.len(bestCandidate) or bestBytes
+			end
+		end
+
+		if analysis.AllSame then
+			local tinyBytes = estimatedTinyFillBytes(analysis.Length, analysis.FirstByte)
+			if tinyBytes ~= nil and tinyBytes <= bestBytes then
+				bestCandidate = tinyFillPacket(value, analysis)
+				bestBytes = bestCandidate and buffer.len(bestCandidate) or bestBytes
+			end
+
+			if analysis.Length >= 258 then
+				local compactFillBytes = estimatedCompactFillBytes(analysis.Length, analysis.FirstByte)
+				if compactFillBytes < bestBytes then
+					bestCandidate = compactFillPacket(value, analysis)
+					bestBytes = bestCandidate and buffer.len(bestCandidate) or bestBytes
+				end
+			end
+
+			if analysis.Length >= 67 then
+				local bytes = estimatedStringFillBytes(analysis.Length)
+				if bytes < bestBytes then
+					bestCandidate = stringFillPacket(value, analysis)
+					bestBytes = bestCandidate and buffer.len(bestCandidate) or bestBytes
+				end
+			end
+		end
+
 		local minLength = math.max(3, options and options.StringMinLength or 16)
-		if analysis.Length >= minLength then
+		local tryLZ = analysis.Length >= minLength
+			or (analysis.AllSame and analysis.Length >= 4)
+			or (analysis.Length < minLength and shortStringHasLZPotential(value, analysis.Length))
+
+		if tryLZ then
 			local lz = lzV2Packet(value, options)
 			if buffer.len(lz) < bestBytes then
 				bestCandidate = lz
@@ -1502,8 +1722,60 @@ end
 function Compression.DecompressString(data: buffer): string
 	if typeof(data) ~= "buffer" then fail("DecompressString expects buffer", 2) end
 	data = entropyDecodeIfNeeded(data)
-	if buffer.len(data) == 0 then return "" end
+	local dataLength = buffer.len(data)
+	if dataLength == 0 then return "" end
 	local first = buffer.readu8(data, 0)
+
+	-- One-byte packets 0..6 were never emitted as complete legacy strings.
+	-- Treating them as inline literals removes the old 1 -> 2 byte expansion case.
+	if dataLength == 1 and first <= STR.RAW_V3 then
+		return string.char(first)
+	end
+
+	-- Tiny fill frames occupy legacy LZ-v1 lengths that were invalid except [1,0,0].
+	if first == STR.LZ_V1 then
+		if dataLength == 2 then
+			return string.rep(string.char(buffer.readu8(data, 1)), 2)
+		elseif dataLength == 3 then
+			local countCode = buffer.readu8(data, 2)
+			if countCode > 0 then
+				return string.rep(string.char(buffer.readu8(data, 1)), countCode + 2)
+			end
+		end
+	end
+
+	-- Compact LowASCII5 reuses a RAW frame whose declared payload would otherwise be truncated.
+	if first == STR.RAW and dataLength >= 2 then
+		-- Two-byte RAW packets with a non-zero declared length were truncated legacy frames.
+		-- Reuse them as a dense NUL run: count = code + 2.
+		if dataLength == 2 then
+			local zeroRunCode = buffer.readu8(data, 1)
+			if zeroRunCode > 0 then return string.rep("\0", zeroRunCode + 2) end
+		elseif dataLength >= 4 and buffer.readu8(data, 1) == 0 then
+			local rz = newReader(data)
+			readByte(rz)
+			readByte(rz)
+			local zeroLength = readVarUInt(rz)
+			if zeroLength >= 258 and zeroLength <= MAX_DECODE_STRING_BYTES and rz.Position == rz.Length then
+				return string.rep("\0", zeroLength)
+			end
+		end
+	end
+
+	if first == STR.RAW and dataLength >= 6 then
+		local originalLength = buffer.readu8(data, 1)
+		local compactBytes = estimatedCompactLowASCII5Bytes(originalLength)
+		if compactBytes ~= nil and dataLength == compactBytes then
+			local r5 = newReader(data)
+			readByte(r5)
+			readByte(r5)
+			local output = table.create(originalLength)
+			for i = 1, originalLength do output[i] = string.char(readBits(r5, 5)) end
+			if r5.Position ~= r5.Length or r5.BitBuffer ~= 0 then fail("invalid compact LowASCII5 payload", 2) end
+			return table.concat(output)
+		end
+	end
+
 	if first > STR.RAW_V3 then
 		return buffer.readstring(data, 0, buffer.len(data))
 	end
@@ -1566,6 +1838,16 @@ function Compression.DecompressString(data: buffer): string
 		if r.Position ~= r.Length or r.BitBuffer ~= 0 then fail("invalid ASCII7 padding or trailing bytes", 2) end
 		return table.concat(output)
 	elseif mode == STR.LZ_V2 then
+		-- Compact fill extension: [LZ_V2, 0, byte, VarUInt(length)].
+		if r.Position < r.Length and buffer.readu8(r.Buffer, r.Position) == 0 and r.Length >= 4 then
+			readByte(r)
+			local byte = readByte(r)
+			local fillLength = readVarUInt(r)
+			if fillLength < 258 or fillLength > MAX_DECODE_STRING_BYTES then fail("invalid compact LZ fill length", 2) end
+			if r.Position ~= r.Length then fail("invalid compact LZ fill payload", 2) end
+			return string.rep(string.char(byte), fillLength)
+		end
+
 		local originalLength = readVarUInt(r)
 		if originalLength > MAX_DECODE_STRING_BYTES then
 			fail("LZ string exceeds decode limit", 2)
@@ -1586,7 +1868,29 @@ function Compression.DecompressString(data: buffer): string
 			else
 				local length = token - 192 + 3
 				local distance = readVarUInt(r)
-				if distance < 1 or distance > #output or #output + length > originalLength then fail("invalid LZ back-reference", 2) end
+
+				if distance == 0 then
+					if #output ~= 0 then fail("LZ extension must appear at the start of the payload", 2) end
+
+					if token == LZ_EXT_LOW_ASCII5_TOKEN then
+						local availableBits = (r.Length - r.Position) * 8 + r.BitCount
+						if originalLength * 5 > availableBits then fail("truncated LowASCII5 payload", 2) end
+						local packedOutput = table.create(originalLength)
+						for i = 1, originalLength do
+							packedOutput[i] = string.char(readBits(r, 5))
+						end
+						if r.Position ~= r.Length or r.BitBuffer ~= 0 then fail("invalid LowASCII5 padding or trailing bytes", 2) end
+						return table.concat(packedOutput)
+					elseif token == LZ_EXT_FILL_TOKEN then
+						if r.Position + 1 ~= r.Length then fail("invalid LZ fill payload", 2) end
+						local byte = readByte(r)
+						return string.rep(string.char(byte), originalLength)
+					end
+
+					fail("unknown LZ extension", 2)
+				end
+
+				if distance > #output or #output + length > originalLength then fail("invalid LZ back-reference", 2) end
 				for _ = 1, length do
 					local index = #output - distance + 1
 					output[#output + 1] = output[index]
@@ -2644,7 +2948,7 @@ end
 -- Prints a formatted BufferStats report for an original uncompressed buffer.
 function Compression.PrintBufferStats(value: buffer, options: Options?): {[string]: any}
 	local stats = Compression.BufferStats(value, options)
-	print("========== Compression v2.6.4 Buffer Stats ==========")
+	print("========== Compression v" .. Compression.VERSION .. " Buffer Stats ==========")
 	print("Mode:", stats.Mode, "| Frame:", "v" .. tostring(stats.FrameVersion or "?"))
 	print("Raw:", Compression.FormatBytes(stats.RawBytes))
 	print("Encoded:", Compression.FormatBytes(stats.Bytes))
@@ -3007,7 +3311,7 @@ end
 local function readHeader(r: Reader, expectedMode: number): (number, number)
 	if readByte(r) ~= FMT.MAGIC_A or readByte(r) ~= FMT.MAGIC_B then fail("invalid binary header", 2) end
 	local binaryVersion = readByte(r)
-	if binaryVersion ~= FMT.VERSION and binaryVersion ~= 24 and binaryVersion ~= 23 and binaryVersion ~= 22 and binaryVersion ~= 21 and binaryVersion ~= 20 and binaryVersion ~= 19 and binaryVersion ~= 18 and binaryVersion ~= 17 and binaryVersion ~= 16 and binaryVersion ~= 15 and binaryVersion ~= 14 and binaryVersion ~= 13 and binaryVersion ~= 12 and binaryVersion ~= 11 and binaryVersion ~= 10 and binaryVersion ~= 9 and binaryVersion ~= 8 and binaryVersion ~= 7 and binaryVersion ~= 6 then fail("unsupported binary version", 2) end
+	if binaryVersion ~= FMT.VERSION and binaryVersion ~= 26 and binaryVersion ~= 25 and binaryVersion ~= 24 and binaryVersion ~= 23 and binaryVersion ~= 22 and binaryVersion ~= 21 and binaryVersion ~= 20 and binaryVersion ~= 19 and binaryVersion ~= 18 and binaryVersion ~= 17 and binaryVersion ~= 16 and binaryVersion ~= 15 and binaryVersion ~= 14 and binaryVersion ~= 13 and binaryVersion ~= 12 and binaryVersion ~= 11 and binaryVersion ~= 10 and binaryVersion ~= 9 and binaryVersion ~= 8 and binaryVersion ~= 7 and binaryVersion ~= 6 then fail("unsupported binary version", 2) end
 	r.LegacyVarUInt = binaryVersion == 6
 	if readByte(r) ~= expectedMode then fail("unexpected binary mode", 2) end
 	return readVarUInt(r), binaryVersion
@@ -4385,7 +4689,7 @@ local TINY = {
 }
 
 -- Handles append buffer.
-local function appendBuffer(w: Writer, data: buffer)
+function INTERNAL.appendBuffer(w: Writer, data: buffer)
 	flushBits(w)
 	local length = buffer.len(data)
 	ensureCapacity(w, length)
@@ -4395,7 +4699,7 @@ local function appendBuffer(w: Writer, data: buffer)
 end
 
 -- Handles tiny string mode.
-local function tinyStringMode(value: string): (number, number)
+function INTERNAL.tinyStringMode(value: string): (number, number)
 	local length = #value
 	local headerBytes = length <= 31 and 1 or 1 + varUIntByteLength(length)
 	local bestMode = 0
@@ -4427,10 +4731,10 @@ local function tinyStringMode(value: string): (number, number)
 end
 
 -- Handles write tiny string.
-local function writeTinyString(w: Writer, value: string)
+function INTERNAL.writeTinyString(w: Writer, value: string)
 	flushBits(w)
 	local length = #value
-	local mode = tinyStringMode(value)
+	local mode = INTERNAL.tinyStringMode(value)
 	if length <= 31 then
 		if mode == 0 then writeByte(w, length)
 		elseif mode == 1 then writeByte(w, 0x20 + length)
@@ -4462,7 +4766,7 @@ local function writeTinyString(w: Writer, value: string)
 end
 
 -- Handles read tiny string.
-local function readTinyString(r: Reader): string
+function INTERNAL.readTinyString(r: Reader): string
 	alignReader(r)
 	local header = readByte(r)
 	local mode: number
@@ -4535,7 +4839,7 @@ local function readTinyString(r: Reader): string
 end
 
 -- Handles compact integer option.
-local function compactIntegerOption(
+function INTERNAL.compactIntegerOption(
 	value: any,
 	defaultValue: number,
 	minimum: number,
@@ -4564,7 +4868,7 @@ local function compactIntegerOption(
 end
 
 -- Handles build compact key map.
-local function buildCompactKeyMap(value: {[any]: any}, options: Options?): DictionaryState
+function INTERNAL.buildCompactKeyMap(value: {[any]: any}, options: Options?): DictionaryState
 	local state: DictionaryState = {Encode = {}, Decode = {}}
 
 	if options and options.TableKeyMapping == false then
@@ -4613,7 +4917,7 @@ local function buildCompactKeyMap(value: {[any]: any}, options: Options?): Dicti
 
 	visit(value)
 
-	local minimumUses = compactIntegerOption(
+	local minimumUses = INTERNAL.compactIntegerOption(
 		options and options.MappedKeyMinUses,
 		2,
 		2,
@@ -4621,7 +4925,7 @@ local function buildCompactKeyMap(value: {[any]: any}, options: Options?): Dicti
 		"MappedKeyMinUses"
 	)
 
-	local maximum = compactIntegerOption(
+	local maximum = INTERNAL.compactIntegerOption(
 		options and options.MaxMappedKeys,
 		255,
 		0,
@@ -4637,7 +4941,7 @@ local function buildCompactKeyMap(value: {[any]: any}, options: Options?): Dicti
 
 	for key, count in pairs(counts) do
 		if count >= minimumUses then
-			local _, keyBytes = tinyStringMode(key)
+			local _, keyBytes = INTERNAL.tinyStringMode(key)
 			local potential =
 				count * keyBytes
 			- keyBytes
@@ -4695,7 +4999,7 @@ local function buildCompactKeyMap(value: {[any]: any}, options: Options?): Dicti
 end
 
 -- Handles compact array normal uint bytes.
-local function compactArrayNormalUIntBytes(value: {any}): number
+function INTERNAL.compactArrayNormalUIntBytes(value: {any}): number
 	local count = #value
 	local bytes = count <= 15 and 1 or 1 + varUIntByteLength(count)
 	for i = 1, count do bytes += varUIntByteLength(value[i]) end
@@ -4703,7 +5007,7 @@ local function compactArrayNormalUIntBytes(value: {any}): number
 end
 
 -- Handles compact array delta uint bytes.
-local function compactArrayDeltaUIntBytes(value: {any}): number
+function INTERNAL.compactArrayDeltaUIntBytes(value: {any}): number
 	local count = #value
 	local bytes = 1 + varUIntByteLength(count)
 	if count == 0 then return bytes end
@@ -4713,7 +5017,7 @@ local function compactArrayDeltaUIntBytes(value: {any}): number
 end
 
 -- Handles compact array normal int bytes.
-local function compactArrayNormalIntBytes(value: {any}): number
+function INTERNAL.compactArrayNormalIntBytes(value: {any}): number
 	local count = #value
 	local bytes = 1 + varUIntByteLength(count)
 	for i = 1, count do bytes += varIntByteLength(value[i]) end
@@ -4721,7 +5025,7 @@ local function compactArrayNormalIntBytes(value: {any}): number
 end
 
 -- Handles compact array delta int bytes.
-local function compactArrayDeltaIntBytes(value: {any}): number
+function INTERNAL.compactArrayDeltaIntBytes(value: {any}): number
 	local count = #value
 	local bytes = 1 + varUIntByteLength(count)
 	if count == 0 then return bytes end
@@ -4734,7 +5038,7 @@ local compactWriteValue: (Writer, any, Options?) -> ()
 local compactReadValue: (Reader) -> any
 
 -- Handles validate container count.
-local function validateContainerCount(r: Reader, count: number, label: string)
+function INTERNAL.validateContainerCount(r: Reader, count: number, label: string)
 	if count < 0
 		or count % 1 ~= 0 then
 		fail(
@@ -4767,7 +5071,7 @@ local function validateContainerCount(r: Reader, count: number, label: string)
 end
 
 -- Handles write compact count tag.
-local function writeCompactCountTag(w: Writer, smallBase: number, extendedTag: number, count: number)
+function INTERNAL.writeCompactCountTag(w: Writer, smallBase: number, extendedTag: number, count: number)
 	if count <= 15 then
 		writeByte(w, smallBase + count)
 	else
@@ -4777,7 +5081,7 @@ local function writeCompactCountTag(w: Writer, smallBase: number, extendedTag: n
 end
 
 -- Handles compact write array.
-local function compactWriteArray(w: Writer, value: {any}, options: Options?)
+function INTERNAL.compactWriteArray(w: Writer, value: {any}, options: Options?)
 	local count = #value
 	local arrayKind = (not options or options.HomogeneousArrays ~= false) and classifyArray(value) or "Mixed"
 	local runCount = (not options or options.RunLengthArrays ~= false) and countScalarRuns(value) or count
@@ -4800,24 +5104,24 @@ local function compactWriteArray(w: Writer, value: {any}, options: Options?)
 	end
 
 	if arrayKind == "Bool" then
-		writeCompactCountTag(w, CT.SMALL_BOOL_ARRAY, CT.BOOL_ARRAY_EXT, count)
+		INTERNAL.writeCompactCountTag(w, CT.SMALL_BOOL_ARRAY, CT.BOOL_ARRAY_EXT, count)
 		for i = 1, count do writeBits(w, value[i] and 1 or 0, 1) end
 		flushBits(w)
 	elseif arrayKind == "UInt" then
 		local useDelta = count >= 3 and (not options or options.DeltaArrays ~= false)
-		if useDelta then useDelta = compactArrayDeltaUIntBytes(value) < compactArrayNormalUIntBytes(value) end
+		if useDelta then useDelta = INTERNAL.compactArrayDeltaUIntBytes(value) < INTERNAL.compactArrayNormalUIntBytes(value) end
 		if useDelta then
 			writeByte(w, CT.UINT_DELTA_EXT)
 			writeVarUInt(w, count)
 			writeVarUInt(w, value[1])
 			for i = 2, count do writeVarInt(w, value[i] - value[i - 1]) end
 		else
-			writeCompactCountTag(w, CT.SMALL_UINT_ARRAY, CT.UINT_ARRAY_EXT, count)
+			INTERNAL.writeCompactCountTag(w, CT.SMALL_UINT_ARRAY, CT.UINT_ARRAY_EXT, count)
 			for i = 1, count do writeVarUInt(w, value[i]) end
 		end
 	elseif arrayKind == "Int" then
 		local useDelta = count >= 3 and (not options or options.DeltaArrays ~= false)
-		if useDelta then useDelta = compactArrayDeltaIntBytes(value) < compactArrayNormalIntBytes(value) end
+		if useDelta then useDelta = INTERNAL.compactArrayDeltaIntBytes(value) < INTERNAL.compactArrayNormalIntBytes(value) end
 		writeByte(w, useDelta and CT.INT_DELTA_EXT or CT.INT_ARRAY_EXT)
 		writeVarUInt(w, count)
 		if count > 0 then
@@ -4840,16 +5144,16 @@ local function compactWriteArray(w: Writer, value: {any}, options: Options?)
 			if useF32 then writeF32(w, value[i]) else writeF64(w, value[i]) end
 		end
 	elseif arrayKind == "String" then
-		writeCompactCountTag(w, CT.SMALL_STRING_ARRAY, CT.STRING_ARRAY_EXT, count)
-		for i = 1, count do writeTinyString(w, value[i]) end
+		INTERNAL.writeCompactCountTag(w, CT.SMALL_STRING_ARRAY, CT.STRING_ARRAY_EXT, count)
+		for i = 1, count do INTERNAL.writeTinyString(w, value[i]) end
 	else
-		writeCompactCountTag(w, CT.SMALL_ARRAY, CT.ARRAY_EXT, count)
+		INTERNAL.writeCompactCountTag(w, CT.SMALL_ARRAY, CT.ARRAY_EXT, count)
 		for i = 1, count do compactWriteValue(w, value[i], options) end
 	end
 end
 
 -- Handles compact write map.
-local function compactWriteMap(w: Writer, value: {[any]: any}, options: Options?)
+function INTERNAL.compactWriteMap(w: Writer, value: {[any]: any}, options: Options?)
 	local keys = sortedMapKeys(value)
 	local allStringKeys = not options or options.CompactMapKeys ~= false
 
@@ -4863,7 +5167,7 @@ local function compactWriteMap(w: Writer, value: {[any]: any}, options: Options?
 	end
 
 	if allStringKeys then
-		writeCompactCountTag(
+		INTERNAL.writeCompactCountTag(
 			w,
 			CT.SMALL_STRING_MAP,
 			CT.STRING_MAP_EXT,
@@ -4880,16 +5184,16 @@ local function compactWriteMap(w: Writer, value: {[any]: any}, options: Options?
 					writeVarUInt(w, id)
 				else
 					writeVarUInt(w, 0)
-					writeTinyString(w, key)
+					INTERNAL.writeTinyString(w, key)
 				end
 			else
-				writeTinyString(w, key)
+				INTERNAL.writeTinyString(w, key)
 			end
 
 			compactWriteValue(w, value[key], options)
 		end
 	else
-		writeCompactCountTag(
+		INTERNAL.writeCompactCountTag(
 			w,
 			CT.SMALL_MAP,
 			CT.MAP_EXT,
@@ -4946,7 +5250,7 @@ compactWriteValue = function(w: Writer, value: any, options: Options?)
 		end
 	elseif kind == "string" then
 		writeByte(w, CT.VALUE_STRING)
-		writeTinyString(w, value)
+		INTERNAL.writeTinyString(w, value)
 	elseif kind == "Vector2" then
 		if exactFloat32(value.X)
 			and exactFloat32(value.Y) then
@@ -5008,25 +5312,25 @@ compactWriteValue = function(w: Writer, value: any, options: Options?)
 		writeByte(w, CT.VALUE_BUFFER)
 		local packed = Compression.CompressBuffer(value, options)
 		writeVarUInt(w, buffer.len(packed))
-		appendBuffer(w, packed)
+		INTERNAL.appendBuffer(w, packed)
 	elseif kind == "table" then
-		if isArray(value) then compactWriteArray(w, value, options) else compactWriteMap(w, value, options) end
+		if isArray(value) then INTERNAL.compactWriteArray(w, value, options) else INTERNAL.compactWriteMap(w, value, options) end
 	else
 		fail("unsupported compact table type " .. kind, 2)
 	end
 end
 
 -- Handles read compact array.
-local function readCompactArray(r: Reader, count: number): {any}
-	validateContainerCount(r, count, "compact array")
+function INTERNAL.readCompactArray(r: Reader, count: number): {any}
+	INTERNAL.validateContainerCount(r, count, "compact array")
 	local result = table.create(count)
 	for i = 1, count do result[i] = compactReadValue(r) end
 	return result
 end
 
 -- Handles read compact string map.
-local function readCompactStringMap(r: Reader, count: number): {[any]: any}
-	validateContainerCount(r, count, "compact string map")
+function INTERNAL.readCompactStringMap(r: Reader, count: number): {[any]: any}
+	INTERNAL.validateContainerCount(r, count, "compact string map")
 
 	local result = {}
 	local seenKeys: {[string]: boolean} = {}
@@ -5039,7 +5343,7 @@ local function readCompactStringMap(r: Reader, count: number): {[any]: any}
 			local id = readVarUInt(r)
 
 			if id == 0 then
-				key = readTinyString(r)
+				key = INTERNAL.readTinyString(r)
 			else
 				key = keyMap[id]
 
@@ -5048,7 +5352,7 @@ local function readCompactStringMap(r: Reader, count: number): {[any]: any}
 				end
 			end
 		else
-			key = readTinyString(r)
+			key = INTERNAL.readTinyString(r)
 		end
 
 		if seenKeys[key] then
@@ -5063,8 +5367,8 @@ local function readCompactStringMap(r: Reader, count: number): {[any]: any}
 end
 
 -- Handles read compact map.
-local function readCompactMap(r: Reader, count: number): {[any]: any}
-	validateContainerCount(r, count, "compact map")
+function INTERNAL.readCompactMap(r: Reader, count: number): {[any]: any}
+	INTERNAL.validateContainerCount(r, count, "compact map")
 
 	local result = {}
 	local seenKeys: {[any]: boolean} = {}
@@ -5096,7 +5400,7 @@ compactReadValue = function(r: Reader): any
 	if tag >= CT.SMALL_STRING_ARRAY and tag <= CT.SMALL_STRING_ARRAY + 15 then
 		local count = tag - CT.SMALL_STRING_ARRAY
 		local result = table.create(count)
-		for i = 1, count do result[i] = readTinyString(r) end
+		for i = 1, count do result[i] = INTERNAL.readTinyString(r) end
 		return result
 	end
 	if tag >= CT.SMALL_UINT_ARRAY and tag <= CT.SMALL_UINT_ARRAY + 15 then
@@ -5113,14 +5417,14 @@ compactReadValue = function(r: Reader): any
 		alignReader(r)
 		return result
 	end
-	if tag >= CT.SMALL_MAP and tag <= CT.SMALL_MAP + 15 then return readCompactMap(r, tag - CT.SMALL_MAP) end
-	if tag >= CT.SMALL_STRING_MAP and tag <= CT.SMALL_STRING_MAP + 15 then return readCompactStringMap(r, tag - CT.SMALL_STRING_MAP) end
-	if tag >= CT.SMALL_ARRAY and tag <= CT.SMALL_ARRAY + 15 then return readCompactArray(r, tag - CT.SMALL_ARRAY) end
+	if tag >= CT.SMALL_MAP and tag <= CT.SMALL_MAP + 15 then return INTERNAL.readCompactMap(r, tag - CT.SMALL_MAP) end
+	if tag >= CT.SMALL_STRING_MAP and tag <= CT.SMALL_STRING_MAP + 15 then return INTERNAL.readCompactStringMap(r, tag - CT.SMALL_STRING_MAP) end
+	if tag >= CT.SMALL_ARRAY and tag <= CT.SMALL_ARRAY + 15 then return INTERNAL.readCompactArray(r, tag - CT.SMALL_ARRAY) end
 
 	if tag == CT.VALUE_NIL then return nil
 	elseif tag == CT.VALUE_FALSE then return false
 	elseif tag == CT.VALUE_TRUE then return true
-	elseif tag == CT.VALUE_STRING then return readTinyString(r)
+	elseif tag == CT.VALUE_STRING then return INTERNAL.readTinyString(r)
 	elseif tag == CT.VALUE_FLOAT then return readF64(r)
 	elseif tag == CT.VALUE_FLOAT32 then return readF32(r)
 	elseif tag == CT.VALUE_DECIMAL then
@@ -5155,12 +5459,12 @@ compactReadValue = function(r: Reader): any
 		buffer.copy(packed, 0, r.Buffer, r.Position, length)
 		r.Position += length
 		return Compression.DecompressBuffer(packed)
-	elseif tag == CT.ARRAY_EXT then return readCompactArray(r, readVarUInt(r))
-	elseif tag == CT.STRING_MAP_EXT then return readCompactStringMap(r, readVarUInt(r))
-	elseif tag == CT.MAP_EXT then return readCompactMap(r, readVarUInt(r))
+	elseif tag == CT.ARRAY_EXT then return INTERNAL.readCompactArray(r, readVarUInt(r))
+	elseif tag == CT.STRING_MAP_EXT then return INTERNAL.readCompactStringMap(r, readVarUInt(r))
+	elseif tag == CT.MAP_EXT then return INTERNAL.readCompactMap(r, readVarUInt(r))
 	elseif tag == CT.BOOL_ARRAY_EXT then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "compact bool array")
+		INTERNAL.validateContainerCount(r, count, "compact bool array")
 		local result = table.create(count)
 		for i = 1, count do result[i] = readBits(r, 1) == 1 end
 		if r.BitBuffer ~= 0 then fail("invalid compact bool array padding", 2) end
@@ -5168,37 +5472,37 @@ compactReadValue = function(r: Reader): any
 		return result
 	elseif tag == CT.UINT_ARRAY_EXT then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "compact uint array")
+		INTERNAL.validateContainerCount(r, count, "compact uint array")
 		local result = table.create(count)
 		for i = 1, count do result[i] = readVarUInt(r) end
 		return result
 	elseif tag == CT.INT_ARRAY_EXT then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "compact int array")
+		INTERNAL.validateContainerCount(r, count, "compact int array")
 		local result = table.create(count)
 		for i = 1, count do result[i] = readVarInt(r) end
 		return result
 	elseif tag == CT.FLOAT_ARRAY_EXT then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "compact float array")
+		INTERNAL.validateContainerCount(r, count, "compact float array")
 		local result = table.create(count)
 		for i = 1, count do result[i] = readF64(r) end
 		return result
 	elseif tag == CT.FLOAT32_ARRAY_EXT then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "compact float32 array")
+		INTERNAL.validateContainerCount(r, count, "compact float32 array")
 		local result = table.create(count)
 		for i = 1, count do result[i] = readF32(r) end
 		return result
 	elseif tag == CT.STRING_ARRAY_EXT then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "compact string array")
+		INTERNAL.validateContainerCount(r, count, "compact string array")
 		local result = table.create(count)
-		for i = 1, count do result[i] = readTinyString(r) end
+		for i = 1, count do result[i] = INTERNAL.readTinyString(r) end
 		return result
 	elseif tag == CT.UINT_DELTA_EXT then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "compact uint delta array")
+		INTERNAL.validateContainerCount(r, count, "compact uint delta array")
 		local result = table.create(count)
 		if count > 0 then
 			result[1] = readVarUInt(r)
@@ -5207,7 +5511,7 @@ compactReadValue = function(r: Reader): any
 		return result
 	elseif tag == CT.INT_DELTA_EXT then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "compact int delta array")
+		INTERNAL.validateContainerCount(r, count, "compact int delta array")
 		local result = table.create(count)
 		if count > 0 then
 			result[1] = readVarInt(r)
@@ -5218,7 +5522,7 @@ compactReadValue = function(r: Reader): any
 		local count = readVarUInt(r)
 		if count > 4_194_304 then fail("compact RLE array count exceeds decode limit", 2) end
 		local runCount = readVarUInt(r)
-		validateContainerCount(r, runCount, "compact RLE run")
+		INTERNAL.validateContainerCount(r, runCount, "compact RLE run")
 		if runCount > count and count > 0 then fail("compact RLE run count exceeds item count", 2) end
 		local result = table.create(count)
 		local position = 1
@@ -5236,7 +5540,7 @@ compactReadValue = function(r: Reader): any
 end
 
 -- Handles encode compact table buffer.
-local function encodeCompactTableBuffer(
+function INTERNAL.encodeCompactTableBuffer(
 	value: {[any]: any},
 	options: Options?
 ): (buffer, number, number, boolean)
@@ -5255,7 +5559,7 @@ local function encodeCompactTableBuffer(
 	local plainUsefulBits = plain.UsedBits
 	local plainPaddingBits = plain.PaddingBits
 
-	local keyMap = buildCompactKeyMap(
+	local keyMap = INTERNAL.buildCompactKeyMap(
 		value,
 		options
 	)
@@ -5282,7 +5586,7 @@ local function encodeCompactTableBuffer(
 	)
 
 	for i = 1, #keyMap.Decode do
-		writeTinyString(
+		INTERNAL.writeTinyString(
 			mapped,
 			keyMap.Decode[i]
 		)
@@ -5311,14 +5615,14 @@ local function encodeCompactTableBuffer(
 end
 
 -- Handles decode compact table buffer.
-local function decodeCompactTableBuffer(data: buffer): {[any]: any}
+function INTERNAL.decodeCompactTableBuffer(data: buffer): {[any]: any}
 	local r = newReader(data)
 	local magic = readByte(r)
 
 	if magic == FMT.COMPACT_MAPPED_TABLE_MAGIC then
 		local keyCount = readVarUInt(r)
 
-		validateContainerCount(
+		INTERNAL.validateContainerCount(
 			r,
 			keyCount,
 			"compact mapped key dictionary"
@@ -5328,7 +5632,7 @@ local function decodeCompactTableBuffer(data: buffer): {[any]: any}
 		local seen: {[string]: boolean} = {}
 
 		for i = 1, keyCount do
-			local key = readTinyString(r)
+			local key = INTERNAL.readTinyString(r)
 
 			if seen[key] then
 				fail(
@@ -5485,14 +5789,14 @@ CT.TableModeFromData = function(data: buffer): string?
 	local ok, tag = pcall(function()
 		local keyCount = readVarUInt(r)
 
-		validateContainerCount(
+		INTERNAL.validateContainerCount(
 			r,
 			keyCount,
 			"compact mapped key dictionary"
 		)
 
 		for _ = 1, keyCount do
-			readTinyString(r)
+			INTERNAL.readTinyString(r)
 		end
 
 		alignReader(r)
@@ -5510,7 +5814,7 @@ CT.TableModeFromData = function(data: buffer): string?
 end
 
 -- Handles dynamic write.
-local function dynamicWrite(w: Writer, value: any, options: Options?, dictionary: DictionaryState)
+function INTERNAL.dynamicWrite(w: Writer, value: any, options: Options?, dictionary: DictionaryState)
 	local kind = typeof(value)
 	if kind == "nil" then
 		flushBits(w)
@@ -5671,7 +5975,7 @@ local function dynamicWrite(w: Writer, value: any, options: Options?, dictionary
 					local length = 1
 					while i + length <= count and value[i + length] == item do length += 1 end
 					writeVarUInt(w, length)
-					dynamicWrite(w, item, options, dictionary)
+					INTERNAL.dynamicWrite(w, item, options, dictionary)
 					i += length
 				end
 			elseif arrayKind == "Bool" then
@@ -5852,7 +6156,7 @@ local function dynamicWrite(w: Writer, value: any, options: Options?, dictionary
 			else
 				writeByte(w, TAG.ARRAY)
 				writeVarUInt(w, count)
-				for _, item in ipairs(value) do dynamicWrite(w, item, options, dictionary) end
+				for _, item in ipairs(value) do INTERNAL.dynamicWrite(w, item, options, dictionary) end
 			end
 		else
 			local keys = sortedMapKeys(value)
@@ -5867,14 +6171,14 @@ local function dynamicWrite(w: Writer, value: any, options: Options?, dictionary
 				writeVarUInt(w, #keys)
 				for _, key in ipairs(keys) do
 					writeCompactString(w, key, options, dictionary)
-					dynamicWrite(w, value[key], options, dictionary)
+					INTERNAL.dynamicWrite(w, value[key], options, dictionary)
 				end
 			else
 				writeByte(w, TAG.MAP)
 				writeVarUInt(w, #keys)
 				for _, key in ipairs(keys) do
-					dynamicWrite(w, key, options, dictionary)
-					dynamicWrite(w, value[key], options, dictionary)
+					INTERNAL.dynamicWrite(w, key, options, dictionary)
+					INTERNAL.dynamicWrite(w, value[key], options, dictionary)
 				end
 			end
 		end
@@ -5884,7 +6188,7 @@ local function dynamicWrite(w: Writer, value: any, options: Options?, dictionary
 end
 
 -- Handles dynamic read.
-local function dynamicRead(r: Reader, dictionary: DictionaryState): any
+function INTERNAL.dynamicRead(r: Reader, dictionary: DictionaryState): any
 	alignReader(r)
 	local tag = readByte(r)
 	if tag >= TAG.INLINE_UINT_BASE then
@@ -5972,50 +6276,50 @@ local function dynamicRead(r: Reader, dictionary: DictionaryState): any
 		return Compression.DecompressBuffer(packed)
 	elseif tag == TAG.ARRAY then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "dynamic array")
+		INTERNAL.validateContainerCount(r, count, "dynamic array")
 		local result = table.create(count)
-		for i = 1, count do result[i] = dynamicRead(r, dictionary) end
+		for i = 1, count do result[i] = INTERNAL.dynamicRead(r, dictionary) end
 		return result
 	elseif tag == TAG.ARRAY_BOOL then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "dynamic bool array")
+		INTERNAL.validateContainerCount(r, count, "dynamic bool array")
 		local result = table.create(count)
 		for i = 1, count do result[i] = readBits(r, 1) == 1 end
 		return result
 	elseif tag == TAG.ARRAY_UINT then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "dynamic uint array")
+		INTERNAL.validateContainerCount(r, count, "dynamic uint array")
 		local result = table.create(count)
 		for i = 1, count do result[i] = readVarUInt(r) end
 		return result
 	elseif tag == TAG.ARRAY_INT then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "dynamic int array")
+		INTERNAL.validateContainerCount(r, count, "dynamic int array")
 		local result = table.create(count)
 		for i = 1, count do result[i] = readVarInt(r) end
 		return result
 	elseif tag == TAG.ARRAY_FLOAT then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "dynamic float array")
+		INTERNAL.validateContainerCount(r, count, "dynamic float array")
 		local result = table.create(count)
 		for i = 1, count do result[i] = readF64(r) end
 		return result
 	elseif tag == TAG.ARRAY_FLOAT32 then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "dynamic float32 array")
+		INTERNAL.validateContainerCount(r, count, "dynamic float32 array")
 		local result = table.create(count)
 		for i = 1, count do result[i] = readF32(r) end
 		return result
 	elseif tag == TAG.ARRAY_STRING then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "dynamic string array")
+		INTERNAL.validateContainerCount(r, count, "dynamic string array")
 		local result = table.create(count)
 		for i = 1, count do result[i] = readCompactString(r, dictionary) end
 		return result
 	elseif tag == TAG.ARRAY_VECTOR2_F32
 		or tag == TAG.ARRAY_VECTOR2_F64 then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "dynamic Vector2 array")
+		INTERNAL.validateContainerCount(r, count, "dynamic Vector2 array")
 		local result = table.create(count)
 		local useF32 = tag == TAG.ARRAY_VECTOR2_F32
 		for i = 1, count do
@@ -6028,7 +6332,7 @@ local function dynamicRead(r: Reader, dictionary: DictionaryState): any
 	elseif tag == TAG.ARRAY_VECTOR3_F32
 		or tag == TAG.ARRAY_VECTOR3_F64 then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "dynamic Vector3 array")
+		INTERNAL.validateContainerCount(r, count, "dynamic Vector3 array")
 		local result = table.create(count)
 		local useF32 = tag == TAG.ARRAY_VECTOR3_F32
 		for i = 1, count do
@@ -6043,7 +6347,7 @@ local function dynamicRead(r: Reader, dictionary: DictionaryState): any
 		or tag == TAG.ARRAY_COLOR3_F32
 		or tag == TAG.ARRAY_COLOR3_F64 then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "dynamic Color3 array")
+		INTERNAL.validateContainerCount(r, count, "dynamic Color3 array")
 		local result = table.create(count)
 		for i = 1, count do
 			if tag == TAG.ARRAY_COLOR3_RGB8 then
@@ -6057,13 +6361,13 @@ local function dynamicRead(r: Reader, dictionary: DictionaryState): any
 		return result
 	elseif tag == TAG.ARRAY_UDIM then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "dynamic UDim array")
+		INTERNAL.validateContainerCount(r, count, "dynamic UDim array")
 		local result = table.create(count)
 		for i = 1, count do result[i] = UDim.new(readNumberPayload(r), readVarInt(r)) end
 		return result
 	elseif tag == TAG.ARRAY_UDIM2 then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "dynamic UDim2 array")
+		INTERNAL.validateContainerCount(r, count, "dynamic UDim2 array")
 		local result = table.create(count)
 		for i = 1, count do
 			result[i] = UDim2.new(
@@ -6076,19 +6380,19 @@ local function dynamicRead(r: Reader, dictionary: DictionaryState): any
 		return result
 	elseif tag == TAG.ARRAY_NUMBER_RANGE then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "dynamic NumberRange array")
+		INTERNAL.validateContainerCount(r, count, "dynamic NumberRange array")
 		local result = table.create(count)
 		for i = 1, count do result[i] = NumberRange.new(readNumberPayload(r), readNumberPayload(r)) end
 		return result
 	elseif tag == TAG.ARRAY_BRICK_COLOR then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "dynamic BrickColor array")
+		INTERNAL.validateContainerCount(r, count, "dynamic BrickColor array")
 		local result = table.create(count)
 		for i = 1, count do result[i] = BrickColor.new(readVarUInt(r)) end
 		return result
 	elseif tag == TAG.ARRAY_RECT then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "dynamic Rect array")
+		INTERNAL.validateContainerCount(r, count, "dynamic Rect array")
 		local result = table.create(count)
 		for i = 1, count do
 			result[i] = Rect.new(
@@ -6101,7 +6405,7 @@ local function dynamicRead(r: Reader, dictionary: DictionaryState): any
 		return result
 	elseif tag == TAG.ARRAY_DATETIME then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "dynamic DateTime array")
+		INTERNAL.validateContainerCount(r, count, "dynamic DateTime array")
 		local result = table.create(count)
 		for i = 1, count do result[i] = readDateTimePayload(r) end
 		return result
@@ -6109,21 +6413,21 @@ local function dynamicRead(r: Reader, dictionary: DictionaryState): any
 		local count = readVarUInt(r)
 		if count > 4_194_304 then fail("dynamic RLE array count exceeds decode limit", 2) end
 		local runCount = readVarUInt(r)
-		validateContainerCount(r, runCount, "dynamic RLE run")
+		INTERNAL.validateContainerCount(r, runCount, "dynamic RLE run")
 		if runCount > count and count > 0 then fail("dynamic RLE run count exceeds item count", 2) end
 		local result = table.create(count)
 		local position = 1
 		for _ = 1, runCount do
 			local length = readVarUInt(r)
 			if length < 1 or position + length - 1 > count then fail("invalid RLE array", 2) end
-			local item = dynamicRead(r, dictionary)
+			local item = INTERNAL.dynamicRead(r, dictionary)
 			for _ = 1, length do result[position] = item; position += 1 end
 		end
 		if position ~= count + 1 then fail("RLE array length mismatch", 2) end
 		return result
 	elseif tag == TAG.ARRAY_UINT_DELTA then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "dynamic uint delta array")
+		INTERNAL.validateContainerCount(r, count, "dynamic uint delta array")
 		local result = table.create(count)
 		if count > 0 then
 			result[1] = readVarUInt(r)
@@ -6132,7 +6436,7 @@ local function dynamicRead(r: Reader, dictionary: DictionaryState): any
 		return result
 	elseif tag == TAG.ARRAY_INT_DELTA then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "dynamic int delta array")
+		INTERNAL.validateContainerCount(r, count, "dynamic int delta array")
 		local result = table.create(count)
 		if count > 0 then
 			result[1] = readVarInt(r)
@@ -6141,13 +6445,13 @@ local function dynamicRead(r: Reader, dictionary: DictionaryState): any
 		return result
 	elseif tag == TAG.MAP then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "dynamic map")
+		INTERNAL.validateContainerCount(r, count, "dynamic map")
 
 		local result = {}
 		local seenKeys: {[any]: boolean} = {}
 
 		for _ = 1, count do
-			local key = dynamicRead(r, dictionary)
+			local key = INTERNAL.dynamicRead(r, dictionary)
 			local keyType = typeof(key)
 
 			if keyType ~= "string"
@@ -6160,13 +6464,13 @@ local function dynamicRead(r: Reader, dictionary: DictionaryState): any
 			end
 
 			seenKeys[key] = true
-			result[key] = dynamicRead(r, dictionary)
+			result[key] = INTERNAL.dynamicRead(r, dictionary)
 		end
 
 		return result
 	elseif tag == TAG.MAP_STRING then
 		local count = readVarUInt(r)
-		validateContainerCount(r, count, "dynamic string map")
+		INTERNAL.validateContainerCount(r, count, "dynamic string map")
 
 		local result = {}
 		local seenKeys: {[string]: boolean} = {}
@@ -6185,7 +6489,7 @@ local function dynamicRead(r: Reader, dictionary: DictionaryState): any
 			end
 
 			seenKeys[key] = true
-			result[key] = dynamicRead(
+			result[key] = INTERNAL.dynamicRead(
 				r,
 				dictionary
 			)
@@ -6198,7 +6502,7 @@ local function dynamicRead(r: Reader, dictionary: DictionaryState): any
 end
 
 -- Handles write compressed string blob.
-local function writeCompressedStringBlob(w: Writer, value: string, options: Options?)
+function INTERNAL.writeCompressedStringBlob(w: Writer, value: string, options: Options?)
 	local packed = Compression.CompressString(value, options)
 	writeVarUInt(w, buffer.len(packed))
 	flushBits(w)
@@ -6209,7 +6513,7 @@ local function writeCompressedStringBlob(w: Writer, value: string, options: Opti
 end
 
 -- Handles read compressed string blob.
-local function readCompressedStringBlob(r: Reader): string
+function INTERNAL.readCompressedStringBlob(r: Reader): string
 	local length = readVarUInt(r)
 	if r.Position + length > r.Length then fail("truncated dictionary string", 2) end
 	local data = buffer.create(length)
@@ -6219,21 +6523,21 @@ local function readCompressedStringBlob(r: Reader): string
 end
 
 -- Handles assert no cycles.
-local function assertNoCycles(value: any, active: {[any]: boolean}, visited: {[any]: boolean})
+function INTERNAL.assertNoCycles(value: any, active: {[any]: boolean}, visited: {[any]: boolean})
 	if typeof(value) ~= "table" then return end
 	if active[value] then fail("cyclic tables cannot be encoded", 3) end
 	if visited[value] then return end
 	active[value] = true
 	for key, child in pairs(value) do
-		assertNoCycles(key, active, visited)
-		assertNoCycles(child, active, visited)
+		INTERNAL.assertNoCycles(key, active, visited)
+		INTERNAL.assertNoCycles(child, active, visited)
 	end
 	active[value] = nil
 	visited[value] = true
 end
 
 -- Handles encode dynamic value packet.
-local function encodeDynamicValuePacket(
+function INTERNAL.encodeDynamicValuePacket(
 	value: any,
 	options: Options?,
 	schemaVersion: number,
@@ -6241,7 +6545,7 @@ local function encodeDynamicValuePacket(
 	cyclesAlreadyChecked: boolean?
 ): Packet
 	if not cyclesAlreadyChecked then
-		assertNoCycles(value, {}, {})
+		INTERNAL.assertNoCycles(value, {}, {})
 	end
 
 	local w = newWriter()
@@ -6249,9 +6553,9 @@ local function encodeDynamicValuePacket(
 	writeHeader(w, MODE.DYNAMIC, schemaVersion)
 	writeVarUInt(w, #dictionary.Decode)
 	for i = 1, #dictionary.Decode do
-		writeCompressedStringBlob(w, dictionary.Decode[i], options)
+		INTERNAL.writeCompressedStringBlob(w, dictionary.Decode[i], options)
 	end
-	dynamicWrite(w, value, options, dictionary)
+	INTERNAL.dynamicWrite(w, value, options, dictionary)
 
 	local data = finish(w)
 	return packetFromEntropy(
@@ -6286,11 +6590,11 @@ function Compression.Encode(value: any, options: Options?): Packet
 		and options
 		and options.TableCompression ~= false
 		and options.TableStrategy == "Compact" then
-		assertNoCycles(value, {}, {})
+		INTERNAL.assertNoCycles(value, {}, {})
 		local compactTable,
 			usefulBits,
 			paddingBits =
-			encodeCompactTableBuffer(
+			INTERNAL.encodeCompactTableBuffer(
 				value,
 				options
 			)
@@ -6317,7 +6621,7 @@ function Compression.Encode(value: any, options: Options?): Packet
 		return packet
 	end
 
-	return encodeDynamicValuePacket(
+	return INTERNAL.encodeDynamicValuePacket(
 		value,
 		options,
 		schemaVersion,
@@ -6345,7 +6649,7 @@ function Compression.Decode(packet: Packet | buffer, options: Options?): any
 		local first = buffer.readu8(data, 0)
 		if first == FMT.COMPACT_TABLE_MAGIC
 			or first == FMT.COMPACT_MAPPED_TABLE_MAGIC then
-			return decodeCompactTableBuffer(data)
+			return INTERNAL.decodeCompactTableBuffer(data)
 		end
 	end
 
@@ -6356,7 +6660,7 @@ function Compression.Decode(packet: Packet | buffer, options: Options?): any
 	if r.Length >= 2 and buffer.readu8(data, 0) == FMT.COMPACT_NUMBER_MAGIC then
 		readByte(r)
 		local compactVersion = readByte(r)
-		if compactVersion ~= FMT.VERSION and compactVersion ~= 24 and compactVersion ~= 23 and compactVersion ~= 22 and compactVersion ~= 21 and compactVersion ~= 20 and compactVersion ~= 19 and compactVersion ~= 18 and compactVersion ~= 17 and compactVersion ~= 16 and compactVersion ~= 15 and compactVersion ~= 14 and compactVersion ~= 13 and compactVersion ~= 12 and compactVersion ~= 11 and compactVersion ~= 10 and compactVersion ~= 9 and compactVersion ~= 8 and compactVersion ~= 7 then fail("unsupported compact number version", 2) end
+		if compactVersion ~= FMT.VERSION and compactVersion ~= 26 and compactVersion ~= 25 and compactVersion ~= 24 and compactVersion ~= 23 and compactVersion ~= 22 and compactVersion ~= 21 and compactVersion ~= 20 and compactVersion ~= 19 and compactVersion ~= 18 and compactVersion ~= 17 and compactVersion ~= 16 and compactVersion ~= 15 and compactVersion ~= 14 and compactVersion ~= 13 and compactVersion ~= 12 and compactVersion ~= 11 and compactVersion ~= 10 and compactVersion ~= 9 and compactVersion ~= 8 and compactVersion ~= 7 then fail("unsupported compact number version", 2) end
 		local value = readNumberPayload(r)
 		if r.Position ~= r.Length then fail("trailing bytes in compact number payload", 2) end
 		return value
@@ -6364,11 +6668,11 @@ function Compression.Decode(packet: Packet | buffer, options: Options?): any
 	local _, binaryVersion = readHeader(r, MODE.DYNAMIC)
 	local dictionary: DictionaryState = {Encode = {}, Decode = {}}
 	local count = readVarUInt(r)
-	validateContainerCount(r, count, "string dictionary")
+	INTERNAL.validateContainerCount(r, count, "string dictionary")
 	for i = 1, count do
 		local value =
 			binaryVersion >= 8
-			and readCompressedStringBlob(r)
+			and INTERNAL.readCompressedStringBlob(r)
 			or readStringRaw(r)
 
 		if dictionary.Encode[value] ~= nil then
@@ -6381,7 +6685,7 @@ function Compression.Decode(packet: Packet | buffer, options: Options?): any
 		dictionary.Decode[i] = value
 		dictionary.Encode[value] = i
 	end
-	local value = dynamicRead(r, dictionary)
+	local value = INTERNAL.dynamicRead(r, dictionary)
 	alignReader(r)
 	if r.Position ~= r.Length then fail("trailing bytes in dynamic payload", 2) end
 	return value
@@ -6664,15 +6968,45 @@ function Compression.StringMode(data: buffer): string
 		if not ok then return "Invalid" end
 		return "Huffman/" .. Compression.StringMode(decoded)
 	end
-	if buffer.len(data) == 0 then return "RawPassthrough" end
+	local dataLength = buffer.len(data)
+	if dataLength == 0 then return "RawPassthrough" end
 	local mode = buffer.readu8(data, 0)
+	if dataLength == 1 and mode <= STR.RAW_V3 then return "InlineLiteral" end
+	if mode == STR.LZ_V1 then
+		if dataLength == 2 then return "TinyFill" end
+		if dataLength == 3 and buffer.readu8(data, 2) > 0 then return "TinyFill" end
+	end
+	if mode == STR.RAW and dataLength == 2 and buffer.readu8(data, 1) > 0 then return "TinyZeroFill" end
+	if mode == STR.RAW and dataLength >= 4 and buffer.readu8(data, 1) == 0 then return "ZeroFill-Compact" end
+	if mode == STR.RAW and dataLength >= 6 then
+		local originalLength = buffer.readu8(data, 1)
+		local compactBytes = estimatedCompactLowASCII5Bytes(originalLength)
+		if compactBytes ~= nil and dataLength == compactBytes then return "LowASCII5-Compact" end
+	end
+	if mode == STR.LZ_V2 and dataLength >= 4 and buffer.readu8(data, 1) == 0 then return "LZ-Fill-Compact" end
 	if mode > STR.RAW_V3 then return "RawPassthrough" end
 	if mode == STR.RAW then return "Raw" end
 	if mode == STR.LZ_V1 then return "LZ-v1" end
 	if mode == STR.NUMERIC4 then return "Numeric4" end
 	if mode == STR.IDENTIFIER6 then return "Identifier6" end
 	if mode == STR.ASCII7 then return "ASCII7" end
-	if mode == STR.LZ_V2 then return "LZ-v2" end
+	if mode == STR.LZ_V2 then
+		local ok, extensionMode = pcall(function(): string?
+			local r = newReader(data)
+			readByte(r)
+			readVarUInt(r)
+			if r.Position >= r.Length then return nil end
+			local token = readByte(r)
+			if token < 192 then return nil end
+			local distance = readVarUInt(r)
+			if distance ~= 0 then return nil end
+			if token == LZ_EXT_LOW_ASCII5_TOKEN then return "LowASCII5" end
+			if token == LZ_EXT_FILL_TOKEN then return "LZ-Fill" end
+			return nil
+		end)
+		if ok and extensionMode ~= nil then return extensionMode end
+		return "LZ-v2"
+	end
 	if mode == STR.RAW_V3 then return "Raw" end
 	return "Unknown"
 end
@@ -6713,7 +7047,7 @@ end
 -- Prints string stats.
 function Compression.PrintStringStats(value: string, options: Options?): {[string]: any}
 	local stats = Compression.StringStats(value, options)
-	print("========== Compression v2.6.4 String Stats ==========")
+	print("========== Compression v" .. Compression.VERSION .. " String Stats ==========")
 	print("Mode:", stats.Mode)
 	print("Raw:", stats.RawBytesText)
 	print("Encoded:", stats.EncodedBytesText)
@@ -6764,7 +7098,7 @@ function Compression.DecompressStringSmart(data: buffer, compressed: boolean): s
 end
 
 -- Handles auto codec for.
-local function autoCodecFor(value: any, packet: Packet, options: Options?): string
+function INTERNAL.autoCodecFor(value: any, packet: Packet, options: Options?): string
 	if packet.Codec ~= nil then return packet.Codec end
 	local kind = typeof(value)
 	local inspectData = packet.Data
@@ -6821,13 +7155,13 @@ local function autoCodecFor(value: any, packet: Packet, options: Options?): stri
 	return base .. suffix
 end
 -- Handles dynamic table packet.
-local function dynamicTablePacket(
+function INTERNAL.dynamicTablePacket(
 	value: {[any]: any},
 	options: Options?,
 	rawBits: number,
 	cyclesAlreadyChecked: boolean
 ): Packet
-	local packet = encodeDynamicValuePacket(
+	local packet = INTERNAL.encodeDynamicValuePacket(
 		value,
 		options,
 		options and options.SchemaVersion or 1,
@@ -6839,12 +7173,12 @@ local function dynamicTablePacket(
 end
 
 -- Handles adaptive table packet.
-local function adaptiveTablePacket(value: {[any]: any}, options: Options?): Packet
-	assertNoCycles(value, {}, {})
+function INTERNAL.adaptiveTablePacket(value: {[any]: any}, options: Options?): Packet
+	INTERNAL.assertNoCycles(value, {}, {})
 	local rawBits = rawValueBits(value)
 
 	if options and options.TableStrategy == "Dynamic" then
-		return dynamicTablePacket(value, options, rawBits, true)
+		return INTERNAL.dynamicTablePacket(value, options, rawBits, true)
 	end
 
 	if options and options.TableStrategy == "Compact" then
@@ -6853,7 +7187,7 @@ local function adaptiveTablePacket(value: {[any]: any}, options: Options?): Pack
 			compactUsefulBits,
 			compactPaddingBits =
 			pcall(
-				encodeCompactTableBuffer,
+				INTERNAL.encodeCompactTableBuffer,
 				value,
 				options
 			)
@@ -6871,7 +7205,7 @@ local function adaptiveTablePacket(value: {[any]: any}, options: Options?): Pack
 			return packet
 		end
 
-		return dynamicTablePacket(
+		return INTERNAL.dynamicTablePacket(
 			value,
 			options,
 			rawBits,
@@ -6884,13 +7218,13 @@ local function adaptiveTablePacket(value: {[any]: any}, options: Options?): Pack
 		compactUsefulBits,
 		compactPaddingBits =
 		pcall(
-			encodeCompactTableBuffer,
+			INTERNAL.encodeCompactTableBuffer,
 			value,
 			options
 		)
 
 	local dynamicPacket =
-		dynamicTablePacket(
+		INTERNAL.dynamicTablePacket(
 			value,
 			options,
 			rawBits,
@@ -6922,7 +7256,7 @@ end
 function Compression.Compress(value: any, options: Options?): Packet
 	if typeof(value) == "table"
 		and (not options or options.TableCompression ~= false) then
-		return adaptiveTablePacket(value, options)
+		return INTERNAL.adaptiveTablePacket(value, options)
 	end
 
 	return Compression.Encode(value, options)
@@ -6938,14 +7272,14 @@ function Compression.Auto(value: any, options: Options?): Packet
 	local packet = Compression.Compress(value, options)
 	local kind = typeof(value)
 	packet.ValueType = kind
-	packet.Codec = autoCodecFor(value, packet, options)
+	packet.Codec = INTERNAL.autoCodecFor(value, packet, options)
 	if kind == "boolean" then
 		markBooleanPacket(packet)
 	end
 
 	if not options or options.AllowExpansion ~= true then
 		local rawBytes, rawCodec = rawAutoByteCountAndCodec(value)
-		if rawBytes ~= nil and rawCodec ~= nil and rawBytes < packet.Bytes then
+		if rawBytes ~= nil and rawCodec ~= nil and rawBytes <= packet.Bytes then
 			local rawData = rawAutoData(value)
 			if rawData ~= nil then
 				local rawPacket = packetFromBuffer(rawData, options, options and options.SchemaVersion or 1, rawValueBits(value))
@@ -6985,6 +7319,12 @@ function Compression.TryAutoDecompress(packet: Packet | buffer, options: Options
 	return false, nil, tostring(result)
 end
 
+-- Returns true when Auto selected an actual smaller representation instead of passthrough.
+function Compression.AutoCompressed(value: any, options: Options?): boolean
+	local packet = Compression.Auto(value, options)
+	return packet.Passthrough ~= true and packet.RawBytes ~= nil and packet.Bytes < packet.RawBytes
+end
+
 -- Handles auto stats.
 function Compression.AutoStats(value: any, options: Options?): {[string]: any}
 	local packet = Compression.Auto(value, options)
@@ -7001,7 +7341,7 @@ end
 -- Prints auto stats.
 function Compression.PrintAutoStats(value: any, options: Options?): {[string]: any}
 	local stats = Compression.AutoStats(value, options)
-	print("========== Compression v2.6.4 Auto Stats ==========")
+	print("========== Compression v" .. Compression.VERSION .. " Auto Stats ==========")
 	print("Type:", stats.ValueType)
 	print("Codec:", stats.Codec)
 	if stats.Entropy ~= nil then
@@ -7219,7 +7559,7 @@ MODE.AnalyzeTableStructure = function(value: {[any]: any}): {[string]: any}
 			result.RepeatedStringKeys += 1
 
 			local _, keyBytes =
-				tinyStringMode(key)
+				INTERNAL.tinyStringMode(key)
 
 			if keyBytes * count
 				- keyBytes
@@ -7248,7 +7588,7 @@ MODE.TopLevelDynamicTag = function(packet: Packet | buffer, options: Options?): 
 		local _, binaryVersion = readHeader(r, MODE.DYNAMIC)
 		local count = readVarUInt(r)
 		for _ = 1, count do
-			if binaryVersion >= 8 then readCompressedStringBlob(r) else readStringRaw(r) end
+			if binaryVersion >= 8 then INTERNAL.readCompressedStringBlob(r) else readStringRaw(r) end
 		end
 		alignReader(r)
 		return readByte(r)
@@ -7265,7 +7605,7 @@ function Compression.CompressTable(value: {[any]: any}, options: Options?): buff
 		return Compression.Encode(value, options).Data
 	end
 
-	return adaptiveTablePacket(value, options).Data
+	return INTERNAL.adaptiveTablePacket(value, options).Data
 end
 
 -- Compresses table packet.
@@ -7276,7 +7616,7 @@ function Compression.CompressTablePacket(value: {[any]: any}, options: Options?)
 		return Compression.Encode(value, options)
 	end
 
-	return adaptiveTablePacket(value, options)
+	return INTERNAL.adaptiveTablePacket(value, options)
 end
 
 -- Decompresses table.
@@ -7288,7 +7628,7 @@ function Compression.DecompressTable(packet: Packet | buffer, options: Options?)
 			buffer.readu8(data, 0) == FMT.COMPACT_TABLE_MAGIC
 				or buffer.readu8(data, 0) == FMT.COMPACT_MAPPED_TABLE_MAGIC
 		) then
-		value = decodeCompactTableBuffer(data)
+		value = INTERNAL.decodeCompactTableBuffer(data)
 	else
 		value = Compression.Decode(
 			data,
@@ -7424,7 +7764,7 @@ function Compression.TableStats(value: {[any]: any}, options: Options?): {[strin
 		MODE.AnalyzeTableStructure(value)
 
 	local keyMap =
-		buildCompactKeyMap(
+		INTERNAL.buildCompactKeyMap(
 			value,
 			options
 		)
@@ -7653,7 +7993,7 @@ end
 -- Prints table stats.
 function Compression.PrintTableStats(value: {[any]: any}, options: Options?): {[string]: any}
 	local stats = Compression.TableStats(value, options)
-	print("========== Compression v2.6.4 Table Stats ==========")
+	print("========== Compression v" .. Compression.VERSION .. " Table Stats ==========")
 	print("Mode:", stats.Mode)
 	print("Format:", stats.Format)
 	print("Kind:", stats.Kind)
@@ -7874,7 +8214,7 @@ end
 
 -- Handles version.
 function Compression.Version(): string
-	return "2.6.4"
+	return Compression.VERSION
 end
 
 return Compression
