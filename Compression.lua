@@ -4,7 +4,7 @@
 local Compression = {}
 local INTERNAL: any = {}
 
-Compression.VERSION = "2.6.7"
+Compression.VERSION = "3.0.0"
 
 export type Mode = "Binary" | "BinaryWithHash"
 export type StringStrategy = "Auto" | "Raw" | "LZ" | "ASCII7" | "LowASCII5" | "Identifier6" | "Numeric4"
@@ -51,6 +51,7 @@ export type Options = {
 export type Descriptor = {
 	Kind: string,
 	Optional: boolean?,
+	Default: any?,
 	Options: {[string]: any}?,
 	Item: Descriptor?,
 	Fields: {[string]: Descriptor}?,
@@ -91,6 +92,7 @@ export type BitLayoutField = {
 	Name: string,
 	Type: string,
 	Present: boolean,
+	Defaulted: boolean?,
 	UsefulBits: number,
 	PaddingBits: number,
 	PhysicalBits: number,
@@ -102,6 +104,8 @@ export type BitLayoutField = {
 
 export type BitLayout = {
 	HeaderBits: number,
+	DefaultFields: number?,
+	ElidedRawBits: number?,
 	UsefulBits: number,
 	PaddingBits: number,
 	PhysicalBits: number,
@@ -155,15 +159,37 @@ type SchemaObject = {
 	PrintBitLayout: (self: SchemaObject, value: {[string]: any}) -> BitLayout,
 }
 
+export type IndexedLayoutObject = {
+	Version: number,
+	Keys: {string},
+	Mode: string,
+	ToIndexed: (self: IndexedLayoutObject, value: {[string]: any}) -> {any},
+	FromIndexed: (self: IndexedLayoutObject, value: {any}) -> {[string]: any},
+	Encode: (self: IndexedLayoutObject, value: {[string]: any}, options: Options?) -> Packet,
+	Decode: (self: IndexedLayoutObject, packet: Packet | buffer, options: Options?) -> {[string]: any},
+	Stats: (self: IndexedLayoutObject, value: {[string]: any}, options: Options?) -> {[string]: any},
+}
+
+type IndexedLayoutNode = {
+	Kind: string,
+	Keys: {string}?,
+	IndexByKey: {[string]: number}?,
+	Children: {IndexedLayoutNode}?,
+	Defaults: {any}?,
+	Item: IndexedLayoutNode?,
+}
+
 local FMT = {
 	MAGIC_A = 0x43,
 	MAGIC_B = 0x50,
-	VERSION = 27,
+	VERSION = 29,
 	HUFFMAN_MAGIC_A = 0x48,
 	HUFFMAN_MAGIC_B = 0x55,
 	HUFFMAN_MAGIC_C = 0x46,
 	HUFFMAN_MAGIC_D = 0x31,
 	COMPACT_NUMBER_MAGIC = 0xD7,
+	SCHEMA_V29_MAGIC = 0xD1,
+	DELTA_V29_MAGIC = 0xD0,
 	COMPACT_BUFFER_ZERO_RUN_MAGIC = 0xD6,
 	COMPACT_TABLE_MAGIC = 0xD5,
 	COMPACT_MAPPED_TABLE_MAGIC = 0xD2,
@@ -242,6 +268,14 @@ local TAG = {
 	ARRAY_BRICK_COLOR = 52,
 	ARRAY_RECT = 53,
 	ARRAY_DATETIME = 54,
+	ARRAY_UINT_BITS = 55,
+	ARRAY_INT_BITS = 56,
+	ARRAY_UINT_DELTA_BITS = 57,
+	ARRAY_INT_DELTA_BITS = 58,
+	ARRAY_UINT_FIXED_BITS = 59,
+	ARRAY_INT_FIXED_BITS = 60,
+	ARRAY_UINT_DELTA_FIXED_BITS = 61,
+	ARRAY_INT_DELTA_FIXED_BITS = 62,
 	INLINE_NEG_BASE = 112,
 	INLINE_UINT_BASE = 128,
 }
@@ -407,6 +441,37 @@ local function readBits(r: Reader, count: number): number
 		multiplier *= base
 	end
 	return result
+end
+
+-- Writes standard VarUInt bytes through the bit stream without byte-aligning it.
+-- This is used by the bit-first integer escape path so a large value can fall
+-- back to the existing byte representation without wasting the remaining bits
+-- in the current physical byte.
+function INTERNAL.writeVarUIntBits(w: Writer, value: number)
+	if value < 0 or value % 1 ~= 0 or value > MAX_SAFE_INTEGER then
+		fail("expected safe unsigned integer", 2)
+	end
+	repeat
+		local byte = value % 128
+		value = math.floor(value / 128)
+		if value > 0 then byte += 128 end
+		writeBits(w, byte, 8)
+	until value == 0
+end
+
+-- Reads a VarUInt that was written with writeVarUIntBits.
+function INTERNAL.readVarUIntBits(r: Reader): number
+	local result = 0
+	local multiplier = 1
+	for _ = 1, 8 do
+		local byte = readBits(r, 8)
+		result += (byte % 128) * multiplier
+		if result > MAX_SAFE_INTEGER then fail("bit VarUInt exceeds safe integer range", 2) end
+		if byte < 128 then return result end
+		multiplier *= 128
+	end
+	fail("invalid bit VarUInt", 2)
+	return 0
 end
 
 -- Handles write var uint.
@@ -1053,6 +1118,290 @@ local function varIntByteLength(value: number): number
 	return varUIntByteLength(zigzagEncode(value))
 end
 
+-- Bit-first unsigned integer code.
+--   0       -> 0                    (1 bit)
+--   1..8    -> 10 + 3-bit payload   (5 bits)
+--   9..40   -> 110 + 5-bit payload  (8 bits)
+--   41+     -> 111 + normal VarUInt bytes, still packed through writeBits
+-- Arrays compare this exact bit cost against normal VarUInt and only select
+-- the bit codec when it is physically smaller after byte rounding.
+function INTERNAL.adaptiveUIntBitLength(value: number): number
+	if value == 0 then return 1 end
+	if value <= 8 then return 5 end
+	if value <= 40 then return 8 end
+	return 3 + varUIntByteLength(value) * 8
+end
+
+function INTERNAL.adaptiveIntBitLength(value: number): number
+	return INTERNAL.adaptiveUIntBitLength(zigzagEncode(value))
+end
+
+function INTERNAL.writeAdaptiveUIntBits(w: Writer, value: number)
+	if not isSafeUInt(value) then fail("expected safe unsigned integer", 2) end
+	if value == 0 then
+		writeBits(w, 0, 1)
+	elseif value <= 8 then
+		writeBits(w, 1, 2) -- stream prefix 10 (writer is LSB-first)
+		writeBits(w, value - 1, 3)
+	elseif value <= 40 then
+		writeBits(w, 3, 3) -- stream prefix 110
+		writeBits(w, value - 9, 5)
+	else
+		writeBits(w, 7, 3) -- stream prefix 111
+		INTERNAL.writeVarUIntBits(w, value)
+	end
+end
+
+function INTERNAL.readAdaptiveUIntBits(r: Reader): number
+	if readBits(r, 1) == 0 then return 0 end
+	if readBits(r, 1) == 0 then return readBits(r, 3) + 1 end
+	if readBits(r, 1) == 0 then return readBits(r, 5) + 9 end
+	return INTERNAL.readVarUIntBits(r)
+end
+
+function INTERNAL.writeAdaptiveIntBits(w: Writer, value: number)
+	if not isSafeInt(value) then fail("expected safe signed integer", 2) end
+	INTERNAL.writeAdaptiveUIntBits(w, zigzagEncode(value))
+end
+
+function INTERNAL.readAdaptiveIntBits(r: Reader): number
+	return zigzagDecode(INTERNAL.readAdaptiveUIntBits(r))
+end
+
+-- Byte payloads can remain inside an existing bit stream in v2.9.
+function INTERNAL.writeBufferBits(w: Writer, data: buffer)
+	local length = buffer.len(data)
+	if length >= 32 then
+		flushBits(w)
+		ensureCapacity(w, length)
+		if length > 0 then buffer.copy(w.Buffer, w.Position, data, 0, length) end
+		w.Position += length
+		w.UsedBits += length * 8
+		return
+	end
+	for i = 0, length - 1 do writeBits(w, buffer.readu8(data, i), 8) end
+end
+
+function INTERNAL.readBufferBits(r: Reader, length: number): buffer
+	local result = buffer.create(length)
+	if length >= 32 then
+		alignReader(r)
+		if r.Position + length > r.Length then fail("truncated bit-stream buffer", 2) end
+		if length > 0 then buffer.copy(result, 0, r.Buffer, r.Position, length) end
+		r.Position += length
+		return result
+	end
+	for i = 0, length - 1 do buffer.writeu8(result, i, readBits(r, 8)) end
+	return result
+end
+
+function INTERNAL.writeStringBits(w: Writer, value: string)
+	local length = #value
+	INTERNAL.writeAdaptiveUIntBits(w, length)
+	if length >= 32 then
+		flushBits(w)
+		ensureCapacity(w, length)
+		buffer.writestring(w.Buffer, w.Position, value)
+		w.Position += length
+		w.UsedBits += length * 8
+		return
+	end
+	for i = 1, length do writeBits(w, string.byte(value, i), 8) end
+end
+
+function INTERNAL.readStringBits(r: Reader): string
+	local length = INTERNAL.readAdaptiveUIntBits(r)
+	if length > MAX_DECODE_STRING_BYTES then fail("string exceeds decode limit", 2) end
+	if length >= 32 then
+		alignReader(r)
+		if r.Position + length > r.Length then fail("truncated bit-stream string", 2) end
+		local value = buffer.readstring(r.Buffer, r.Position, length)
+		r.Position += length
+		return value
+	end
+	local bytes = table.create(length)
+	for i = 1, length do bytes[i] = string.char(readBits(r, 8)) end
+	return table.concat(bytes)
+end
+
+function INTERNAL.adaptiveUIntArrayBits(value: {any}, delta: boolean): number
+	local count = #value
+	if count == 0 then return 0 end
+	local bits = INTERNAL.adaptiveUIntBitLength(value[1])
+	for i = 2, count do
+		if delta then
+			bits += INTERNAL.adaptiveIntBitLength(value[i] - value[i - 1])
+		else
+			bits += INTERNAL.adaptiveUIntBitLength(value[i])
+		end
+	end
+	return bits
+end
+
+function INTERNAL.adaptiveIntArrayBits(value: {any}, delta: boolean): number
+	local count = #value
+	if count == 0 then return 0 end
+	local bits = INTERNAL.adaptiveIntBitLength(value[1])
+	for i = 2, count do
+		bits += INTERNAL.adaptiveIntBitLength(delta and (value[i] - value[i - 1]) or value[i])
+	end
+	return bits
+end
+
+function INTERNAL.varUIntArrayBits(value: {any}, delta: boolean): number
+	local count = #value
+	if count == 0 then return 0 end
+	local bits = varUIntByteLength(value[1]) * 8
+	for i = 2, count do
+		if delta then
+			bits += varIntByteLength(value[i] - value[i - 1]) * 8
+		else
+			bits += varUIntByteLength(value[i]) * 8
+		end
+	end
+	return bits
+end
+
+function INTERNAL.varIntArrayBits(value: {any}, delta: boolean): number
+	local count = #value
+	if count == 0 then return 0 end
+	local bits = varIntByteLength(value[1]) * 8
+	for i = 2, count do
+		bits += varIntByteLength(delta and (value[i] - value[i - 1]) or value[i]) * 8
+	end
+	return bits
+end
+
+-- Returns the exact number of value bits needed for an unsigned safe integer.
+function INTERNAL.bitsNeededUnsigned(value: number): number
+	if value <= 0 then return 0 end
+	local bits = math.clamp(math.floor(math.log(value) / 0.6931471805599453) + 1, 1, 53)
+	while bits > 1 and value < 2 ^ (bits - 1) do bits -= 1 end
+	while bits < 53 and value >= 2 ^ bits do bits += 1 end
+	return bits
+end
+
+-- Computes fixed-width payload cost. Width itself is stored in six bits (0..53).
+function INTERNAL.fixedUIntArrayBits(value: {any}, delta: boolean): (number, number)
+	local count = #value
+	local maximum = 0
+	if count > 0 then
+		if delta then
+			maximum = value[1]
+			for i = 2, count do
+				maximum = math.max(maximum, zigzagEncode(value[i] - value[i - 1]))
+			end
+		else
+			for i = 1, count do maximum = math.max(maximum, value[i]) end
+		end
+	end
+	local width = INTERNAL.bitsNeededUnsigned(maximum)
+	return 6 + width * count, width
+end
+
+function INTERNAL.fixedIntArrayBits(value: {any}, delta: boolean): (number, number)
+	local count = #value
+	local maximum = 0
+	for i = 1, count do
+		local current = if delta and i > 1 then value[i] - value[i - 1] else value[i]
+		maximum = math.max(maximum, zigzagEncode(current))
+	end
+	local width = INTERNAL.bitsNeededUnsigned(maximum)
+	return 6 + width * count, width
+end
+
+function INTERNAL.writeFixedUIntArrayBits(w: Writer, value: {any}, delta: boolean, width: number)
+	writeBits(w, width, 6)
+	for i = 1, #value do
+		local encoded = if delta and i > 1 then zigzagEncode(value[i] - value[i - 1]) else value[i]
+		if width > 0 then writeBits(w, encoded, width) end
+	end
+end
+
+function INTERNAL.writeFixedIntArrayBits(w: Writer, value: {any}, delta: boolean, width: number)
+	writeBits(w, width, 6)
+	for i = 1, #value do
+		local current = if delta and i > 1 then value[i] - value[i - 1] else value[i]
+		if width > 0 then writeBits(w, zigzagEncode(current), width) end
+	end
+end
+
+function INTERNAL.readFixedUIntArrayBits(r: Reader, count: number, delta: boolean): {number}
+	local width = readBits(r, 6)
+	if width > 53 then fail("invalid fixed UInt bit width", 2) end
+	local result = table.create(count)
+	for i = 1, count do
+		local encoded = width > 0 and readBits(r, width) or 0
+		if delta and i > 1 then result[i] = result[i - 1] + zigzagDecode(encoded) else result[i] = encoded end
+	end
+	return result
+end
+
+function INTERNAL.readFixedIntArrayBits(r: Reader, count: number, delta: boolean): {number}
+	local width = readBits(r, 6)
+	if width > 53 then fail("invalid fixed Int bit width", 2) end
+	local result = table.create(count)
+	for i = 1, count do
+		local decoded = zigzagDecode(width > 0 and readBits(r, width) or 0)
+		if delta and i > 1 then result[i] = result[i - 1] + decoded else result[i] = decoded end
+	end
+	return result
+end
+
+-- Array codec selector: 0=byte, 1=adaptive bits, 2=fixed bits,
+-- 3=delta byte, 4=delta adaptive bits, 5=delta fixed bits.
+function INTERNAL.selectUIntArrayCodec(value: {any}, allowDelta: boolean): (number, number)
+	local normalByte = INTERNAL.varUIntArrayBits(value, false)
+	local normalAdaptive = INTERNAL.adaptiveUIntArrayBits(value, false)
+	local normalFixed, normalWidth = INTERNAL.fixedUIntArrayBits(value, false)
+	local bestMode = 0
+	local bestBits = normalByte
+	local bestWidth = 0
+	if math.ceil(normalAdaptive / 8) < math.ceil(bestBits / 8) or (math.ceil(normalAdaptive / 8) == math.ceil(bestBits / 8) and normalAdaptive < bestBits) then
+		bestMode, bestBits = 1, normalAdaptive
+	end
+	if math.ceil(normalFixed / 8) < math.ceil(bestBits / 8) or (math.ceil(normalFixed / 8) == math.ceil(bestBits / 8) and normalFixed < bestBits) then
+		bestMode, bestBits, bestWidth = 2, normalFixed, normalWidth
+	end
+	if allowDelta and #value >= 3 then
+		local safe = true
+		for i = 2, #value do if not isSafeInt(value[i] - value[i - 1]) then safe = false; break end end
+		if safe then
+			local deltaByte = INTERNAL.varUIntArrayBits(value, true)
+			local deltaAdaptive = INTERNAL.adaptiveUIntArrayBits(value, true)
+			local deltaFixed, deltaWidth = INTERNAL.fixedUIntArrayBits(value, true)
+			if math.ceil(deltaByte / 8) < math.ceil(bestBits / 8) or (math.ceil(deltaByte / 8) == math.ceil(bestBits / 8) and deltaByte < bestBits) then bestMode, bestBits, bestWidth = 3, deltaByte, 0 end
+			if math.ceil(deltaAdaptive / 8) < math.ceil(bestBits / 8) or (math.ceil(deltaAdaptive / 8) == math.ceil(bestBits / 8) and deltaAdaptive < bestBits) then bestMode, bestBits, bestWidth = 4, deltaAdaptive, 0 end
+			if math.ceil(deltaFixed / 8) < math.ceil(bestBits / 8) or (math.ceil(deltaFixed / 8) == math.ceil(bestBits / 8) and deltaFixed < bestBits) then bestMode, bestBits, bestWidth = 5, deltaFixed, deltaWidth end
+		end
+	end
+	return bestMode, bestWidth
+end
+
+function INTERNAL.selectIntArrayCodec(value: {any}, allowDelta: boolean): (number, number)
+	local normalByte = INTERNAL.varIntArrayBits(value, false)
+	local normalAdaptive = INTERNAL.adaptiveIntArrayBits(value, false)
+	local normalFixed, normalWidth = INTERNAL.fixedIntArrayBits(value, false)
+	local bestMode = 0
+	local bestBits = normalByte
+	local bestWidth = 0
+	if math.ceil(normalAdaptive / 8) < math.ceil(bestBits / 8) or (math.ceil(normalAdaptive / 8) == math.ceil(bestBits / 8) and normalAdaptive < bestBits) then bestMode, bestBits = 1, normalAdaptive end
+	if math.ceil(normalFixed / 8) < math.ceil(bestBits / 8) or (math.ceil(normalFixed / 8) == math.ceil(bestBits / 8) and normalFixed < bestBits) then bestMode, bestBits, bestWidth = 2, normalFixed, normalWidth end
+	if allowDelta and #value >= 3 then
+		local safe = true
+		for i = 2, #value do if not isSafeInt(value[i] - value[i - 1]) then safe = false; break end end
+		if safe then
+			local deltaByte = INTERNAL.varIntArrayBits(value, true)
+			local deltaAdaptive = INTERNAL.adaptiveIntArrayBits(value, true)
+			local deltaFixed, deltaWidth = INTERNAL.fixedIntArrayBits(value, true)
+			if math.ceil(deltaByte / 8) < math.ceil(bestBits / 8) or (math.ceil(deltaByte / 8) == math.ceil(bestBits / 8) and deltaByte < bestBits) then bestMode, bestBits, bestWidth = 3, deltaByte, 0 end
+			if math.ceil(deltaAdaptive / 8) < math.ceil(bestBits / 8) or (math.ceil(deltaAdaptive / 8) == math.ceil(bestBits / 8) and deltaAdaptive < bestBits) then bestMode, bestBits, bestWidth = 4, deltaAdaptive, 0 end
+			if math.ceil(deltaFixed / 8) < math.ceil(bestBits / 8) or (math.ceil(deltaFixed / 8) == math.ceil(bestBits / 8) and deltaFixed < bestBits) then bestMode, bestBits, bestWidth = 5, deltaFixed, deltaWidth end
+		end
+	end
+	return bestMode, bestWidth
+end
+
 -- Handles is array.
 local function isArray(value: {[any]: any}): boolean
 	local n = #value
@@ -1079,6 +1428,23 @@ FMT.DeepEqual = function(a: any, b: any): boolean
 	for key, value in pairs(a) do if not FMT.DeepEqual(value, b[key]) then return false end end
 	for key, value in pairs(b) do if not FMT.DeepEqual(value, a[key]) then return false end end
 	return true
+end
+
+-- Clones descriptor defaults so decoded profiles never share mutable table/buffer defaults.
+FMT.CloneDefault = function(value: any): any
+	local kind = typeof(value)
+	if kind == "buffer" then
+		local length = buffer.len(value)
+		local result = buffer.create(length)
+		if length > 0 then buffer.copy(result, 0, value, 0, length) end
+		return result
+	end
+	if kind ~= "table" then return value end
+	local result = {}
+	for key, child in pairs(value) do
+		result[FMT.CloneDefault(key)] = FMT.CloneDefault(child)
+	end
+	return result
 end
 
 -- Handles dictionary score.
@@ -3019,7 +3385,7 @@ local readDateTimePayload: (Reader) -> any
 -- Handles validate.
 local function validate(descriptor: Descriptor, value: any, path: string)
 	if value == nil then
-		if descriptor.Optional then return end
+		if descriptor.Optional or descriptor.Default ~= nil then return end
 		fail(path .. " is required", 3)
 	end
 	local kind = descriptor.Kind
@@ -3055,6 +3421,12 @@ local function descriptorUsesBitStream(kind: string): boolean
 	-- perform their own alignment when necessary. This preserves bit packing
 	-- for nested Bool/optional fields instead of forcing a padding byte.
 	return kind == "Bool"
+		or kind == "UInt"
+		or kind == "Int"
+		or kind == "String"
+		or kind == "CompressedString"
+		or kind == "Buffer"
+		or kind == "Array"
 		or kind == "Quantized"
 		or kind == "QuantizedVector3"
 		or kind == "Object"
@@ -3066,26 +3438,18 @@ local function writeDescriptor(w: Writer, descriptor: Descriptor, value: any)
 	local o = descriptor.Options
 	if not descriptorUsesBitStream(kind) then flushBits(w) end
 	if kind == "Bool" then writeBits(w, value and 1 or 0, 1)
-	elseif kind == "UInt" then writeVarUInt(w, value)
-	elseif kind == "Int" then writeVarInt(w, value)
+	elseif kind == "UInt" then INTERNAL.writeAdaptiveUIntBits(w, value)
+	elseif kind == "Int" then INTERNAL.writeAdaptiveIntBits(w, value)
 	elseif kind == "Float" then writeF64(w, value)
-	elseif kind == "String" then writeStringRaw(w, value)
+	elseif kind == "String" then INTERNAL.writeStringBits(w, value)
 	elseif kind == "CompressedString" then
 		local compressed = Compression.CompressString(value, o)
-		writeVarUInt(w, buffer.len(compressed))
-		flushBits(w)
-		ensureCapacity(w, buffer.len(compressed))
-		buffer.copy(w.Buffer, w.Position, compressed, 0, buffer.len(compressed))
-		w.Position += buffer.len(compressed)
-		w.UsedBits += buffer.len(compressed) * 8
+		INTERNAL.writeAdaptiveUIntBits(w, buffer.len(compressed))
+		INTERNAL.writeBufferBits(w, compressed)
 	elseif kind == "Buffer" then
 		local compressed = Compression.CompressBuffer(value, o)
-		writeVarUInt(w, buffer.len(compressed))
-		flushBits(w)
-		ensureCapacity(w, buffer.len(compressed))
-		buffer.copy(w.Buffer, w.Position, compressed, 0, buffer.len(compressed))
-		w.Position += buffer.len(compressed)
-		w.UsedBits += buffer.len(compressed) * 8
+		INTERNAL.writeAdaptiveUIntBits(w, buffer.len(compressed))
+		INTERNAL.writeBufferBits(w, compressed)
 	elseif kind == "Vector2" then writeF64(w, value.X); writeF64(w, value.Y)
 	elseif kind == "Vector3" then writeF64(w, value.X); writeF64(w, value.Y); writeF64(w, value.Z)
 	elseif kind == "Color3" then
@@ -3135,17 +3499,39 @@ local function writeDescriptor(w: Writer, descriptor: Descriptor, value: any)
 		writeBits(w, quantize(value.Y, o.Minimum.Y, o.Maximum.Y, o.Bits), o.Bits)
 		writeBits(w, quantize(value.Z, o.Minimum.Z, o.Maximum.Z, o.Bits), o.Bits)
 	elseif kind == "Array" then
-		writeVarUInt(w, #value)
-		for _, item in ipairs(value) do writeDescriptor(w, descriptor.Item :: Descriptor, item) end
+		INTERNAL.writeAdaptiveUIntBits(w, #value)
+		local itemDescriptor = descriptor.Item :: Descriptor
+		for _, item in ipairs(value) do
+			if itemDescriptor.Default ~= nil then
+				local defaulted = FMT.DeepEqual(item, itemDescriptor.Default)
+				writeBits(w, defaulted and 0 or 1, 1)
+				if not defaulted then writeDescriptor(w, itemDescriptor, item) end
+			else
+				writeDescriptor(w, itemDescriptor, item)
+			end
+		end
 	elseif kind == "Object" then
 		local names = {}
 		for name in pairs(descriptor.Fields :: {[string]: Descriptor}) do names[#names + 1] = name end
 		table.sort(names)
 		for _, name in ipairs(names) do
 			local child = (descriptor.Fields :: {[string]: Descriptor})[name]
-			local present = value[name] ~= nil
+			local childValue = value[name]
+			local present = childValue ~= nil
+			if not present and child.Default ~= nil and not child.Optional then
+				childValue = child.Default
+				present = true
+			end
 			if child.Optional then writeBits(w, present and 1 or 0, 1) end
-			if present then writeDescriptor(w, child, value[name]) end
+			if present then
+				if child.Default ~= nil then
+					local defaulted = FMT.DeepEqual(childValue, child.Default)
+					writeBits(w, defaulted and 0 or 1, 1)
+					if not defaulted then writeDescriptor(w, child, childValue) end
+				else
+					writeDescriptor(w, child, childValue)
+				end
+			end
 		end
 	end
 end
@@ -3156,11 +3542,22 @@ local function readDescriptor(r: Reader, descriptor: Descriptor, binaryVersion: 
 	local o = descriptor.Options
 	if not descriptorUsesBitStream(kind) then alignReader(r) end
 	if kind == "Bool" then return readBits(r, 1) == 1
-	elseif kind == "UInt" then return readVarUInt(r)
-	elseif kind == "Int" then return readVarInt(r)
+	elseif kind == "UInt" then
+		if binaryVersion ~= nil and binaryVersion >= 28 then return INTERNAL.readAdaptiveUIntBits(r) end
+		return readVarUInt(r)
+	elseif kind == "Int" then
+		if binaryVersion ~= nil and binaryVersion >= 28 then return INTERNAL.readAdaptiveIntBits(r) end
+		return readVarInt(r)
 	elseif kind == "Float" then return readF64(r)
-	elseif kind == "String" then return readStringRaw(r)
+	elseif kind == "String" then
+		if binaryVersion ~= nil and binaryVersion >= 29 then return INTERNAL.readStringBits(r) end
+		return readStringRaw(r)
 	elseif kind == "CompressedString" then
+		if binaryVersion ~= nil and binaryVersion >= 29 then
+			local length = INTERNAL.readAdaptiveUIntBits(r)
+			if length > MAX_DECODE_STRING_BYTES then fail("compressed string exceeds decode limit", 2) end
+			return Compression.DecompressString(INTERNAL.readBufferBits(r, length))
+		end
 		local length = readVarUInt(r)
 		alignReader(r)
 		if r.Position + length > r.Length then fail("truncated compressed string", 2) end
@@ -3169,6 +3566,11 @@ local function readDescriptor(r: Reader, descriptor: Descriptor, binaryVersion: 
 		r.Position += length
 		return Compression.DecompressString(slice)
 	elseif kind == "Buffer" then
+		if binaryVersion ~= nil and binaryVersion >= 29 then
+			local length = INTERNAL.readAdaptiveUIntBits(r)
+			if length > MAX_DECODE_BUFFER_BYTES then fail("compressed buffer exceeds decode limit", 2) end
+			return Compression.DecompressBuffer(INTERNAL.readBufferBits(r, length))
+		end
 		local length = readVarUInt(r)
 		alignReader(r)
 		if r.Position + length > r.Length then fail("truncated compressed buffer", 2) end
@@ -3251,7 +3653,7 @@ local function readDescriptor(r: Reader, descriptor: Descriptor, binaryVersion: 
 			dequantize(readBits(r, o.Bits), o.Minimum.Z, o.Maximum.Z, o.Bits)
 		)
 	elseif kind == "Array" then
-		local count = readVarUInt(r)
+		local count = if binaryVersion ~= nil and binaryVersion >= 29 then INTERNAL.readAdaptiveUIntBits(r) else readVarUInt(r)
 		if count < 0 or count % 1 ~= 0 then
 			fail("invalid schema array count", 2)
 		end
@@ -3273,12 +3675,17 @@ local function readDescriptor(r: Reader, descriptor: Descriptor, binaryVersion: 
 			)
 		end
 		local result = table.create(count)
+		local itemDescriptor = descriptor.Item :: Descriptor
 		for i = 1, count do
-			result[i] = readDescriptor(
-				r,
-				descriptor.Item :: Descriptor,
-				binaryVersion
-			)
+			if binaryVersion ~= nil and binaryVersion >= 29 and itemDescriptor.Default ~= nil then
+				if readBits(r, 1) == 0 then
+					result[i] = FMT.CloneDefault(itemDescriptor.Default)
+				else
+					result[i] = readDescriptor(r, itemDescriptor, binaryVersion)
+				end
+			else
+				result[i] = readDescriptor(r, itemDescriptor, binaryVersion)
+			end
 		end
 		return result
 	elseif kind == "Object" then
@@ -3290,7 +3697,14 @@ local function readDescriptor(r: Reader, descriptor: Descriptor, binaryVersion: 
 			local child = (descriptor.Fields :: {[string]: Descriptor})[name]
 			local present = true
 			if child.Optional then present = readBits(r, 1) == 1 end
-			if present then result[name] = readDescriptor(r, child, binaryVersion) end
+			if present then
+				if binaryVersion ~= nil and binaryVersion >= 29 and child.Default ~= nil then
+					if readBits(r, 1) == 0 then result[name] = FMT.CloneDefault(child.Default)
+					else result[name] = readDescriptor(r, child, binaryVersion) end
+				else
+					result[name] = readDescriptor(r, child, binaryVersion)
+				end
+			end
 		end
 		return result
 	end
@@ -3311,10 +3725,30 @@ end
 local function readHeader(r: Reader, expectedMode: number): (number, number)
 	if readByte(r) ~= FMT.MAGIC_A or readByte(r) ~= FMT.MAGIC_B then fail("invalid binary header", 2) end
 	local binaryVersion = readByte(r)
-	if binaryVersion ~= FMT.VERSION and binaryVersion ~= 26 and binaryVersion ~= 25 and binaryVersion ~= 24 and binaryVersion ~= 23 and binaryVersion ~= 22 and binaryVersion ~= 21 and binaryVersion ~= 20 and binaryVersion ~= 19 and binaryVersion ~= 18 and binaryVersion ~= 17 and binaryVersion ~= 16 and binaryVersion ~= 15 and binaryVersion ~= 14 and binaryVersion ~= 13 and binaryVersion ~= 12 and binaryVersion ~= 11 and binaryVersion ~= 10 and binaryVersion ~= 9 and binaryVersion ~= 8 and binaryVersion ~= 7 and binaryVersion ~= 6 then fail("unsupported binary version", 2) end
+	if binaryVersion ~= FMT.VERSION and binaryVersion ~= 28 and binaryVersion ~= 27 and binaryVersion ~= 26 and binaryVersion ~= 25 and binaryVersion ~= 24 and binaryVersion ~= 23 and binaryVersion ~= 22 and binaryVersion ~= 21 and binaryVersion ~= 20 and binaryVersion ~= 19 and binaryVersion ~= 18 and binaryVersion ~= 17 and binaryVersion ~= 16 and binaryVersion ~= 15 and binaryVersion ~= 14 and binaryVersion ~= 13 and binaryVersion ~= 12 and binaryVersion ~= 11 and binaryVersion ~= 10 and binaryVersion ~= 9 and binaryVersion ~= 8 and binaryVersion ~= 7 and binaryVersion ~= 6 then fail("unsupported binary version", 2) end
 	r.LegacyVarUInt = binaryVersion == 6
 	if readByte(r) ~= expectedMode then fail("unexpected binary mode", 2) end
 	return readVarUInt(r), binaryVersion
+end
+
+-- v2.9 schema frames remove the generic CP/version/mode bytes. The marker implies
+-- binary v29 + mode, and the schema version continues directly in the bit stream.
+FMT.WriteSchemaHeader = function(w: Writer, mode: number, schemaVersion: number?)
+	if mode == MODE.SCHEMA then writeByte(w, FMT.SCHEMA_V29_MAGIC)
+	elseif mode == MODE.DELTA then writeByte(w, FMT.DELTA_V29_MAGIC)
+	else fail("invalid compact schema mode", 3) end
+	INTERNAL.writeAdaptiveUIntBits(w, (schemaVersion or 1) - 1)
+end
+
+FMT.ReadSchemaHeader = function(r: Reader, expectedMode: number): (number, number)
+	if r.Position >= r.Length then fail("unexpected end of schema payload", 3) end
+	local first = buffer.readu8(r.Buffer, r.Position)
+	local expectedMagic = expectedMode == MODE.SCHEMA and FMT.SCHEMA_V29_MAGIC or FMT.DELTA_V29_MAGIC
+	if first == expectedMagic then
+		r.Position += 1
+		return INTERNAL.readAdaptiveUIntBits(r) + 1, 29
+	end
+	return readHeader(r, expectedMode)
 end
 
 -- Handles packet from buffer.
@@ -3735,6 +4169,13 @@ local function decodePassthroughPacket(packet: Packet): (boolean, any)
 	return false, nil
 end
 
+function INTERNAL.schemaEffectiveValue(descriptor: Descriptor, value: any): any
+	if value == nil and descriptor.Default ~= nil and not descriptor.Optional then
+		return descriptor.Default
+	end
+	return value
+end
+
 local Schema = {}
 Schema.__index = Schema
 
@@ -3749,6 +4190,7 @@ function Compression.Schema(definition: {[string]: Descriptor}, version: number?
 	for name, descriptor in pairs(definition) do
 		if typeof(name) ~= "string" then fail("schema field names must be strings", 2) end
 		if typeof(descriptor) ~= "table" or typeof(descriptor.Kind) ~= "string" then fail("invalid descriptor for field " .. name, 2) end
+		if descriptor.Default ~= nil then validate(descriptor, descriptor.Default, name .. ".Default") end
 		fields[#fields + 1] = {Name = name, Descriptor = descriptor}
 	end
 	table.sort(fields, function(a, b) return a.Name < b.Name end)
@@ -3765,14 +4207,27 @@ function Schema:Encode(value: {[string]: any}, options: Options?): Packet
 	end
 
 	local w = newWriter()
-	writeHeader(w, MODE.SCHEMA, self.Version)
+	FMT.WriteSchemaHeader(w, MODE.SCHEMA, self.Version)
 	for _, field in ipairs(self.Fields) do
 		local descriptor = field.Descriptor
 		local fieldValue = value[field.Name]
 		local present = fieldValue ~= nil
+		if not present and descriptor.Default ~= nil and not descriptor.Optional then
+			fieldValue = descriptor.Default
+			present = true
+		end
 		if descriptor.Optional then writeBits(w, present and 1 or 0, 1)
 		elseif not present then fail("missing required field " .. field.Name, 2) end
-		if present then validate(descriptor, fieldValue, field.Name); writeDescriptor(w, descriptor, fieldValue) end
+		if present then
+			validate(descriptor, fieldValue, field.Name)
+			if descriptor.Default ~= nil then
+				local defaulted = FMT.DeepEqual(fieldValue, descriptor.Default)
+				writeBits(w, defaulted and 0 or 1, 1)
+				if not defaulted then writeDescriptor(w, descriptor, fieldValue) end
+			else
+				writeDescriptor(w, descriptor, fieldValue)
+			end
+		end
 	end
 	local data = finish(w)
 	return packetFromEntropy(
@@ -3789,7 +4244,7 @@ end
 function Schema:Decode(packet: Packet | buffer, options: Options?): {[string]: any}
 	local data, packetVersion = unwrapPacket(packet, options)
 	local r = newReader(data)
-	local encodedVersion, binaryVersion = readHeader(r, MODE.SCHEMA)
+	local encodedVersion, binaryVersion = FMT.ReadSchemaHeader(r, MODE.SCHEMA)
 	if packetVersion ~= nil and packetVersion ~= encodedVersion then fail("packet/schema version mismatch", 2) end
 	if encodedVersion ~= self.Version then fail("schema version mismatch", 2) end
 	local result = {}
@@ -3797,7 +4252,14 @@ function Schema:Decode(packet: Packet | buffer, options: Options?): {[string]: a
 		local descriptor = field.Descriptor
 		local present = true
 		if descriptor.Optional then present = readBits(r, 1) == 1 end
-		if present then result[field.Name] = readDescriptor(r, descriptor, binaryVersion) end
+		if present then
+			if binaryVersion >= 29 and descriptor.Default ~= nil then
+				if readBits(r, 1) == 0 then result[field.Name] = FMT.CloneDefault(descriptor.Default)
+				else result[field.Name] = readDescriptor(r, descriptor, binaryVersion) end
+			else
+				result[field.Name] = readDescriptor(r, descriptor, binaryVersion)
+			end
+		end
 	end
 	alignReader(r)
 	if r.Position ~= r.Length then fail("trailing bytes in schema payload", 2) end
@@ -3821,7 +4283,7 @@ function Schema:EncodeDelta(previous: {[string]: any}, current: {[string]: any},
 			current[field.Name]
 
 		if value == nil then
-			if not descriptor.Optional then
+			if not descriptor.Optional and descriptor.Default == nil then
 				fail(
 					"missing required field "
 						.. field.Name,
@@ -3838,47 +4300,41 @@ function Schema:EncodeDelta(previous: {[string]: any}, current: {[string]: any},
 	end
 
 	local w = newWriter()
-	writeHeader(
+	FMT.WriteSchemaHeader(
 		w,
 		MODE.DELTA,
 		self.Version
 	)
 
 	for _, field in ipairs(self.Fields) do
-		writeBits(
-			w,
-			FMT.DeepEqual(
-				previous[field.Name],
-				current[field.Name]
-			)
-				and 0
-				or 1,
-			1
-		)
+		local descriptor = field.Descriptor
+		local previousValue = INTERNAL.schemaEffectiveValue(descriptor, previous[field.Name])
+		local currentValue = INTERNAL.schemaEffectiveValue(descriptor, current[field.Name])
+		writeBits(w, FMT.DeepEqual(previousValue, currentValue) and 0 or 1, 1)
 	end
 
 	for _, field in ipairs(self.Fields) do
-		if not FMT.DeepEqual(
-			previous[field.Name],
-			current[field.Name]
-			) then
-			local value =
-				current[field.Name]
+		local descriptor = field.Descriptor
+		local previousValue = INTERNAL.schemaEffectiveValue(descriptor, previous[field.Name])
+		local currentValue = INTERNAL.schemaEffectiveValue(descriptor, current[field.Name])
+		if not FMT.DeepEqual(previousValue, currentValue) then
+			local value = currentValue
+			local present = value ~= nil
+			if not present and descriptor.Default ~= nil and not descriptor.Optional then
+				value = descriptor.Default
+				present = true
+			end
 
-			writeBits(
-				w,
-				value ~= nil
-					and 1
-					or 0,
-				1
-			)
+			writeBits(w, present and 1 or 0, 1)
 
-			if value ~= nil then
-				writeDescriptor(
-					w,
-					field.Descriptor,
-					value
-				)
+			if present then
+				if descriptor.Default ~= nil then
+					local defaulted = FMT.DeepEqual(value, descriptor.Default)
+					writeBits(w, defaulted and 0 or 1, 1)
+					if not defaulted then writeDescriptor(w, descriptor, value) end
+				else
+					writeDescriptor(w, descriptor, value)
+				end
 			end
 		end
 	end
@@ -3912,7 +4368,7 @@ function Schema:DecodeDelta(previous: {[string]: any}, packet: Packet | buffer, 
 		)
 	local r = newReader(data)
 	local version, binaryVersion =
-		readHeader(
+		FMT.ReadSchemaHeader(
 			r,
 			MODE.DELTA
 		)
@@ -3947,18 +4403,18 @@ function Schema:DecodeDelta(previous: {[string]: any}, packet: Packet | buffer, 
 
 	for i, field in ipairs(self.Fields) do
 		if changed[i] then
-			local present =
-				readBits(r, 1) == 1
+			local descriptor = field.Descriptor
+			local present = readBits(r, 1) == 1
 
 			if present then
-				result[field.Name] =
-					readDescriptor(
-						r,
-						field.Descriptor,
-						binaryVersion
-					)
+				if binaryVersion >= 29 and descriptor.Default ~= nil then
+					if readBits(r, 1) == 0 then result[field.Name] = FMT.CloneDefault(descriptor.Default)
+					else result[field.Name] = readDescriptor(r, descriptor, binaryVersion) end
+				else
+					result[field.Name] = readDescriptor(r, descriptor, binaryVersion)
+				end
 			else
-				if not field.Descriptor.Optional then
+				if not descriptor.Optional and descriptor.Default == nil then
 					fail(
 						"delta removed required field "
 							.. field.Name,
@@ -3966,7 +4422,7 @@ function Schema:DecodeDelta(previous: {[string]: any}, packet: Packet | buffer, 
 					)
 				end
 
-				result[field.Name] = nil
+				result[field.Name] = descriptor.Default ~= nil and FMT.CloneDefault(descriptor.Default) or nil
 			end
 		end
 	end
@@ -3985,7 +4441,9 @@ function Schema:DecodeDelta(previous: {[string]: any}, packet: Packet | buffer, 
 			result[field.Name]
 
 		if value == nil then
-			if not field.Descriptor.Optional then
+			if field.Descriptor.Default ~= nil and not field.Descriptor.Optional then
+				result[field.Name] = FMT.CloneDefault(field.Descriptor.Default)
+			elseif not field.Descriptor.Optional then
 				fail(
 					"missing required field "
 						.. field.Name,
@@ -4016,27 +4474,44 @@ function Schema:AnalyzeBits(value: {[string]: any}): BitLayout
 	local w = newWriter()
 	local fields = {}
 	local rawBits = 0
-	writeHeader(w, MODE.SCHEMA, self.Version)
+	local defaultFields = 0
+	local elidedRawBits = 0
+	FMT.WriteSchemaHeader(w, MODE.SCHEMA, self.Version)
 	local headerBits = w.UsedBits
 	for _, field in ipairs(self.Fields) do
 		local descriptor = field.Descriptor
 		local fieldValue = value[field.Name]
 		local present = fieldValue ~= nil
+		if not present and descriptor.Default ~= nil and not descriptor.Optional then
+			fieldValue = descriptor.Default
+			present = true
+		end
 		local usedBefore = w.UsedBits
 		local paddingBefore = w.PaddingBits
+		local defaulted = false
 		if descriptor.Optional then writeBits(w, present and 1 or 0, 1)
 		elseif not present then fail("missing required field " .. field.Name, 2) end
-		if present then validate(descriptor, fieldValue, field.Name); writeDescriptor(w, descriptor, fieldValue) end
+		if present then
+			validate(descriptor, fieldValue, field.Name)
+			if descriptor.Default ~= nil then
+				defaulted = FMT.DeepEqual(fieldValue, descriptor.Default)
+				writeBits(w, defaulted and 0 or 1, 1)
+				if defaulted then defaultFields += 1 else writeDescriptor(w, descriptor, fieldValue) end
+			else
+				writeDescriptor(w, descriptor, fieldValue)
+			end
+		end
 		local useful = w.UsedBits - usedBefore
 		local padding = w.PaddingBits - paddingBefore
 		local raw = present and rawValueBits(fieldValue) or 0
+		if defaulted then elidedRawBits += raw end
 		local physical = useful + padding
 		local delta = raw - physical
 		local saved = math.max(0, delta)
 		local expanded = math.max(0, -delta)
 		rawBits += raw
 		fields[#fields + 1] = {
-			Name = field.Name, Type = descriptor.Kind, Present = present,
+			Name = field.Name, Type = descriptor.Kind, Present = present, Defaulted = defaulted,
 			UsefulBits = useful, PaddingBits = padding, PhysicalBits = physical,
 			RawBits = raw, SavedBits = saved, ExpandedBits = expanded,
 			SavingsPercent = raw > 0 and math.max(0, (delta / raw) * 100) or 0,
@@ -4048,7 +4523,8 @@ function Schema:AnalyzeBits(value: {[string]: any}): BitLayout
 	local savedBits = math.max(0, deltaBits)
 	local expandedBits = math.max(0, -deltaBits)
 	return {
-		HeaderBits = headerBits, UsefulBits = w.UsedBits, PaddingBits = w.PaddingBits,
+		HeaderBits = headerBits, DefaultFields = defaultFields, ElidedRawBits = elidedRawBits,
+		UsefulBits = w.UsedBits, PaddingBits = w.PaddingBits,
 		PhysicalBits = physicalBits, PhysicalBytes = buffer.len(data), RawBits = rawBits,
 		SavedBits = savedBits, ExpandedBits = expandedBits,
 		SavingsPercent = rawBits > 0 and math.max(0, (deltaBits / rawBits) * 100) or 0,
@@ -4059,15 +4535,17 @@ end
 -- Handles schema.
 function Schema:PrintBitLayout(value: {[string]: any}): BitLayout
 	local layout = self:AnalyzeBits(value)
-	print("========== Compression v2.6.0 Bit Layout ==========")
+	print("========== Compression v" .. Compression.VERSION .. " Bit Layout ==========")
 	print("Header bits:", layout.HeaderBits)
 	for _, field in ipairs(layout.Fields) do
 		print(string.format(
-			"%s [%s] | useful=%d bits | padding=%d | physical=%d | raw=%d | saved=%.2f%%",
-			field.Name, field.Type, field.UsefulBits, field.PaddingBits, field.PhysicalBits, field.RawBits, field.SavingsPercent
+			"%s [%s]%s | useful=%d bits | padding=%d | physical=%d | raw=%d | saved=%.2f%%",
+			field.Name, field.Type, field.Defaulted and " [DEFAULT ELIDED]" or "", field.UsefulBits, field.PaddingBits, field.PhysicalBits, field.RawBits, field.SavingsPercent
 			))
 	end
 	print("---------------------------------------------------")
+	print("Default fields elided:", layout.DefaultFields or 0)
+	print("Raw bits elided by defaults:", layout.ElidedRawBits or 0)
 	print("Useful bits:", layout.UsefulBits)
 	print("Padding bits:", layout.PaddingBits)
 	print("Physical:", layout.PhysicalBits, "bits /", layout.PhysicalBytes, "bytes")
@@ -5983,23 +6461,57 @@ function INTERNAL.dynamicWrite(w: Writer, value: any, options: Options?, diction
 				writeVarUInt(w, count)
 				for i = 1, count do writeBits(w, value[i] and 1 or 0, 1) end
 			elseif arrayKind == "UInt" then
-				local useDelta = (not options or options.DeltaArrays ~= false) and canUseUIntDelta(value)
-				writeByte(w, useDelta and TAG.ARRAY_UINT_DELTA or TAG.ARRAY_UINT)
-				writeVarUInt(w, count)
-				if count > 0 then
-					writeVarUInt(w, value[1])
-					for i = 2, count do
-						if useDelta then writeVarInt(w, value[i] - value[i - 1]) else writeVarUInt(w, value[i]) end
+				local mode, width = INTERNAL.selectUIntArrayCodec(
+					value,
+					(not options or options.DeltaArrays ~= false)
+				)
+				if mode == 2 or mode == 5 then
+					writeByte(w, mode == 5 and TAG.ARRAY_UINT_DELTA_FIXED_BITS or TAG.ARRAY_UINT_FIXED_BITS)
+					writeVarUInt(w, count)
+					INTERNAL.writeFixedUIntArrayBits(w, value, mode == 5, width)
+				elseif mode == 1 or mode == 4 then
+					writeByte(w, mode == 4 and TAG.ARRAY_UINT_DELTA_BITS or TAG.ARRAY_UINT_BITS)
+					writeVarUInt(w, count)
+					if count > 0 then
+						INTERNAL.writeAdaptiveUIntBits(w, value[1])
+						for i = 2, count do
+							if mode == 4 then INTERNAL.writeAdaptiveIntBits(w, value[i] - value[i - 1]) else INTERNAL.writeAdaptiveUIntBits(w, value[i]) end
+						end
+					end
+				else
+					writeByte(w, mode == 3 and TAG.ARRAY_UINT_DELTA or TAG.ARRAY_UINT)
+					writeVarUInt(w, count)
+					if count > 0 then
+						writeVarUInt(w, value[1])
+						for i = 2, count do
+							if mode == 3 then writeVarInt(w, value[i] - value[i - 1]) else writeVarUInt(w, value[i]) end
+						end
 					end
 				end
 			elseif arrayKind == "Int" then
-				local useDelta = (not options or options.DeltaArrays ~= false) and canUseIntDelta(value)
-				writeByte(w, useDelta and TAG.ARRAY_INT_DELTA or TAG.ARRAY_INT)
-				writeVarUInt(w, count)
-				if count > 0 then
-					writeVarInt(w, value[1])
-					for i = 2, count do
-						if useDelta then writeVarInt(w, value[i] - value[i - 1]) else writeVarInt(w, value[i]) end
+				local mode, width = INTERNAL.selectIntArrayCodec(
+					value,
+					(not options or options.DeltaArrays ~= false)
+				)
+				if mode == 2 or mode == 5 then
+					writeByte(w, mode == 5 and TAG.ARRAY_INT_DELTA_FIXED_BITS or TAG.ARRAY_INT_FIXED_BITS)
+					writeVarUInt(w, count)
+					INTERNAL.writeFixedIntArrayBits(w, value, mode == 5, width)
+				elseif mode == 1 or mode == 4 then
+					writeByte(w, mode == 4 and TAG.ARRAY_INT_DELTA_BITS or TAG.ARRAY_INT_BITS)
+					writeVarUInt(w, count)
+					if count > 0 then
+						INTERNAL.writeAdaptiveIntBits(w, value[1])
+						for i = 2, count do INTERNAL.writeAdaptiveIntBits(w, mode == 4 and (value[i] - value[i - 1]) or value[i]) end
+					end
+				else
+					writeByte(w, mode == 3 and TAG.ARRAY_INT_DELTA or TAG.ARRAY_INT)
+					writeVarUInt(w, count)
+					if count > 0 then
+						writeVarInt(w, value[1])
+						for i = 2, count do
+							if mode == 3 then writeVarInt(w, value[i] - value[i - 1]) else writeVarInt(w, value[i]) end
+						end
 					end
 				end
 			elseif arrayKind == "Float" then
@@ -6298,6 +6810,52 @@ function INTERNAL.dynamicRead(r: Reader, dictionary: DictionaryState): any
 		local result = table.create(count)
 		for i = 1, count do result[i] = readVarInt(r) end
 		return result
+	elseif tag == TAG.ARRAY_UINT_BITS then
+		local count = readVarUInt(r)
+		INTERNAL.validateContainerCount(r, count, "dynamic bit uint array")
+		local result = table.create(count)
+		for i = 1, count do result[i] = INTERNAL.readAdaptiveUIntBits(r) end
+		return result
+	elseif tag == TAG.ARRAY_INT_BITS then
+		local count = readVarUInt(r)
+		INTERNAL.validateContainerCount(r, count, "dynamic bit int array")
+		local result = table.create(count)
+		for i = 1, count do result[i] = INTERNAL.readAdaptiveIntBits(r) end
+		return result
+	elseif tag == TAG.ARRAY_UINT_DELTA_BITS then
+		local count = readVarUInt(r)
+		INTERNAL.validateContainerCount(r, count, "dynamic bit uint delta array")
+		local result = table.create(count)
+		if count > 0 then
+			result[1] = INTERNAL.readAdaptiveUIntBits(r)
+			for i = 2, count do result[i] = result[i - 1] + INTERNAL.readAdaptiveIntBits(r) end
+		end
+		return result
+	elseif tag == TAG.ARRAY_INT_DELTA_BITS then
+		local count = readVarUInt(r)
+		INTERNAL.validateContainerCount(r, count, "dynamic bit int delta array")
+		local result = table.create(count)
+		if count > 0 then
+			result[1] = INTERNAL.readAdaptiveIntBits(r)
+			for i = 2, count do result[i] = result[i - 1] + INTERNAL.readAdaptiveIntBits(r) end
+		end
+		return result
+	elseif tag == TAG.ARRAY_UINT_FIXED_BITS then
+		local count = readVarUInt(r)
+		INTERNAL.validateContainerCount(r, count, "dynamic fixed-bit uint array")
+		return INTERNAL.readFixedUIntArrayBits(r, count, false)
+	elseif tag == TAG.ARRAY_INT_FIXED_BITS then
+		local count = readVarUInt(r)
+		INTERNAL.validateContainerCount(r, count, "dynamic fixed-bit int array")
+		return INTERNAL.readFixedIntArrayBits(r, count, false)
+	elseif tag == TAG.ARRAY_UINT_DELTA_FIXED_BITS then
+		local count = readVarUInt(r)
+		INTERNAL.validateContainerCount(r, count, "dynamic fixed-bit uint delta array")
+		return INTERNAL.readFixedUIntArrayBits(r, count, true)
+	elseif tag == TAG.ARRAY_INT_DELTA_FIXED_BITS then
+		local count = readVarUInt(r)
+		INTERNAL.validateContainerCount(r, count, "dynamic fixed-bit int delta array")
+		return INTERNAL.readFixedIntArrayBits(r, count, true)
 	elseif tag == TAG.ARRAY_FLOAT then
 		local count = readVarUInt(r)
 		INTERNAL.validateContainerCount(r, count, "dynamic float array")
@@ -6660,7 +7218,7 @@ function Compression.Decode(packet: Packet | buffer, options: Options?): any
 	if r.Length >= 2 and buffer.readu8(data, 0) == FMT.COMPACT_NUMBER_MAGIC then
 		readByte(r)
 		local compactVersion = readByte(r)
-		if compactVersion ~= FMT.VERSION and compactVersion ~= 26 and compactVersion ~= 25 and compactVersion ~= 24 and compactVersion ~= 23 and compactVersion ~= 22 and compactVersion ~= 21 and compactVersion ~= 20 and compactVersion ~= 19 and compactVersion ~= 18 and compactVersion ~= 17 and compactVersion ~= 16 and compactVersion ~= 15 and compactVersion ~= 14 and compactVersion ~= 13 and compactVersion ~= 12 and compactVersion ~= 11 and compactVersion ~= 10 and compactVersion ~= 9 and compactVersion ~= 8 and compactVersion ~= 7 then fail("unsupported compact number version", 2) end
+		if compactVersion ~= FMT.VERSION and compactVersion ~= 27 and compactVersion ~= 26 and compactVersion ~= 25 and compactVersion ~= 24 and compactVersion ~= 23 and compactVersion ~= 22 and compactVersion ~= 21 and compactVersion ~= 20 and compactVersion ~= 19 and compactVersion ~= 18 and compactVersion ~= 17 and compactVersion ~= 16 and compactVersion ~= 15 and compactVersion ~= 14 and compactVersion ~= 13 and compactVersion ~= 12 and compactVersion ~= 11 and compactVersion ~= 10 and compactVersion ~= 9 and compactVersion ~= 8 and compactVersion ~= 7 then fail("unsupported compact number version", 2) end
 		local value = readNumberPayload(r)
 		if r.Position ~= r.Length then fail("trailing bytes in compact number payload", 2) end
 		return value
@@ -6712,16 +7270,63 @@ function Compression.Optional(descriptor: Descriptor): Descriptor
 	return copy
 end
 
+-- Attaches a schema default. v2.9 writes one default-state bit and omits the payload when equal.
+function Compression.Default(descriptor: Descriptor, defaultValue: any): Descriptor
+	if typeof(descriptor) ~= "table" or typeof(descriptor.Kind) ~= "string" then fail("Default expects Descriptor", 2) end
+	if defaultValue == nil then fail("Default value cannot be nil; use Optional instead", 2) end
+	validate(descriptor, defaultValue, "Default")
+	local copy = table.clone(descriptor)
+	copy.Default = FMT.CloneDefault(defaultValue)
+	return copy
+end
+
 -- Handles bool.
-function Compression.Bool(): Descriptor return {Kind = "Bool"} end
+function Compression.Bool(defaultValue: boolean?): Descriptor
+	local descriptor: Descriptor = {Kind = "Bool"}
+	if defaultValue ~= nil then descriptor.Default = defaultValue end
+	return descriptor
+end
 -- Handles uint.
-function Compression.UInt(): Descriptor return {Kind = "UInt"} end
+function Compression.UInt(defaultValue: number?): Descriptor
+	local descriptor: Descriptor = {Kind = "UInt"}
+	if defaultValue ~= nil then
+		if not isSafeUInt(defaultValue) then fail("UInt default must be a safe unsigned integer", 2) end
+		descriptor.Default = defaultValue
+	end
+	return descriptor
+end
 -- Handles int.
-function Compression.Int(): Descriptor return {Kind = "Int"} end
+function Compression.Int(defaultValue: number?): Descriptor
+	local descriptor: Descriptor = {Kind = "Int"}
+	if defaultValue ~= nil then
+		if not isSafeInt(defaultValue) then fail("Int default must be a safe signed integer", 2) end
+		descriptor.Default = defaultValue
+	end
+	return descriptor
+end
+
+-- Reports the logical bit cost of the v2.9 bit-first integer code.
+function Compression.UIntBitLength(value: number): number
+	if not isSafeUInt(value) then fail("UIntBitLength expects safe unsigned integer", 2) end
+	return INTERNAL.adaptiveUIntBitLength(value)
+end
+
+function Compression.IntBitLength(value: number): number
+	if not isSafeInt(value) then fail("IntBitLength expects safe signed integer", 2) end
+	return INTERNAL.adaptiveIntBitLength(value)
+end
 -- Handles float.
-function Compression.Float(): Descriptor return {Kind = "Float"} end
+function Compression.Float(defaultValue: number?): Descriptor
+	local descriptor: Descriptor = {Kind = "Float"}
+	if defaultValue ~= nil then descriptor.Default = defaultValue end
+	return descriptor
+end
 -- Handles string.
-function Compression.String(): Descriptor return {Kind = "String"} end
+function Compression.String(defaultValue: string?): Descriptor
+	local descriptor: Descriptor = {Kind = "String"}
+	if defaultValue ~= nil then descriptor.Default = defaultValue end
+	return descriptor
+end
 -- Compresses ed string.
 function Compression.CompressedString(options: Options?): Descriptor return {Kind = "CompressedString", Options = options} end
 -- Handles buffer.
@@ -6867,6 +7472,13 @@ FMT.DescriptorsEquivalent = function(a: Descriptor, b: Descriptor): boolean
 		return false
 	end
 
+	if (a.Default ~= nil) ~= (b.Default ~= nil) then
+		return false
+	end
+	if a.Default ~= nil and not FMT.DeepEqual(a.Default, b.Default) then
+		return false
+	end
+
 	if a.Kind == "Array" then
 		return a.Item ~= nil
 			and b.Item ~= nil
@@ -6958,6 +7570,280 @@ end
 -- Handles auto descriptor.
 function Compression.AutoDescriptor(value: any): Descriptor
 	return Compression.InferDescriptor(value)
+end
+
+-- Infers a descriptor tree from a template and attaches defaults to leaves/arrays.
+-- Empty arrays still require an explicit schema because their item type is unknowable.
+function INTERNAL.inferDefaultDescriptor(value: any): Descriptor
+	local kind = typeof(value)
+	if kind == "table" and not isArray(value) then
+		local fields: {[string]: Descriptor} = {}
+		for key, child in pairs(value) do
+			if typeof(key) ~= "string" then fail("SchemaFromTemplate object keys must be strings", 3) end
+			fields[key] = INTERNAL.inferDefaultDescriptor(child)
+		end
+		return Compression.Object(fields)
+	end
+	if kind == "table" and #value == 0 then
+		fail("SchemaFromTemplate cannot infer an empty array item type; use Compression.Schema for that field", 3)
+	end
+	return Compression.Default(Compression.InferDescriptor(value), value)
+end
+
+-- Builds a default-eliding schema directly from a DataStore-style template.
+function Compression.SchemaFromTemplate(template: {[string]: any}, version: number?): SchemaObject
+	if typeof(template) ~= "table" or isArray(template) then fail("SchemaFromTemplate expects a string-keyed template table", 2) end
+	local definition: {[string]: Descriptor} = {}
+	for name, value in pairs(template) do
+		if typeof(name) ~= "string" then fail("SchemaFromTemplate keys must be strings", 2) end
+		definition[name] = INTERNAL.inferDefaultDescriptor(value)
+	end
+	return Compression.Schema(definition, version)
+end
+
+
+-- v3.0 indexed layouts -------------------------------------------------------
+-- A reusable indexed layout removes string field names from each payload.
+-- Example: {Coins = 0, Rebirths = 5} becomes {0, 5} internally, while Decode
+-- restores the original named table. The layout itself is compiled once from a
+-- template and is intentionally not transmitted with every packet.
+local IndexedLayout = {}
+IndexedLayout.__index = IndexedLayout
+
+-- Handles building an indexed layout node.
+function INTERNAL.buildIndexedLayoutNode(template: any, path: string): IndexedLayoutNode
+	if typeof(template) ~= "table" then
+		return {Kind = "Value"}
+	end
+
+	if isArray(template) then
+		local item: IndexedLayoutNode? = nil
+		if #template > 0 then
+			item = INTERNAL.buildIndexedLayoutNode(template[1], path .. "[]")
+		end
+		return {
+			Kind = "Array",
+			Item = item,
+		}
+	end
+
+	local keys = {}
+	for key in pairs(template) do
+		if typeof(key) ~= "string" then
+			fail(path .. " must use string keys for indexed objects", 3)
+		end
+		keys[#keys + 1] = key
+	end
+	table.sort(keys)
+
+	local indexByKey: {[string]: number} = {}
+	local children: {IndexedLayoutNode} = table.create(#keys)
+	local defaults: {any} = table.create(#keys)
+	for i, key in ipairs(keys) do
+		indexByKey[key] = i
+		children[i] = INTERNAL.buildIndexedLayoutNode(template[key], path .. "." .. key)
+		defaults[i] = FMT.CloneDefault(template[key])
+	end
+
+	return {
+		Kind = "Object",
+		Keys = keys,
+		IndexByKey = indexByKey,
+		Children = children,
+		Defaults = defaults,
+	}
+end
+
+-- Copies an unknown-shape value without changing its map keys. This is used for
+-- empty template arrays, where no stable child layout can be inferred safely.
+function INTERNAL.cloneIndexedUnknown(value: any, active: {[any]: boolean}?): any
+	if typeof(value) == "buffer" then
+		local copy = buffer.create(buffer.len(value))
+		if buffer.len(value) > 0 then buffer.copy(copy, 0, value, 0, buffer.len(value)) end
+		return copy
+	end
+	if typeof(value) ~= "table" then return value end
+	local seen = active or {}
+	if seen[value] then fail("cyclic tables cannot be converted to indexed form", 3) end
+	seen[value] = true
+	local result = {}
+	for key, child in pairs(value) do
+		result[INTERNAL.cloneIndexedUnknown(key, seen)] = INTERNAL.cloneIndexedUnknown(child, seen)
+	end
+	seen[value] = nil
+	return result
+end
+
+-- Converts named object fields into deterministic numeric positions.
+function INTERNAL.toIndexedNode(node: IndexedLayoutNode, value: any, path: string): any
+	if node.Kind == "Value" then
+		return INTERNAL.cloneIndexedUnknown(value)
+	end
+
+	if node.Kind == "Array" then
+		if typeof(value) ~= "table" or not isArray(value) then
+			fail(path .. " expected array", 3)
+		end
+		local result = table.create(#value)
+		local item = node.Item
+		for i = 1, #value do
+			result[i] = item and INTERNAL.toIndexedNode(item, value[i], path .. "[" .. tostring(i) .. "]") or INTERNAL.cloneIndexedUnknown(value[i])
+		end
+		return result
+	end
+
+	if typeof(value) ~= "table" or isArray(value) then
+		fail(path .. " expected named table", 3)
+	end
+
+	local keys = node.Keys :: {string}
+	local indexByKey = node.IndexByKey :: {[string]: number}
+	local children = node.Children :: {IndexedLayoutNode}
+	local defaults = node.Defaults :: {any}
+
+	for key in pairs(value) do
+		if typeof(key) ~= "string" or indexByKey[key] == nil then
+			fail(path .. " contains unknown indexed field " .. tostring(key), 3)
+		end
+	end
+
+	local result = table.create(#keys)
+	for i, key in ipairs(keys) do
+		local childValue = value[key]
+		if childValue == nil then childValue = FMT.CloneDefault(defaults[i]) end
+		if childValue == nil then fail(path .. "." .. key .. " is missing", 3) end
+		result[i] = INTERNAL.toIndexedNode(children[i], childValue, path .. "." .. key)
+	end
+	return result
+end
+
+-- Restores deterministic numeric positions back into their original field names.
+function INTERNAL.fromIndexedNode(node: IndexedLayoutNode, value: any, path: string): any
+	if node.Kind == "Value" then
+		return INTERNAL.cloneIndexedUnknown(value)
+	end
+
+	if node.Kind == "Array" then
+		if typeof(value) ~= "table" or not isArray(value) then
+			fail(path .. " expected indexed array", 3)
+		end
+		local result = table.create(#value)
+		local item = node.Item
+		for i = 1, #value do
+			result[i] = item and INTERNAL.fromIndexedNode(item, value[i], path .. "[" .. tostring(i) .. "]") or INTERNAL.cloneIndexedUnknown(value[i])
+		end
+		return result
+	end
+
+	if typeof(value) ~= "table" or not isArray(value) then
+		fail(path .. " expected indexed object array", 3)
+	end
+
+	local keys = node.Keys :: {string}
+	local children = node.Children :: {IndexedLayoutNode}
+	if #value ~= #keys then
+		fail(path .. " indexed field count mismatch", 3)
+	end
+
+	local result = {}
+	for i, key in ipairs(keys) do
+		result[key] = INTERNAL.fromIndexedNode(children[i], value[i], path .. "." .. key)
+	end
+	return result
+end
+
+function IndexedLayout:ToIndexed(value: {[string]: any}): {any}
+	if typeof(value) ~= "table" or isArray(value) then fail("IndexedLayout:ToIndexed expects a named table", 2) end
+	return INTERNAL.toIndexedNode((self :: any)._Node, value, "$indexed")
+end
+
+function IndexedLayout:FromIndexed(value: {any}): {[string]: any}
+	if typeof(value) ~= "table" then fail("IndexedLayout:FromIndexed expects table", 2) end
+	return INTERNAL.fromIndexedNode((self :: any)._Node, value, "$indexed")
+end
+
+-- Uses the existing schema codec whenever the template can be inferred. This is
+-- the smallest path because field names and types both live in the reusable
+-- layout. Empty/unknown arrays fall back to the normal Compression encoder over
+-- the positional table, so all existing codecs remain available.
+function IndexedLayout:Encode(value: {[string]: any}, options: Options?): Packet
+	if typeof(value) ~= "table" or isArray(value) then fail("IndexedLayout:Encode expects a named table", 2) end
+	local schema = (self :: any)._Schema
+	if schema ~= nil then
+		local packet = (schema :: SchemaObject):Encode(value, options)
+		packet.Codec = packet.Entropy == "Huffman" and "IndexedSchema+Huffman" or "IndexedSchema"
+		return packet
+	end
+
+	local indexed = self:ToIndexed(value)
+	local packet = Compression.Encode(indexed, options)
+	packet.Codec = packet.Entropy == "Huffman" and "IndexedTable+Huffman" or "IndexedTable"
+	return packet
+end
+
+function IndexedLayout:Decode(packet: Packet | buffer, options: Options?): {[string]: any}
+	local schema = (self :: any)._Schema
+	if schema ~= nil then
+		return (schema :: SchemaObject):Decode(packet, options)
+	end
+	local indexed = Compression.Decode(packet, options)
+	if typeof(indexed) ~= "table" then fail("IndexedLayout payload did not decode to table", 2) end
+	return self:FromIndexed(indexed)
+end
+
+function IndexedLayout:Stats(value: {[string]: any}, options: Options?): {[string]: any}
+	local indexedPacket = self:Encode(value, options)
+	local regularPacket = Compression.CompressTablePacket(value, options)
+	local indexedBytes = indexedPacket.Bytes
+	local regularBytes = regularPacket.Bytes
+	local savedBytes = math.max(0, regularBytes - indexedBytes)
+	local expandedBytes = math.max(0, indexedBytes - regularBytes)
+	return {
+		Mode = self.Mode,
+		Fields = #self.Keys,
+		IndexedBytes = indexedBytes,
+		RegularBytes = regularBytes,
+		SavedBytes = savedBytes,
+		ExpandedBytes = expandedBytes,
+		SavingsPercent = regularBytes > 0 and math.max(0, (regularBytes - indexedBytes) / regularBytes * 100) or 0,
+		IsSmaller = indexedBytes < regularBytes,
+	}
+end
+
+-- Compiles a reusable key layout. The sorted field order is stable, so
+-- {Coins = 0, Rebirths = 5} maps to the same positional representation every run.
+function Compression.IndexedLayout(template: {[string]: any}, version: number?): IndexedLayoutObject
+	if typeof(template) ~= "table" or isArray(template) then fail("IndexedLayout expects a string-keyed template table", 2) end
+	local layoutVersion = version or 1
+	if not isSafeUInt(layoutVersion) or layoutVersion < 1 then fail("IndexedLayout version must be a positive safe integer", 2) end
+	local node = INTERNAL.buildIndexedLayoutNode(template, "$template")
+	local schema: SchemaObject? = nil
+	local ok, inferred = pcall(Compression.SchemaFromTemplate, template, layoutVersion)
+	if ok then schema = inferred end
+	local rootKeys = node.Keys or {}
+	return setmetatable({
+		Version = layoutVersion,
+		Keys = rootKeys,
+		Mode = schema ~= nil and "IndexedSchema" or "IndexedTable",
+		_Node = node,
+		_Schema = schema,
+	}, IndexedLayout) :: any
+end
+
+-- Short alias for users who want the compact API name.
+Compression.Indexed = Compression.IndexedLayout
+
+-- One-shot inspection helper. Reuse the returned layout for actual repeated
+-- compression so the key map is not rebuilt every packet.
+function Compression.ToIndexedTable(value: {[string]: any}): ({any}, IndexedLayoutObject)
+	if typeof(value) ~= "table" or isArray(value) then fail("ToIndexedTable expects a string-keyed table", 2) end
+	local layout = Compression.IndexedLayout(value)
+	return layout:ToIndexed(value), layout
+end
+
+function Compression.FromIndexedTable(value: {any}, layout: IndexedLayoutObject): {[string]: any}
+	if typeof(layout) ~= "table" or typeof((layout :: any).FromIndexed) ~= "function" then fail("FromIndexedTable expects IndexedLayout", 2) end
+	return layout:FromIndexed(value)
 end
 
 -- Handles string mode.
@@ -7383,7 +8269,15 @@ end
 function Compression.CompressNumber(value: number, options: Options?): buffer
 	if typeof(value) ~= "number" then fail("CompressNumber expects number", 2) end
 	local w = newWriter(16)
-	writeNumberPayload(w, value)
+	-- Small signed integers are ZigZag-mapped and stored with the bit-first code.
+	-- Values whose code fits in at most 8 useful bits become one physical byte.
+	-- Larger integers/floats fall back to the existing tagged byte codec.
+	local smallIntegerCode = if isSafeInt(value) then zigzagEncode(value) else math.huge
+	if smallIntegerCode <= 40 then
+		INTERNAL.writeAdaptiveUIntBits(w, smallIntegerCode)
+	else
+		writeNumberPayload(w, value)
+	end
 	local data = finish(w)
 	local encoded = maybeHuffman(data, options)
 	return encoded
@@ -7393,6 +8287,26 @@ end
 function Compression.DecompressNumber(data: buffer): number
 	if typeof(data) ~= "buffer" then fail("DecompressNumber expects buffer", 2) end
 	data = entropyDecodeIfNeeded(data)
+	-- One-byte values 14/15/16 are the legacy 0/1/-1 packets. All canonical
+	-- v2.9 bit-first small-integer bytes intentionally avoid those values.
+	if buffer.len(data) == 1 then
+		local first = buffer.readu8(data, 0)
+		if first == TAG.ZERO then return 0 end
+		if first == TAG.ONE then return 1 end
+		if first == TAG.NEG_ONE then return -1 end
+
+		local code: number? = nil
+		if first == 0 then
+			code = 0
+		elseif first <= 29 and first % 4 == 1 then
+			code = math.floor((first - 1) / 4) + 1
+		elseif first % 8 == 3 then
+			local candidate = math.floor((first - 3) / 8) + 9
+			if candidate <= 40 then code = candidate end
+		end
+
+		if code ~= nil then return zigzagDecode(code) end
+	end
 	local r = newReader(data)
 	local value = readNumberPayload(r)
 	if r.Position ~= r.Length then fail("trailing bytes in number payload", 2) end
@@ -7403,7 +8317,13 @@ end
 function Compression.NumberStats(value: number): {[string]: any}
 	local data = Compression.CompressNumber(value)
 	local bytes = buffer.len(data)
-	local bits = bytes * 8
+	local physicalBits = bytes * 8
+	local smallIntegerCode = if isSafeInt(value) then zigzagEncode(value) else math.huge
+	local usefulBits = smallIntegerCode <= 40
+		and INTERNAL.adaptiveUIntBitLength(smallIntegerCode)
+		or physicalBits
+	local paddingBits = math.max(0, physicalBits - usefulBits)
+	local bits = usefulBits
 	local rawBytes = 8
 	local rawBits = 64
 	local saved = math.max(0, rawBytes - bytes)
@@ -7414,8 +8334,9 @@ function Compression.NumberStats(value: number): {[string]: any}
 	return {
 		Bytes = bytes,
 		Bits = bits,
-		UsefulBits = bits,
-		PhysicalBits = bits,
+		UsefulBits = usefulBits,
+		PhysicalBits = physicalBits,
+		PaddingBits = paddingBits,
 		RawBytes = rawBytes,
 		RawBits = rawBits,
 		SavedBytes = saved,
@@ -7449,6 +8370,14 @@ TAG.TABLE_MODE_NAMES = {
 	[TAG.MAP_STRING] = "StringMap",
 	[TAG.ARRAY_UINT_DELTA] = "UIntDeltaArray",
 	[TAG.ARRAY_INT_DELTA] = "IntDeltaArray",
+	[TAG.ARRAY_UINT_BITS] = "UIntBitArray",
+	[TAG.ARRAY_INT_BITS] = "IntBitArray",
+	[TAG.ARRAY_UINT_DELTA_BITS] = "UIntDeltaBitArray",
+	[TAG.ARRAY_INT_DELTA_BITS] = "IntDeltaBitArray",
+	[TAG.ARRAY_UINT_FIXED_BITS] = "UIntFixedBitArray",
+	[TAG.ARRAY_INT_FIXED_BITS] = "IntFixedBitArray",
+	[TAG.ARRAY_UINT_DELTA_FIXED_BITS] = "UIntDeltaFixedBitArray",
+	[TAG.ARRAY_INT_DELTA_FIXED_BITS] = "IntDeltaFixedBitArray",
 	[TAG.ARRAY_VECTOR2_F32] = "Vector2F32Array",
 	[TAG.ARRAY_VECTOR2_F64] = "Vector2F64Array",
 	[TAG.ARRAY_VECTOR3_F32] = "Vector3F32Array",
