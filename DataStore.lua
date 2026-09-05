@@ -8,7 +8,6 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 
 local Compression = nil
-local BufferUtil = nil
 
 local function getCompression()
 	if Compression ~= nil then
@@ -17,48 +16,29 @@ local function getCompression()
 
 	local moduleScript = assert(
 		script:WaitForChild("Compression", 10),
-		"DataStore v1.8.4 requires a child ModuleScript named Compression v2.6.7"
+		"DataStore v2.0.0 requires a child ModuleScript named Compression v3.0.0"
 	)
 
 	local codec = require(moduleScript)
 	assert(
 		type(codec) == "table"
 			and type(codec.Version) == "function"
-			and codec.Version() == "2.6.7"
+			and codec.Version() == "3.0.0"
+			and type(codec.Encode) == "function"
+			and type(codec.Decode) == "function"
+			and type(codec.Pack) == "function"
+			and type(codec.Unpack) == "function"
 			and type(codec.CompressTablePacket) == "function"
 			and type(codec.DecompressTable) == "function"
+			and type(codec.IndexedLayout) == "function"
 			and type(codec.CompressBuffer) == "function"
-			and type(codec.CompressBufferSmart) == "function"
-			and type(codec.DecompressBuffer) == "function",
-		"DataStore v1.8.4 requires Compression v2.6.7 with table + smart buffer codecs"
+			and type(codec.DecompressBuffer) == "function"
+			and type(codec.Hash) == "function",
+		"DataStore v2.0.0 requires Compression v3.0.0 with indexed + adaptive table codecs"
 	)
 
 	Compression = codec
 	return codec
-end
-
-local function getBufferUtil()
-	if BufferUtil ~= nil then
-		return BufferUtil
-	end
-
-	local moduleScript = assert(
-		script:WaitForChild("BufferUtil", 10),
-		"DataStore v1.8.4 requires a child ModuleScript named BufferUtil v1.1.0"
-	)
-
-	local util = require(moduleScript)
-	assert(
-		type(util) == "table"
-			and util.VERSION == "1.1.0"
-			and type(util.writer) == "function"
-			and type(util.compactBytes) == "function"
-			and type(util.varUIntSize) == "function",
-		"DataStore v1.8.4 requires BufferUtil v1.1.0 with writer + compact APIs"
-	)
-
-	BufferUtil = util
-	return util
 end
 
 local DataStore = {}
@@ -70,9 +50,10 @@ Profile.__index = Profile
 local Signal = {}
 Signal.__index = Signal
 
-local VERSION = "1.8.4"
-local STORAGE_FORMAT_VERSION = 6
-local SESSION_FORMAT_VERSION = 1
+local VERSION = "2.0.0"
+local STORAGE_FORMAT_VERSION = 8
+local SESSION_FORMAT_VERSION = 2
+local LEGACY_SESSION_FORMAT_VERSION = 1
 local SESSION_MAGIC = 0x53
 local SESSION_FLAG_RELEASED = 0x01
 local SESSION_FLAG_ID_GUID = 0x02
@@ -80,6 +61,20 @@ local SESSION_FLAG_JOB_GUID = 0x04
 local SESSION_FLAG_DIAGNOSTICS = 0x08
 local BUFFER_ENCODING = "BufferV1"
 local TABLE_ENCODING = "Table"
+local STORAGE_FRAME_MAGIC = 0xB7
+local STORAGE_CODEC_INDEXED = 1
+local STORAGE_CODEC_TABLE = 2
+local SESSION_LAYOUT_VERSION = 1
+local SESSION_TEMPLATE = {
+	-- Session ids are generated GUIDs. Storing the UUID as 16 raw bytes avoids
+	-- paying for a 36-byte textual GUID while still letting Compression own the
+	-- actual schema/bit encoding.
+	Id = buffer.create(16),
+	JobId = "",
+	PlaceId = 0,
+	TouchedAt = 0,
+	Released = false,
+}
 
 local LEGACY_FORMAT_TAG = "__SimpleDataStore"
 local LEGACY_FORMAT_V151 = 3
@@ -92,7 +87,7 @@ local MAX_SAFE_INTEGER = 9007199254740991
 local MAX_SAFE_SIGNED_VARINT = math.floor(MAX_SAFE_INTEGER / 2)
 local ADLER_MOD = 65521
 
--- v1.8.4 compact player-key codec. Base62 keeps keys printable and reversible
+-- v1.9.0 compact player-key codec. Base62 keeps keys printable and reversible
 -- while avoiding binary/Base64 expansion. A one-byte prefix namespaces new keys
 -- away from legacy decimal/custom-prefix keys during migration.
 local KEY_BASE62_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -206,22 +201,29 @@ local DEFAULTS = {
 
 	CompressionEnabled = true,
 
-	-- v1.8.4 exact-buffer pipeline. BufferUtil owns working-buffer growth and
-	-- compactBytes trims every DataStore-owned writer to its exact written length
-	-- before the value is handed to Compression or Roblox persistence.
-	BufferUtilEnabled = true,
+	-- v2.0.0 uses native buffer growth only. BufferUtil is no longer required.
+	-- BufferWriterInitialCapacity remains for legacy SDSB encode helpers.
+	BufferUtilEnabled = false,
 	BufferWriterInitialCapacity = 32,
 
-	-- v1.8.4 SchemaBuffer removes DataTemplate field names and per-value type tags
-	-- from the persisted payload. The readable runtime table is reconstructed from
-	-- the versioned template on load. Unsupported/dynamic templates automatically
-	-- fall back to the generic Compression codec.
+	-- Legacy v1.9 SchemaBitBuffer settings are decode-only. They are retained so
+	-- existing v1.9 saves can migrate forward, but new saves never use this codec.
 	SchemaBufferEnabled = true,
-	SchemaBufferCompress = true,
+	SchemaBufferCompress = false,
 	SchemaFallbackToGeneric = true,
 	SchemaHistory = nil,
 
-	-- v1.8 primary storage codec: Compression v2.6.7 adaptive table compression.
+	-- v2.0.0 Compression v3 storage. IndexedLayout removes template field names and
+	-- default values; adaptive table compression is also evaluated as a safe
+	-- self-describing fallback for dynamic/unknown runtime structures.
+	CompressionIndexedLayout = true,
+	CompressionCompareAdaptiveTable = true,
+	CompressionLayoutHistory = nil,
+
+	-- DataStore persists Packet.Data, so the persistence codec intentionally uses
+	-- Compression "Binary" mode. BinaryWithHash stores its hash in Packet metadata
+	-- rather than inside Packet.Data and would lose that metadata in DataStore.
+	-- Compression v3 adaptive table options.
 	CompressionTableStrategy = "Auto",
 	CompressionCompressStrings = true,
 	CompressionStringStrategy = "Auto",
@@ -236,8 +238,8 @@ local DEFAULTS = {
 	CompressionAllowExpansion = false,
 	CompressionCompareLegacyBuffer = true,
 
-	-- Legacy BufferV1 compression settings retained for old-save decoding and
-	-- the public CompressStorageBuffer helper.
+	-- Legacy BufferV1 compression settings retained only for old-save decoding
+	-- and the public CompressStorageBuffer compatibility helper.
 	CompressionMinBufferBytes = 16,
 	CompressionMinSavingsBytes = 1,
 	CompressionBufferStrategy = "Auto",
@@ -543,61 +545,170 @@ local function validateSavable(value, path, seen, depth, state, config)
 	return true
 end
 
+local function resizeBuffer(source, newLength)
+	assert(typeof(source) == "buffer", "resizeBuffer expects buffer")
+	assert(type(newLength) == "number" and newLength >= 0 and newLength == math.floor(newLength), "resizeBuffer expects integer length")
+
+	local out = buffer.create(newLength)
+	local copyLength = math.min(buffer.len(source), newLength)
+	if copyLength > 0 then
+		buffer.copy(out, 0, source, 0, copyLength)
+	end
+	return out
+end
+
+local function compactBufferBytes(source, usedBytes)
+	assert(typeof(source) == "buffer", "compactBufferBytes expects buffer")
+	assert(type(usedBytes) == "number" and usedBytes >= 0 and usedBytes == math.floor(usedBytes), "compactBufferBytes expects integer usedBytes")
+	assert(usedBytes <= buffer.len(source), "compactBufferBytes exceeds source length")
+
+	if usedBytes == buffer.len(source) then
+		return cloneBuffer(source)
+	end
+
+	local out = buffer.create(usedBytes)
+	if usedBytes > 0 then
+		buffer.copy(out, 0, source, 0, usedBytes)
+	end
+	return out
+end
+
+local function writeUintBitsNative(data, bitOffset, bitCount, value)
+	assert(typeof(data) == "buffer", "writeUintBitsNative expects buffer")
+	assert(bitCount >= 1 and bitCount <= 53, "writeUintBitsNative width must be 1..53")
+	assert(value >= 0 and value == math.floor(value), "writeUintBitsNative expects unsigned integer")
+
+	local remaining = bitCount
+	local position = bitOffset
+	local current = value
+
+	while remaining > 0 do
+		local byteIndex = position // 8
+		local bitIndex = position % 8
+		local take = math.min(8 - bitIndex, remaining)
+		local base = 2 ^ take
+		local chunk = current % base
+		local oldByte = buffer.readu8(data, byteIndex)
+		local lowBase = 2 ^ bitIndex
+		local highShift = bitIndex + take
+		local low = oldByte % lowBase
+		local high = math.floor(oldByte / (2 ^ highShift)) * (2 ^ highShift)
+		buffer.writeu8(data, byteIndex, low + chunk * lowBase + high)
+
+		current = math.floor(current / base)
+		position += take
+		remaining -= take
+	end
+end
+
+local function readUintBitsNative(data, bitOffset, bitCount)
+	assert(typeof(data) == "buffer", "readUintBitsNative expects buffer")
+	assert(bitCount >= 1 and bitCount <= 53, "readUintBitsNative width must be 1..53")
+
+	local remaining = bitCount
+	local position = bitOffset
+	local result = 0
+	local multiplier = 1
+
+	while remaining > 0 do
+		local byteIndex = position // 8
+		local bitIndex = position % 8
+		local take = math.min(8 - bitIndex, remaining)
+		local base = 2 ^ take
+		local byte = buffer.readu8(data, byteIndex)
+		local chunk = math.floor(byte / (2 ^ bitIndex)) % base
+		result += chunk * multiplier
+		multiplier *= base
+		position += take
+		remaining -= take
+	end
+
+	return result
+end
+
 local Writer = {}
 Writer.__index = Writer
 
--- DataStore v1.8.4 delegates temporary byte-buffer growth to BufferUtil.
--- The backing buffer may grow geometrically while encoding, but Finish() always
--- calls BufferUtil.compactBytes with the exact number of bytes written. Therefore
--- unused working capacity never reaches Compression, MemoryStore, or DataStore.
 function Writer.new(capacity)
-	local util = getBufferUtil()
-	local requested = capacity or DEFAULTS.BufferWriterInitialCapacity or 32
-	requested = math.max(1, math.floor(requested))
+	local requested = math.max(1, math.floor(capacity or DEFAULTS.BufferWriterInitialCapacity or 32))
 	return setmetatable({
-		Core = util.writer(requested),
+		Data = buffer.create(requested),
+		Position = 0,
 		LastWorkingBytes = requested,
 		LastUsedBytes = 0,
 		LastRemovedBytes = 0,
 	}, Writer)
 end
 
+function Writer:Ensure(additional)
+	local needed = self.Position + additional
+	if needed <= buffer.len(self.Data) then
+		return
+	end
+
+	local nextLength = math.max(needed, math.max(16, buffer.len(self.Data) * 2))
+	self.Data = resizeBuffer(self.Data, nextLength)
+end
+
 function Writer:U8(value)
-	self.Core:WriteU8(value)
+	self:Ensure(1)
+	buffer.writeu8(self.Data, self.Position, value)
+	self.Position += 1
 end
 
 function Writer:U32(value)
-	self.Core:WriteU32(value)
+	self:Ensure(4)
+	buffer.writeu32(self.Data, self.Position, value)
+	self.Position += 4
 end
 
 function Writer:F64(value)
-	self.Core:WriteF64(value)
+	self:Ensure(8)
+	buffer.writef64(self.Data, self.Position, value)
+	self.Position += 8
 end
 
 function Writer:RawString(value)
-	self.Core:WriteString(value)
+	local length = #value
+	self:Ensure(length)
+	if length > 0 then
+		buffer.writestring(self.Data, self.Position, value)
+		self.Position += length
+	end
 end
 
 function Writer:RawBuffer(value)
-	self.Core:WriteBuffer(value)
+	local length = buffer.len(value)
+	self:Ensure(length)
+	if length > 0 then
+		buffer.copy(self.Data, self.Position, value, 0, length)
+		self.Position += length
+	end
 end
 
 function Writer:VarUInt(value)
 	assert(value >= 0 and value <= MAX_SAFE_INTEGER and isInteger(value), "VarUInt expects a non-negative safe integer")
-	self.Core:WriteVarUInt(value)
+	local remaining = value
+	repeat
+		local byte = remaining % 128
+		remaining = math.floor(remaining / 128)
+		if remaining > 0 then
+			byte += 128
+		end
+		self:U8(byte)
+	until remaining == 0
 end
 
 function Writer:VarInt(value)
 	assert(math.abs(value) <= MAX_SAFE_SIGNED_VARINT and isInteger(value), "VarInt expects a safe integer")
-	self.Core:WriteVarInt(value)
+	local encoded = if value >= 0 then value * 2 else -value * 2 - 1
+	self:VarUInt(encoded)
 end
 
 function Writer:Finish()
-	local util = getBufferUtil()
-	local usedBytes = self.Core:Length()
-	local working = self.Core:GetBuffer()
-	local workingBytes = buffer.len(working)
-	local out = util.compactBytes(working, usedBytes)
+	local workingBytes = buffer.len(self.Data)
+	local usedBytes = self.Position
+	local out = compactBufferBytes(self.Data, usedBytes)
 
 	self.LastWorkingBytes = workingBytes
 	self.LastUsedBytes = usedBytes
@@ -709,12 +820,15 @@ local function adler32(data, startOffset, length)
 	return b * 65536 + a
 end
 
--- v1.8.4 positional schema codec. Only one top-level local is used for the
+-- v1.9.0 positional SchemaBitBuffer codec. Only one top-level local is used for the
 -- whole implementation so the module keeps substantial headroom under Luau's
 -- 200-local/register limit.
 local SchemaCodec = {
 	MAGIC = 0xA4,
-	VERSION = 1,
+	LEGACY_VERSION = 1,
+	VERSION = 2,
+	VARUINT_LEGACY = 0,
+	VARUINT_TIERED = 1,
 	KIND_UINT = "uint",
 	KIND_INT = "int",
 	KIND_F64 = "f64",
@@ -971,6 +1085,442 @@ function SchemaCodec.isFrame(data)
 		and buffer.readu8(data, 0) == SchemaCodec.MAGIC
 end
 
+function SchemaCodec.legacyVarUIntBits(value)
+	assert(value >= 0 and value <= MAX_SAFE_INTEGER and isInteger(value), "legacyVarUIntBits expects a non-negative safe integer")
+	local bits = 8
+	local remaining = value
+	while remaining >= 128 do
+		remaining = math.floor(remaining / 128)
+		bits += 8
+	end
+	return bits
+end
+
+function SchemaCodec.tieredVarUIntBits(value)
+	assert(value >= 0 and value <= MAX_SAFE_INTEGER and isInteger(value), "tieredVarUIntBits expects a non-negative safe integer")
+	if value <= 3 then
+		return 4
+	elseif value <= 35 then
+		return 7
+	elseif value <= 4131 then
+		return 14
+	elseif value <= 1052707 then
+		return 23
+	elseif value <= 4296020003 then
+		return 36
+	elseif value <= 281479272730659 then
+		return 53
+	end
+	return 58
+end
+
+function SchemaCodec.zigzagEncode(value)
+	if value >= 0 then
+		return value * 2
+	end
+	return (-value) * 2 - 1
+end
+
+function SchemaCodec.varUIntCostForLeaf(leaf, value)
+	local tiered = 0
+	local legacy = 0
+
+	local function addUnsigned(raw)
+		tiered += SchemaCodec.tieredVarUIntBits(raw)
+		legacy += SchemaCodec.legacyVarUIntBits(raw)
+	end
+
+	local kind = leaf.Kind
+	if kind == SchemaCodec.KIND_UINT then
+		if type(value) == "number" and isInteger(value) and value >= 0 and value <= MAX_SAFE_INTEGER then
+			addUnsigned(value)
+		end
+	elseif kind == SchemaCodec.KIND_INT then
+		if type(value) == "number" and isInteger(value) and math.abs(value) <= MAX_SAFE_SIGNED_VARINT then
+			addUnsigned(SchemaCodec.zigzagEncode(value))
+		end
+	elseif kind == SchemaCodec.KIND_STRING then
+		if type(value) == "string" then
+			addUnsigned(#value)
+		end
+	elseif kind == SchemaCodec.KIND_BUFFER then
+		if typeof(value) == "buffer" then
+			addUnsigned(buffer.len(value))
+		end
+	elseif kind == SchemaCodec.KIND_UDIM then
+		if typeof(value) == "UDim" and isInteger(value.Offset) and math.abs(value.Offset) <= MAX_SAFE_SIGNED_VARINT then
+			addUnsigned(SchemaCodec.zigzagEncode(value.Offset))
+		end
+	elseif kind == SchemaCodec.KIND_UDIM2 then
+		if typeof(value) == "UDim2" then
+			if isInteger(value.X.Offset) and math.abs(value.X.Offset) <= MAX_SAFE_SIGNED_VARINT then
+				addUnsigned(SchemaCodec.zigzagEncode(value.X.Offset))
+			end
+			if isInteger(value.Y.Offset) and math.abs(value.Y.Offset) <= MAX_SAFE_SIGNED_VARINT then
+				addUnsigned(SchemaCodec.zigzagEncode(value.Y.Offset))
+			end
+		end
+	end
+
+	return tiered, legacy
+end
+
+function SchemaCodec.chooseVarUIntMode(dataTemplate, schema, present)
+	local tiered = SchemaCodec.tieredVarUIntBits(dataTemplate.Version)
+	local legacy = SchemaCodec.legacyVarUIntBits(dataTemplate.Version)
+
+	for index, leaf in ipairs(schema.Leaves) do
+		if present[index] then
+			local value = SchemaCodec.pathValue(dataTemplate.Data, leaf.Path)
+			if value == nil then
+				value = leaf.Default
+			end
+			local tieredBits, legacyBits = SchemaCodec.varUIntCostForLeaf(leaf, value)
+			tiered += tieredBits
+			legacy += legacyBits
+		end
+	end
+
+	if tiered < legacy then
+		return SchemaCodec.VARUINT_TIERED, tiered, legacy
+	end
+	return SchemaCodec.VARUINT_LEGACY, tiered, legacy
+end
+
+SchemaCodec.BitWriter = {}
+SchemaCodec.BitWriter.__index = SchemaCodec.BitWriter
+
+function SchemaCodec.BitWriter.new(capacity, varUIntMode)
+	local requested = math.max(1, math.floor(capacity or DEFAULTS.BufferWriterInitialCapacity or 32))
+	return setmetatable({
+		Data = buffer.create(requested),
+		BitPosition = 0,
+		VarUIntMode = varUIntMode or SchemaCodec.VARUINT_LEGACY,
+		Scratch8 = buffer.create(8),
+		LastWorkingBytes = requested,
+		LastUsedBytes = 0,
+		LastUsedBits = 0,
+		LastPaddingBits = 0,
+		LastRemovedBytes = 0,
+	}, SchemaCodec.BitWriter)
+end
+
+function SchemaCodec.BitWriter:Need(bitCount)
+	if bitCount < 0 then
+		error("SchemaBitBuffer cannot reserve a negative bit count", 0)
+	end
+
+	local neededBytes = (self.BitPosition + bitCount + 7) // 8
+	local currentBytes = buffer.len(self.Data)
+	if neededBytes <= currentBytes then
+		return
+	end
+
+	local nextBytes = math.max(neededBytes, math.max(1, currentBytes * 2))
+	self.Data = resizeBuffer(self.Data, nextBytes)
+end
+
+function SchemaCodec.BitWriter:Bit(value)
+	self:Need(1)
+	writeUintBitsNative(self.Data, self.BitPosition, 1, value and 1 or 0)
+	self.BitPosition += 1
+end
+
+function SchemaCodec.BitWriter:UInt(bitCount, value)
+	if bitCount < 1 or bitCount > 53 then
+		error("SchemaBitBuffer UInt width must be 1..53 bits", 0)
+	end
+	self:Need(bitCount)
+	writeUintBitsNative(self.Data, self.BitPosition, bitCount, value)
+	self.BitPosition += bitCount
+end
+
+function SchemaCodec.BitWriter:U8(value)
+	self:UInt(8, value)
+end
+
+function SchemaCodec.BitWriter:U32(value)
+	self:UInt(32, value)
+end
+
+function SchemaCodec.BitWriter:RawBuffer(value)
+	local length = buffer.len(value)
+	local offset = 0
+	while offset + 4 <= length do
+		self:UInt(32, buffer.readu32(value, offset))
+		offset += 4
+	end
+	while offset < length do
+		self:UInt(8, buffer.readu8(value, offset))
+		offset += 1
+	end
+end
+
+function SchemaCodec.BitWriter:RawString(value)
+	if #value == 0 then
+		return
+	end
+	self:RawBuffer(buffer.fromstring(value))
+end
+
+function SchemaCodec.BitWriter:F64(value)
+	buffer.writef64(self.Scratch8, 0, value)
+	self:UInt(32, buffer.readu32(self.Scratch8, 0))
+	self:UInt(32, buffer.readu32(self.Scratch8, 4))
+end
+
+function SchemaCodec.BitWriter:LegacyVarUInt(value)
+	assert(value >= 0 and value <= MAX_SAFE_INTEGER and isInteger(value), "Bit VarUInt expects a non-negative safe integer")
+	local remaining = value
+	repeat
+		local byte = remaining % 128
+		remaining = math.floor(remaining / 128)
+		if remaining > 0 then
+			byte += 128
+		end
+		self:UInt(8, byte)
+	until remaining == 0
+end
+
+function SchemaCodec.BitWriter:TieredVarUInt(value)
+	assert(value >= 0 and value <= MAX_SAFE_INTEGER and isInteger(value), "Tiered BitVarUInt expects a non-negative safe integer")
+
+	if value <= 3 then
+		self:Bit(false)
+		self:Bit(false)
+		self:UInt(2, value)
+		return
+	elseif value <= 35 then
+		self:Bit(false)
+		self:Bit(true)
+		self:UInt(5, value - 4)
+		return
+	elseif value <= 4131 then
+		self:Bit(true)
+		self:Bit(false)
+		self:UInt(12, value - 36)
+		return
+	elseif value <= 1052707 then
+		self:Bit(true)
+		self:Bit(true)
+		self:Bit(false)
+		self:UInt(20, value - 4132)
+		return
+	elseif value <= 4296020003 then
+		self:Bit(true)
+		self:Bit(true)
+		self:Bit(true)
+		self:Bit(false)
+		self:UInt(32, value - 1052708)
+		return
+	elseif value <= 281479272730659 then
+		self:Bit(true)
+		self:Bit(true)
+		self:Bit(true)
+		self:Bit(true)
+		self:Bit(false)
+		self:UInt(48, value - 4296020004)
+		return
+	end
+
+	self:Bit(true)
+	self:Bit(true)
+	self:Bit(true)
+	self:Bit(true)
+	self:Bit(true)
+	self:UInt(53, value - 281479272730660)
+end
+
+function SchemaCodec.BitWriter:VarUInt(value)
+	if self.VarUIntMode == SchemaCodec.VARUINT_TIERED then
+		self:TieredVarUInt(value)
+	else
+		self:LegacyVarUInt(value)
+	end
+end
+
+function SchemaCodec.BitWriter:VarInt(value)
+	assert(math.abs(value) <= MAX_SAFE_SIGNED_VARINT and isInteger(value), "Bit VarInt expects a safe integer")
+	self:VarUInt(SchemaCodec.zigzagEncode(value))
+end
+
+function SchemaCodec.BitWriter:Finish()
+	local workingBytes = buffer.len(self.Data)
+	local usedBits = self.BitPosition
+	local usedBytes = (usedBits + 7) // 8
+	local paddingBits = usedBytes * 8 - usedBits
+	local out = compactBufferBytes(self.Data, usedBytes)
+
+	self.LastWorkingBytes = workingBytes
+	self.LastUsedBytes = usedBytes
+	self.LastUsedBits = usedBits
+	self.LastPaddingBits = paddingBits
+	self.LastRemovedBytes = math.max(0, workingBytes - usedBytes)
+	return out
+end
+
+function SchemaCodec.BitWriter:GetCompactionInfo()
+	return {
+		WorkingBytes = self.LastWorkingBytes or 0,
+		UsedBytes = self.LastUsedBytes or 0,
+		UsedBits = self.LastUsedBits or 0,
+		PaddingBits = self.LastPaddingBits or 0,
+		RemovedBytes = self.LastRemovedBytes or 0,
+	}
+end
+
+SchemaCodec.BitReader = {}
+SchemaCodec.BitReader.__index = SchemaCodec.BitReader
+
+function SchemaCodec.BitReader.new(data, bitLength, varUIntMode)
+	return setmetatable({
+		Data = data,
+		BitPosition = 0,
+		BitLength = bitLength or (buffer.len(data) * 8),
+		VarUIntMode = varUIntMode or SchemaCodec.VARUINT_LEGACY,
+		Scratch8 = buffer.create(8),
+	}, SchemaCodec.BitReader)
+end
+
+function SchemaCodec.BitReader:Need(bitCount)
+	if bitCount < 0 or self.BitPosition + bitCount > self.BitLength then
+		error("SchemaBitBuffer decode overflow", 0)
+	end
+end
+
+function SchemaCodec.BitReader:Bit()
+	self:Need(1)
+	local value = readUintBitsNative(self.Data, self.BitPosition, 1) ~= 0
+	self.BitPosition += 1
+	return value
+end
+
+function SchemaCodec.BitReader:UInt(bitCount)
+	if bitCount < 1 or bitCount > 53 then
+		error("SchemaBitBuffer UInt width must be 1..53 bits", 0)
+	end
+	self:Need(bitCount)
+	local value = readUintBitsNative(self.Data, self.BitPosition, bitCount)
+	self.BitPosition += bitCount
+	return value
+end
+
+function SchemaCodec.BitReader:U8()
+	return self:UInt(8)
+end
+
+function SchemaCodec.BitReader:U32()
+	return self:UInt(32)
+end
+
+function SchemaCodec.BitReader:RawBuffer(length)
+	if length < 0 then
+		error("SchemaBitBuffer negative raw buffer length", 0)
+	end
+
+	self:Need(length * 8)
+	local out = buffer.create(length)
+	local offset = 0
+	while offset + 4 <= length do
+		buffer.writeu32(out, offset, self:UInt(32))
+		offset += 4
+	end
+	while offset < length do
+		buffer.writeu8(out, offset, self:UInt(8))
+		offset += 1
+	end
+	return out
+end
+
+function SchemaCodec.BitReader:RawString(length)
+	if length == 0 then
+		return ""
+	end
+	local raw = self:RawBuffer(length)
+	return buffer.readstring(raw, 0, length)
+end
+
+function SchemaCodec.BitReader:F64()
+	buffer.writeu32(self.Scratch8, 0, self:UInt(32))
+	buffer.writeu32(self.Scratch8, 4, self:UInt(32))
+	return buffer.readf64(self.Scratch8, 0)
+end
+
+function SchemaCodec.BitReader:LegacyVarUInt()
+	local result = 0
+	local multiplier = 1
+	for _ = 1, 8 do
+		local byte = self:UInt(8)
+		result += (byte % 128) * multiplier
+		if result > MAX_SAFE_INTEGER then
+			error("SchemaBitBuffer VarUInt exceeds safe integer range", 0)
+		end
+		if byte < 128 then
+			return result
+		end
+		multiplier *= 128
+	end
+	error("SchemaBitBuffer VarUInt overflow", 0)
+end
+
+function SchemaCodec.BitReader:TieredVarUInt()
+	local first = self:Bit()
+	if not first then
+		if not self:Bit() then
+			return self:UInt(2)
+		end
+		return 4 + self:UInt(5)
+	end
+
+	if not self:Bit() then
+		return 36 + self:UInt(12)
+	end
+	if not self:Bit() then
+		return 4132 + self:UInt(20)
+	end
+	if not self:Bit() then
+		return 1052708 + self:UInt(32)
+	end
+	if not self:Bit() then
+		return 4296020004 + self:UInt(48)
+	end
+
+	local value = 281479272730660 + self:UInt(53)
+	if value > MAX_SAFE_INTEGER then
+		error("SchemaBitBuffer tiered VarUInt exceeds safe integer range", 0)
+	end
+	return value
+end
+
+function SchemaCodec.BitReader:VarUInt()
+	if self.VarUIntMode == SchemaCodec.VARUINT_TIERED then
+		return self:TieredVarUInt()
+	end
+	return self:LegacyVarUInt()
+end
+
+function SchemaCodec.BitReader:VarInt()
+	local value = self:VarUInt()
+	if value % 2 == 0 then
+		return value / 2
+	end
+	return -((value + 1) / 2)
+end
+
+function SchemaCodec.BitReader:RemainingBits()
+	return self.BitLength - self.BitPosition
+end
+
+function SchemaCodec.BitReader:RequireZeroPadding()
+	local remaining = self:RemainingBits()
+	if remaining < 0 or remaining > 7 then
+		error("SchemaBitBuffer frame contains trailing payload bits", 0)
+	end
+	if remaining > 0 and self:UInt(remaining) ~= 0 then
+		error("SchemaBitBuffer frame contains non-zero padding bits", 0)
+	end
+end
+
 function SchemaCodec.writeLeaf(writer, leaf, value)
 	local kind = leaf.Kind
 	if kind == SchemaCodec.KIND_UINT then
@@ -1113,7 +1663,6 @@ function SchemaCodec.encode(dataTemplate, config)
 		return nil, compatibilityError
 	end
 
-	local bitmap = buffer.create(schema.BitmapBytes)
 	local present = table.create(schema.FieldCount, false)
 	local presentCount = 0
 
@@ -1125,22 +1674,36 @@ function SchemaCodec.encode(dataTemplate, config)
 		if not SchemaCodec.valuesEqual(value, leaf.Default, leaf.Kind) then
 			present[index] = true
 			presentCount += 1
-			buffer.writebits(bitmap, index - 1, 1, 1)
 		end
 	end
 
-	local writer = Writer.new(config.BufferWriterInitialCapacity or 32)
+	local varUIntMode, tieredVarUIntBits, legacyVarUIntBits =
+		SchemaCodec.chooseVarUIntMode(dataTemplate, schema, present)
+
+	local writer = SchemaCodec.BitWriter.new(
+		config.BufferWriterInitialCapacity or 32,
+		varUIntMode
+	)
+
 	writer:U8(SchemaCodec.MAGIC)
 	writer:U8(SchemaCodec.VERSION)
+	writer:Bit(varUIntMode == SchemaCodec.VARUINT_TIERED)
 	writer:VarUInt(dataTemplate.Version)
 	writer:U32(schema.Fingerprint)
-	writer:RawBuffer(bitmap)
+
+	-- v2 presence flags occupy exactly one bit per schema leaf. There is no
+	-- standalone bitmap buffer and no forced byte boundary before payload data.
+	for index = 1, schema.FieldCount do
+		writer:Bit(present[index] == true)
+	end
 
 	local okWrite, writeError = pcall(function()
 		for index, leaf in ipairs(schema.Leaves) do
 			if present[index] then
 				local value = SchemaCodec.pathValue(dataTemplate.Data, leaf.Path)
-				if value == nil then value = leaf.Default end
+				if value == nil then
+					value = leaf.Default
+				end
 				SchemaCodec.writeLeaf(writer, leaf, value)
 			end
 		end
@@ -1153,19 +1716,93 @@ function SchemaCodec.encode(dataTemplate, config)
 	local compactInfo = writer:GetCompactionInfo()
 	local bodyLength = buffer.len(body)
 	local out = buffer.create(bodyLength + 4)
-	if bodyLength > 0 then buffer.copy(out, 0, body, 0, bodyLength) end
+	if bodyLength > 0 then
+		buffer.copy(out, 0, body, 0, bodyLength)
+	end
 	buffer.writeu32(out, bodyLength, adler32(out, 0, bodyLength))
 
 	return out, {
 		RawBytes = buffer.len(out),
+		RawBits = buffer.len(out) * 8,
+		UsefulBits = compactInfo.UsedBits + 32,
+		BodyUsefulBits = compactInfo.UsedBits,
+		PaddingBits = compactInfo.PaddingBits,
 		FieldCount = schema.FieldCount,
 		PresentFields = presentCount,
 		DefaultFieldsOmitted = schema.FieldCount - presentCount,
 		Fingerprint = schema.Fingerprint,
 		Version = schema.Version,
+		SchemaCodecVersion = SchemaCodec.VERSION,
+		VarUIntMode = if varUIntMode == SchemaCodec.VARUINT_TIERED then "TieredBits" else "Legacy8BitGroups",
+		TieredVarUIntBits = tieredVarUIntBits,
+		LegacyVarUIntBits = legacyVarUIntBits,
 		WorkingBufferBytes = compactInfo.WorkingBytes,
 		CompactedPayloadBytes = compactInfo.UsedBytes + 4,
 		UnusedWorkingBytesRemoved = compactInfo.RemovedBytes,
+	}
+end
+
+function SchemaCodec.decodeLegacy(raw, config)
+	local length = buffer.len(raw)
+	if length < 11 then
+		error("SchemaBuffer v1 frame is too small", 0)
+	end
+
+	local reader = Reader.new(raw)
+	reader.Length = length - 4
+	if reader:U8() ~= SchemaCodec.MAGIC then
+		error("SchemaBuffer v1 magic mismatch", 0)
+	end
+
+	local codecVersion = reader:U8()
+	if codecVersion ~= SchemaCodec.LEGACY_VERSION then
+		error("Unsupported legacy SchemaBuffer codec version " .. tostring(codecVersion), 0)
+	end
+
+	local dataVersion = reader:VarUInt()
+	local fingerprint = reader:U32()
+	local schema = config._SchemaByVersion and config._SchemaByVersion[dataVersion] or nil
+	if schema == nil then
+		error(
+			"SchemaBuffer v1 save uses DataTemplate version " .. tostring(dataVersion)
+				.. ", but Config.SchemaHistory does not contain that template",
+			0
+		)
+	end
+	if fingerprint ~= schema.Fingerprint then
+		error(
+			"SchemaBuffer v1 fingerprint mismatch for DataTemplate version " .. tostring(dataVersion)
+				.. "; bump DataTemplate.Version and preserve the old template in Config.SchemaHistory",
+			0
+		)
+	end
+
+	local bitmap = reader:RawBuffer(schema.BitmapBytes)
+	local data = deepCopy(schema.Template)
+	local presentCount = 0
+
+	for index, leaf in ipairs(schema.Leaves) do
+		if readUintBitsNative(bitmap, index - 1, 1) ~= 0 then
+			presentCount += 1
+			SchemaCodec.setPathValue(data, leaf.Path, SchemaCodec.readLeaf(reader, leaf, config))
+		end
+	end
+
+	if reader.Position ~= reader.Length then
+		error("SchemaBuffer v1 frame contains trailing payload bytes", 0)
+	end
+
+	validateSavable(data, "SchemaBufferV1Data", nil, 0, nil, config)
+	return {
+		Version = dataVersion,
+		Data = data,
+	}, {
+		SchemaCodecVersion = SchemaCodec.LEGACY_VERSION,
+		FieldCount = schema.FieldCount,
+		PresentFields = presentCount,
+		DefaultFieldsOmitted = schema.FieldCount - presentCount,
+		Fingerprint = fingerprint,
+		VarUIntMode = "LegacyByteAligned",
 	}
 end
 
@@ -1176,59 +1813,81 @@ function SchemaCodec.decode(raw, config)
 	SchemaCodec.ensureConfig(config)
 
 	local length = buffer.len(raw)
-	if length < 11 then error("SchemaBuffer frame is too small", 0) end
+	if length < 6 then
+		error("SchemaBuffer frame is too small", 0)
+	end
+
 	local expectedChecksum = buffer.readu32(raw, length - 4)
 	local actualChecksum = adler32(raw, 0, length - 4)
-	if expectedChecksum ~= actualChecksum then error("SchemaBuffer checksum mismatch", 0) end
+	if expectedChecksum ~= actualChecksum then
+		error("SchemaBuffer checksum mismatch", 0)
+	end
 
-	local reader = Reader.new(raw)
-	reader.Length = length - 4
-	if reader:U8() ~= SchemaCodec.MAGIC then error("SchemaBuffer magic mismatch", 0) end
-	local codecVersion = reader:U8()
+	local codecVersion = buffer.readu8(raw, 1)
+	if codecVersion == SchemaCodec.LEGACY_VERSION then
+		return SchemaCodec.decodeLegacy(raw, config)
+	end
 	if codecVersion ~= SchemaCodec.VERSION then
 		error("Unsupported SchemaBuffer codec version " .. tostring(codecVersion), 0)
 	end
+
+	local bodyBitLength = (length - 4) * 8
+	local reader = SchemaCodec.BitReader.new(raw, bodyBitLength, SchemaCodec.VARUINT_LEGACY)
+
+	if reader:U8() ~= SchemaCodec.MAGIC then
+		error("SchemaBitBuffer magic mismatch", 0)
+	end
+	if reader:U8() ~= SchemaCodec.VERSION then
+		error("SchemaBitBuffer codec version mismatch", 0)
+	end
+
+	reader.VarUIntMode = if reader:Bit() then SchemaCodec.VARUINT_TIERED else SchemaCodec.VARUINT_LEGACY
 
 	local dataVersion = reader:VarUInt()
 	local fingerprint = reader:U32()
 	local schema = config._SchemaByVersion and config._SchemaByVersion[dataVersion] or nil
 	if schema == nil then
 		error(
-			"SchemaBuffer save uses DataTemplate version " .. tostring(dataVersion)
+			"SchemaBitBuffer save uses DataTemplate version " .. tostring(dataVersion)
 				.. ", but Config.SchemaHistory does not contain that template",
 			0
 		)
 	end
 	if fingerprint ~= schema.Fingerprint then
 		error(
-			"SchemaBuffer fingerprint mismatch for DataTemplate version " .. tostring(dataVersion)
+			"SchemaBitBuffer fingerprint mismatch for DataTemplate version " .. tostring(dataVersion)
 				.. "; bump DataTemplate.Version and preserve the old template in Config.SchemaHistory",
 			0
 		)
 	end
 
-	local bitmap = reader:RawBuffer(schema.BitmapBytes)
+	local present = table.create(schema.FieldCount, false)
+	for index = 1, schema.FieldCount do
+		present[index] = reader:Bit()
+	end
+
 	local data = deepCopy(schema.Template)
 	local presentCount = 0
 	for index, leaf in ipairs(schema.Leaves) do
-		if buffer.readbits(bitmap, index - 1, 1) ~= 0 then
+		if present[index] then
 			presentCount += 1
 			SchemaCodec.setPathValue(data, leaf.Path, SchemaCodec.readLeaf(reader, leaf, config))
 		end
 	end
-	if reader.Position ~= reader.Length then
-		error("SchemaBuffer frame contains trailing payload bytes", 0)
-	end
 
-	validateSavable(data, "SchemaBufferData", nil, 0, nil, config)
+	reader:RequireZeroPadding()
+	validateSavable(data, "SchemaBitBufferData", nil, 0, nil, config)
+
 	return {
 		Version = dataVersion,
 		Data = data,
 	}, {
+		SchemaCodecVersion = SchemaCodec.VERSION,
 		FieldCount = schema.FieldCount,
 		PresentFields = presentCount,
 		DefaultFieldsOmitted = schema.FieldCount - presentCount,
 		Fingerprint = fingerprint,
+		VarUIntMode = if reader.VarUIntMode == SchemaCodec.VARUINT_TIERED then "TieredBits" else "Legacy8BitGroups",
 	}
 end
 
@@ -1495,6 +2154,7 @@ end
 
 local function compressionOptions(config)
 	return {
+		Mode = "Binary",
 		CompressBuffers = true,
 		BufferStrategy = config.CompressionBufferStrategy,
 		BufferMinLength = config.CompressionBufferMinLength,
@@ -1509,6 +2169,7 @@ end
 
 local function tableCompressionOptions(config)
 	return {
+		Mode = "Binary",
 		TableCompression = true,
 		TableStrategy = config.CompressionTableStrategy,
 		CompressStrings = config.CompressionCompressStrings,
@@ -1593,151 +2254,301 @@ local function compressStorageBuffer(rawPayload, config)
 	}
 end
 
+local function prepareCompressionLayouts(config)
+	if config._CompressionLayoutsPrepared == true then
+		return
+	end
+
+	config._CompressionLayoutsPrepared = true
+	config._CompressionLayoutsByVersion = {}
+	config._CompressionLayoutErrors = {}
+
+	local codec = getCompression()
+
+	local function addLayout(dataVersion, template)
+		if type(dataVersion) ~= "number"
+			or dataVersion < 0
+			or dataVersion ~= math.floor(dataVersion)
+			or type(template) ~= "table" then
+			return
+		end
+
+		if config._CompressionLayoutsByVersion[dataVersion] ~= nil then
+			return
+		end
+
+		-- IndexedLayout requires a positive layout version. DataVersion itself may
+		-- legally be 0, so the internal Compression schema version is +1.
+		local layoutVersion = dataVersion + 1
+		local ok, layout = pcall(codec.IndexedLayout, template, layoutVersion)
+		if ok and type(layout) == "table" then
+			config._CompressionLayoutsByVersion[dataVersion] = layout
+		else
+			config._CompressionLayoutErrors[dataVersion] = tostring(layout)
+		end
+	end
+
+	addLayout(config.DataVersion or 1, config.Template or {})
+
+	local history = config.CompressionLayoutHistory
+	if history == nil then
+		-- Reuse the existing SchemaHistory table as a migration convenience.
+		history = config.SchemaHistory
+	end
+
+	if type(history) == "table" then
+		for rawVersion, historical in pairs(history) do
+			local dataVersion = tonumber(rawVersion)
+			local template = historical
+			if type(historical) == "table" and type(historical.Data) == "table" then
+				template = historical.Data
+			end
+			addLayout(dataVersion, template)
+		end
+	end
+end
+
+local function getCompressionLayout(config, dataVersion)
+	prepareCompressionLayouts(config)
+	return config._CompressionLayoutsByVersion[dataVersion]
+end
+
+local function isCompressionStorageFrame(value)
+	return typeof(value) == "buffer"
+		and buffer.len(value) >= 2
+		and buffer.readu8(value, 0) == STORAGE_FRAME_MAGIC
+end
+
+local function buildCompressionStorageFrame(codecKind, dataVersion, payload, config)
+	assert(typeof(payload) == "buffer", "Compression storage payload must be a buffer")
+
+	local writer = Writer.new(8)
+	writer:U8(STORAGE_FRAME_MAGIC)
+	writer:U8(STORAGE_FORMAT_VERSION)
+	writer:U8(codecKind)
+	writer:VarUInt(dataVersion)
+	local header = writer:Finish()
+
+	local totalBytes = buffer.len(header) + buffer.len(payload)
+	if totalBytes > config.MaxBufferBytes then
+		error(string.format(
+			"Encoded Compression storage frame is %d bytes, above MaxBufferBytes (%d)",
+			totalBytes,
+			config.MaxBufferBytes
+			), 2)
+	end
+
+	local out = buffer.create(totalBytes)
+	buffer.copy(out, 0, header, 0, buffer.len(header))
+	if buffer.len(payload) > 0 then
+		buffer.copy(out, buffer.len(header), payload, 0, buffer.len(payload))
+	end
+
+	return out, buffer.len(header)
+end
+
+local function parseCompressionStorageFrame(value, config)
+	if not isCompressionStorageFrame(value) then
+		return nil
+	end
+
+	if buffer.len(value) > config.MaxBufferBytes then
+		error("Compression storage frame exceeds MaxBufferBytes", 2)
+	end
+
+	local reader = Reader.new(value)
+	if reader:U8() ~= STORAGE_FRAME_MAGIC then
+		error("Compression storage frame magic mismatch", 2)
+	end
+
+	local formatVersion = reader:U8()
+	if formatVersion ~= STORAGE_FORMAT_VERSION then
+		error("Unsupported Compression storage frame version " .. tostring(formatVersion), 2)
+	end
+
+	local codecKind = reader:U8()
+	if codecKind ~= STORAGE_CODEC_INDEXED and codecKind ~= STORAGE_CODEC_TABLE then
+		error("Compression storage frame has unknown codec kind " .. tostring(codecKind), 2)
+	end
+
+	local dataVersion = reader:VarUInt()
+	local payload = reader:RawBuffer(reader.Length - reader.Position)
+	return codecKind, dataVersion, payload
+end
+
 local function compressStorageTable(dataTemplate, config)
 	validateSavable(dataTemplate, "DataTemplate", nil, 0, nil, config)
-	SchemaCodec.ensureConfig(config)
 
-	-- Generic SDSB remains the compatibility/reference candidate. RawBytes keeps
-	-- measuring this complete named DataTemplate so savings from SchemaBuffer are
-	-- visible against the old representation.
-	local rawPayload, rawCompactInfo = encodeBuffer(dataTemplate, config)
-	local rawBytes = buffer.len(rawPayload)
-	local bestPayload = rawPayload
-	local bestBytes = rawBytes
-	local bestMode = "LegacyRawBuffer"
-	local bestCompressed = false
-	local bestSchemaSelected = false
+	local dataVersion = assert(dataTemplate.Version, "DataTemplate requires Version")
+	local data = assert(dataTemplate.Data, "DataTemplate requires Data")
+	local codec = getCompression()
+	local options = tableCompressionOptions(config)
 
-	local schemaInfo = nil
-	local schemaCandidateBytes = nil
-	local schemaCandidateMode = nil
+	prepareCompressionLayouts(config)
 
-	local function selectCandidate(payload, mode, compressed, schemaSelected)
-		local bytes = buffer.len(payload)
-		if bytes < bestBytes then
-			bestPayload = payload
-			bestBytes = bytes
-			bestMode = mode
-			bestCompressed = compressed == true
-			bestSchemaSelected = schemaSelected == true
-			return true
-		end
-		return false
+	-- Candidate A: self-describing adaptive Compression v3 table packet. This is
+	-- always available and is the safe fallback for dynamic maps/extra fields.
+	local adaptiveOptions = options
+	if not config.CompressionEnabled then
+		adaptiveOptions = table.clone(options)
+		adaptiveOptions.TableCompression = false
+		adaptiveOptions.EntropyCoding = false
 	end
 
-	-- Candidate S: positional SchemaBuffer. Field names and generic value-type
-	-- tags are removed because the versioned DataTemplate itself is the schema.
-	if config.SchemaBufferEnabled == true then
-		local schemaOk, schemaPayload, schemaResult = pcall(SchemaCodec.encode, dataTemplate, config)
-		if schemaOk and typeof(schemaPayload) == "buffer" then
-			schemaInfo = schemaResult
-			local candidate = schemaPayload
-			local candidateMode = "SchemaBuffer/Raw"
-			local candidateCompressed = false
-
-			if config.CompressionEnabled and config.SchemaBufferCompress then
-				local codec = getCompression()
-				local smartOk, smartPayload, smartCompressed = pcall(
-					codec.CompressBufferSmart,
-					schemaPayload,
-					compressionOptions(config)
-				)
-				if smartOk and typeof(smartPayload) == "buffer" and buffer.len(smartPayload) < buffer.len(candidate) then
-					candidate = smartPayload
-					candidateCompressed = smartCompressed == true
-					local bufferMode = "Compressed"
-					if type(codec.BufferMode) == "function" then
-						local modeOk, modeValue = pcall(codec.BufferMode, smartPayload)
-						if modeOk and type(modeValue) == "string" then bufferMode = modeValue end
-					end
-					candidateMode = "SchemaBuffer/" .. bufferMode
-				end
-			end
-
-			schemaCandidateBytes = buffer.len(candidate)
-			schemaCandidateMode = candidateMode
-			selectCandidate(candidate, candidateMode, candidateCompressed, true)
-		else
-			local reason = if schemaOk then schemaResult else schemaPayload
-			if config.SchemaFallbackToGeneric ~= true then
-				error("SchemaBuffer encode failed: " .. tostring(reason), 2)
-			end
-			debugWarn(config, "SchemaBuffer candidate unavailable; using generic codec candidates:", reason)
-		end
-	end
-
-	-- SchemaBuffer is a storage encoding, not entropy compression, so it remains
-	-- usable even when CompressionEnabled=false.
+	local adaptivePacket
 	if config.CompressionEnabled then
-		-- Candidate A: v1.6-compatible SDSB bytes compressed by v2.6.7.
-		if config.CompressionCompareLegacyBuffer ~= false then
-			local legacyPayload, legacyCompressed, legacyStats = compressStorageBuffer(rawPayload, config)
-			selectCandidate(
-				legacyPayload,
-				"LegacyBuffer/" .. tostring(legacyStats.Mode),
-				legacyCompressed,
-				false
+		adaptivePacket = codec.CompressTablePacket(data, adaptiveOptions)
+	else
+		adaptivePacket = codec.Encode(data, adaptiveOptions)
+	end
+
+	if type(adaptivePacket) ~= "table" or typeof(adaptivePacket.Data) ~= "buffer" then
+		error("Compression v3 adaptive table encoder returned an invalid packet", 2)
+	end
+
+	local selectedPacket = adaptivePacket
+	local selectedKind = STORAGE_CODEC_TABLE
+	local selectedMode = type(adaptivePacket.Codec) == "string" and adaptivePacket.Codec or "CompressionTable"
+	local indexedPacket = nil
+	local indexedError = nil
+	local layout = nil
+
+	-- Candidate B: reusable IndexedLayout. For fixed DataTemplates this removes
+	-- field names and lets Compression's inferred schema/default-elision encode
+	-- values at bit granularity. If runtime data contains unknown fields the
+	-- layout throws and we safely keep the adaptive candidate.
+	if config.CompressionEnabled and config.CompressionIndexedLayout ~= false then
+		layout = getCompressionLayout(config, dataVersion)
+		if layout ~= nil then
+			local ok, packetOrError = pcall(function()
+				return layout:Encode(data, options)
+			end)
+
+			if ok
+				and type(packetOrError) == "table"
+				and typeof(packetOrError.Data) == "buffer" then
+				indexedPacket = packetOrError
+				local indexedBytes = buffer.len(indexedPacket.Data)
+				local adaptiveBytes = buffer.len(adaptivePacket.Data)
+
+				if config.CompressionCompareAdaptiveTable == false
+					or indexedBytes < adaptiveBytes then
+					selectedPacket = indexedPacket
+					selectedKind = STORAGE_CODEC_INDEXED
+					selectedMode = type(indexedPacket.Codec) == "string"
+						and indexedPacket.Codec
+						or "IndexedLayout"
+				end
+			else
+				indexedError = tostring(packetOrError)
+				debugWarn(config, "IndexedLayout candidate unavailable; adaptive table codec selected:", indexedError)
+			end
+		end
+	end
+
+	local stored, headerBytes = buildCompressionStorageFrame(
+		selectedKind,
+		dataVersion,
+		selectedPacket.Data,
+		config
+	)
+
+	local storedBytes = buffer.len(stored)
+	local selectedPayloadBytes = buffer.len(selectedPacket.Data)
+	local rawBytes = selectedPacket.RawBytes
+	if type(rawBytes) ~= "number" then
+		rawBytes = adaptivePacket.RawBytes
+	end
+	if type(rawBytes) ~= "number" then
+		rawBytes = selectedPayloadBytes
+	end
+
+	local savedBytes = math.max(0, rawBytes - storedBytes)
+	local usefulBits = selectedPacket.UsefulBits or selectedPacket.Bits or (selectedPayloadBytes * 8)
+	local physicalBits = storedBytes * 8
+	local payloadPhysicalBits = selectedPacket.PhysicalBits or (selectedPayloadBytes * 8)
+	local paddingBits = selectedPacket.PaddingBits or math.max(0, payloadPhysicalBits - usefulBits)
+
+	local indexedBytes = nil
+	if indexedPacket ~= nil then
+		indexedBytes = buffer.len(indexedPacket.Data) + headerBytes
+	end
+	local adaptiveBytes = buffer.len(adaptivePacket.Data) + headerBytes
+
+	return stored, {
+		RawBytes = rawBytes,
+		StoredBytes = storedBytes,
+		SavedBytes = savedBytes,
+		SavingsPercent = rawBytes > 0 and (savedBytes / rawBytes * 100) or 0,
+		Mode = "CompressionV3/" .. selectedMode,
+		Codec = selectedMode,
+		Compressed = config.CompressionEnabled == true,
+		FrameBytes = headerBytes,
+		PayloadBytes = selectedPayloadBytes,
+		UsefulBits = usefulBits,
+		PhysicalBits = physicalBits,
+		PaddingBits = paddingBits,
+		WorkingBufferBytes = selectedPayloadBytes,
+		CompactedPayloadBytes = selectedPayloadBytes,
+		UnusedWorkingBytesRemoved = 0,
+
+		SchemaEligible = layout ~= nil,
+		SchemaCandidateAvailable = indexedPacket ~= nil,
+		SchemaSelected = selectedKind == STORAGE_CODEC_INDEXED,
+		SchemaCandidateBytes = indexedBytes,
+		SchemaCandidateMode = indexedPacket and (indexedPacket.Codec or "IndexedLayout") or nil,
+		SchemaRawBytes = indexedPacket and indexedPacket.RawBytes or nil,
+		SchemaRawBits = indexedPacket and indexedPacket.RawBytes and (indexedPacket.RawBytes * 8) or nil,
+		SchemaUsefulBits = indexedPacket and (indexedPacket.UsefulBits or indexedPacket.Bits) or nil,
+		SchemaPaddingBits = indexedPacket and indexedPacket.PaddingBits or nil,
+		SchemaVarUIntMode = nil,
+		SchemaFieldCount = layout and #layout.Keys or nil,
+		SchemaPresentFields = nil,
+		SchemaDefaultFieldsOmitted = nil,
+		SchemaFingerprint = nil,
+		SchemaWorkingBufferBytes = indexedPacket and buffer.len(indexedPacket.Data) or nil,
+		SchemaCompactedPayloadBytes = indexedPacket and buffer.len(indexedPacket.Data) or nil,
+		SchemaUnusedWorkingBytesRemoved = 0,
+
+		AdaptiveCandidateBytes = adaptiveBytes,
+		IndexedCandidateError = indexedError,
+	}
+end
+
+local function decodeCompressionStorageFrame(value, config)
+	local codecKind, dataVersion, payload = parseCompressionStorageFrame(value, config)
+	if codecKind == nil then
+		return nil
+	end
+
+	local codec = getCompression()
+	local options = tableCompressionOptions(config)
+	local data
+
+	if codecKind == STORAGE_CODEC_INDEXED then
+		local layout = getCompressionLayout(config, dataVersion)
+		if layout == nil then
+			error(
+				"Indexed Compression save uses DataTemplate version " .. tostring(dataVersion)
+					.. ", but no matching template exists in Config.CompressionLayoutHistory/SchemaHistory",
+				2
 			)
 		end
 
-		-- Candidate B: Compression v2.6.7 sees the full named DataTemplate. This
-		-- remains important for dynamic/array-heavy templates that SchemaBuffer
-		-- intentionally refuses to encode.
-		local codec = getCompression()
-		local ok, packet = pcall(codec.CompressTablePacket, dataTemplate, tableCompressionOptions(config))
-		if ok
-			and type(packet) == "table"
-			and typeof(packet.Data) == "buffer" then
-			local nativeData = packet.Data
-			local nativeBackingBytes = buffer.len(nativeData)
-			local reportedBytes = type(packet.Bytes) == "number" and math.floor(packet.Bytes) or nativeBackingBytes
-			if reportedBytes >= 0 and reportedBytes < nativeBackingBytes then
-				nativeData = getBufferUtil().compactBytes(nativeData, reportedBytes)
-			end
-			local nativeBytes = buffer.len(nativeData)
-			local nativeSavings = rawBytes - nativeBytes
-			if nativeBytes <= config.MaxBufferBytes and nativeSavings >= config.CompressionMinSavingsBytes then
-				selectCandidate(
-					nativeData,
-					type(packet.Codec) == "string" and packet.Codec or "CompressionTable",
-					true,
-					false
-				)
-			end
-		else
-			debugWarn(config, "Compression v2.6.7 native table candidate failed; using another valid candidate:", packet)
-		end
+		data = layout:Decode(payload, options)
+	else
+		data = codec.DecompressTable(payload, options)
 	end
 
-	if bestBytes > config.MaxBufferBytes then
-		error(string.format("Encoded DataTemplate is %d bytes, above MaxBufferBytes (%d)", bestBytes, config.MaxBufferBytes), 2)
+	if type(data) ~= "table" then
+		error("Compression storage frame decoded a non-table Data value", 2)
 	end
 
-	local savedBytes = math.max(0, rawBytes - bestBytes)
-	return bestPayload, {
-		RawBytes = rawBytes,
-		StoredBytes = bestBytes,
-		SavedBytes = savedBytes,
-		SavingsPercent = rawBytes > 0 and savedBytes / rawBytes * 100 or 0,
-		Mode = bestMode,
-		Compressed = bestCompressed,
-		WorkingBufferBytes = rawCompactInfo and rawCompactInfo.WorkingBytes or rawBytes,
-		CompactedPayloadBytes = rawCompactInfo and rawCompactInfo.UsedBytes or rawBytes,
-		UnusedWorkingBytesRemoved = rawCompactInfo and rawCompactInfo.RemovedBytes or 0,
-		SchemaEligible = config._SchemaCurrent ~= nil,
-		SchemaCandidateAvailable = schemaInfo ~= nil,
-		SchemaSelected = bestSchemaSelected,
-		SchemaCandidateBytes = schemaCandidateBytes,
-		SchemaCandidateMode = schemaCandidateMode,
-		SchemaRawBytes = schemaInfo and schemaInfo.RawBytes or nil,
-		SchemaFieldCount = schemaInfo and schemaInfo.FieldCount or (config._SchemaCurrent and config._SchemaCurrent.FieldCount or nil),
-		SchemaPresentFields = schemaInfo and schemaInfo.PresentFields or nil,
-		SchemaDefaultFieldsOmitted = schemaInfo and schemaInfo.DefaultFieldsOmitted or nil,
-		SchemaFingerprint = schemaInfo and schemaInfo.Fingerprint or (config._SchemaCurrent and config._SchemaCurrent.Fingerprint or nil),
-		SchemaWorkingBufferBytes = schemaInfo and schemaInfo.WorkingBufferBytes or nil,
-		SchemaCompactedPayloadBytes = schemaInfo and schemaInfo.CompactedPayloadBytes or nil,
-		SchemaUnusedWorkingBytesRemoved = schemaInfo and schemaInfo.UnusedWorkingBytesRemoved or 0,
-	}
+	validateSavable(data, "Data", nil, 0, nil, config)
+	return {
+		Version = dataVersion,
+		Data = deepCopy(data),
+	}, codecKind == STORAGE_CODEC_INDEXED and "CompressionV3Indexed" or "CompressionV3Table"
 end
 
 local function tryDecodeCompressionTable(storedPayload, config)
@@ -1940,6 +2751,10 @@ local function prepareStorage(data, version, config)
 			SchemaCandidateBytes = stats.SchemaCandidateBytes,
 			SchemaCandidateMode = stats.SchemaCandidateMode,
 			SchemaRawBytes = stats.SchemaRawBytes,
+			SchemaRawBits = stats.SchemaRawBits,
+			SchemaUsefulBits = stats.SchemaUsefulBits,
+			SchemaPaddingBits = stats.SchemaPaddingBits,
+			SchemaVarUIntMode = stats.SchemaVarUIntMode,
 			SchemaFieldCount = stats.SchemaFieldCount,
 			SchemaPresentFields = stats.SchemaPresentFields,
 			SchemaDefaultFieldsOmitted = stats.SchemaDefaultFieldsOmitted,
@@ -1970,6 +2785,10 @@ local function prepareStorage(data, version, config)
 		SchemaCandidateBytes = nil,
 		SchemaCandidateMode = nil,
 		SchemaRawBytes = nil,
+		SchemaRawBits = nil,
+		SchemaUsefulBits = nil,
+		SchemaPaddingBits = nil,
+		SchemaVarUIntMode = nil,
 		SchemaFieldCount = nil,
 		SchemaPresentFields = nil,
 		SchemaDefaultFieldsOmitted = nil,
@@ -2019,7 +2838,16 @@ local function decodeStoredValue(value, config)
 	end
 
 	if typeof(value) == "buffer" then
-		-- v1.8+: first try Compression v2.6.7's native table frame. This keeps
+		-- v2.0.0 native Compression v3 frame. The tiny DataStore envelope stores
+		-- DataVersion + codec kind while Compression owns the actual table bits.
+		if isCompressionStorageFrame(value) then
+			local decoded, source = decodeCompressionStorageFrame(value, config)
+			if decoded ~= nil then
+				return decoded, source
+			end
+		end
+
+		-- v1.8/v1.9 compatibility: try the old direct Compression table frame.
 		-- table structure visible to the compressor and avoids double encoding.
 		local compressedTable = tryDecodeCompressionTable(value, config)
 		if compressedTable ~= nil then
@@ -2037,17 +2865,18 @@ local function decodeStoredValue(value, config)
 		end
 
 		-- v1.6 and older: BufferV1/SDSB, optionally wrapped in CompressBuffer.
-		-- Compression v2.6.7 DecompressBuffer intentionally passes unknown raw
-		-- buffers through unchanged, so both old raw and compressed saves work.
+		-- Compression v3 keeps the passthrough behavior needed to unwrap old
+		-- DataStore-owned frames without making them part of the new write path.
 		local rawPayload = autoDecompressStorageBuffer(value, config)
 
-		-- v1.8.4 SchemaBuffer may be stored raw or wrapped by CompressBufferSmart.
+		-- v1.9.0 SchemaBitBuffer v2 may be stored raw or wrapped by CompressBufferSmart.
 		-- DecompressBuffer passes raw unknown frames through unchanged, so one path
 		-- safely handles both forms.
 		if SchemaCodec.isFrame(rawPayload) then
+			local codecVersion = if buffer.len(rawPayload) >= 2 then buffer.readu8(rawPayload, 1) else 0
 			local schemaTemplate = SchemaCodec.decode(rawPayload, config)
 			if schemaTemplate ~= nil then
-				return schemaTemplate, "SchemaBufferV1"
+				return schemaTemplate, if codecVersion == SchemaCodec.VERSION then "SchemaBitBufferV2" else "SchemaBufferV1"
 			end
 		end
 
@@ -2175,7 +3004,8 @@ end
 
 function Profile:GetBuffer()
 	assert(self._active, "Cannot encode an inactive profile")
-	return encodeBuffer(self:GetDataTemplate(), self.Store.Config)
+	local stored = compressStorageTable(self:GetDataTemplate(), self.Store.Config)
+	return stored
 end
 
 Profile.ToBuffer = Profile.GetBuffer
@@ -2209,31 +3039,47 @@ function Profile:GetStorageInfo()
 			else 0,
 		LastBufferCompressed = self._lastBufferCompressed == true,
 		LastCompressionMode = self._lastCompressionMode,
-		BufferUtilEnabled = self.Store.Config.BufferUtilEnabled == true,
-		BufferUtilVersion = if self.Store.Config.BufferUtilEnabled then DataStore.BufferUtilVersion() else "Disabled",
+		BufferUtilEnabled = false,
+		BufferUtilVersion = "Removed",
 		LastWorkingBufferBytes = self._lastWorkingBufferBytes,
 		LastCompactedPayloadBytes = self._lastCompactedPayloadBytes,
 		LastUnusedWorkingBytesRemoved = self._lastUnusedWorkingBytesRemoved or 0,
-		SchemaBufferEnabled = self.Store.Config.SchemaBufferEnabled == true,
-		SchemaFormatVersion = SchemaCodec.VERSION,
-		SchemaEligible = self.Store.Config._SchemaCurrent ~= nil,
+		LegacySchemaBufferDecodeEnabled = self.Store.Config.SchemaBufferEnabled == true,
+		LegacySchemaFormatVersion = SchemaCodec.VERSION,
+		CompressionIndexedLayoutEnabled = self.Store.Config.CompressionIndexedLayout == true,
+		IndexedLayoutAvailable = self.Store.Config._CompressionLayoutsByVersion ~= nil
+			and self.Store.Config._CompressionLayoutsByVersion[self.Version] ~= nil,
+		IndexedCandidateAvailable = self._lastSchemaCandidateAvailable == true,
+		IndexedSelected = self._lastSchemaSelected == true,
+		LastIndexedCandidateBytes = self._lastSchemaCandidateBytes,
+		LastIndexedCandidateMode = self._lastSchemaCandidateMode,
+		-- v1.9-compatible aliases:
+		SchemaEligible = self.Store.Config._CompressionLayoutsByVersion ~= nil
+			and self.Store.Config._CompressionLayoutsByVersion[self.Version] ~= nil,
 		SchemaCandidateAvailable = self._lastSchemaCandidateAvailable == true,
 		SchemaSelected = self._lastSchemaSelected == true,
 		LastSchemaCandidateBytes = self._lastSchemaCandidateBytes,
 		LastSchemaCandidateMode = self._lastSchemaCandidateMode,
 		LastSchemaRawBytes = self._lastSchemaRawBytes,
-		SchemaFieldCount = self._lastSchemaFieldCount or (self.Store.Config._SchemaCurrent and self.Store.Config._SchemaCurrent.FieldCount or nil),
+		LastSchemaRawBits = self._lastSchemaRawBits,
+		LastSchemaUsefulBits = self._lastSchemaUsefulBits,
+		LastSchemaPaddingBits = self._lastSchemaPaddingBits,
+		LastSchemaVarUIntMode = self._lastSchemaVarUIntMode,
+		SchemaFieldCount = self._lastSchemaFieldCount,
 		LastSchemaPresentFields = self._lastSchemaPresentFields,
 		LastSchemaDefaultFieldsOmitted = self._lastSchemaDefaultFieldsOmitted,
-		SchemaFingerprint = self._lastSchemaFingerprint or (self.Store.Config._SchemaCurrent and self.Store.Config._SchemaCurrent.Fingerprint or nil),
+		SchemaFingerprint = self._lastSchemaFingerprint,
 		LastSchemaWorkingBufferBytes = self._lastSchemaWorkingBufferBytes,
 		LastSchemaCompactedPayloadBytes = self._lastSchemaCompactedPayloadBytes,
 		LastSchemaUnusedWorkingBytesRemoved = self._lastSchemaUnusedWorkingBytesRemoved or 0,
 		CompressionEnabled = self.Store.Config.CompressionEnabled,
 		CompressionVersion = DataStore.CompressionVersion(),
 		StorageFormatVersion = STORAGE_FORMAT_VERSION,
-		DataStoreValueContainsOnlyDataTemplate = true,
-		SessionLockStorage = if self.Store.Config.SessionLocking then "MemoryStore/CompactBufferV1" else "Disabled",
+		DataStoreValueContainsOnlyDataTemplate = false,
+		DataStoreValueContainsOnlyPlayerData = true,
+		SessionLockStorage = if self.Store.Config.SessionLocking
+			then (self.Store.Config.SessionCompressionEnabled and "MemoryStore/CompressionV3Indexed" or "MemoryStore/Table")
+			else "Disabled",
 		SessionLockFormatVersion = SESSION_FORMAT_VERSION,
 		SessionCompressionEnabled = self.Store.Config.SessionCompressionEnabled == true,
 		SessionStoreDiagnostics = self.Store.Config.SessionStoreDiagnostics == true,
@@ -2369,6 +3215,38 @@ local function guidHex(value)
 	return string.lower(compact)
 end
 
+local function guidToBuffer(value)
+	local compact = guidHex(value)
+	if compact == nil then
+		return nil
+	end
+
+	local out = buffer.create(16)
+	for i = 1, 16 do
+		local byteText = string.sub(compact, (i - 1) * 2 + 1, i * 2)
+		buffer.writeu8(out, i - 1, tonumber(byteText, 16))
+	end
+	return out
+end
+
+local function bufferToGuid(value)
+	if typeof(value) ~= "buffer" or buffer.len(value) ~= 16 then
+		return nil
+	end
+
+	local parts = table.create(16)
+	for i = 0, 15 do
+		parts[i + 1] = string.format("%02x", buffer.readu8(value, i))
+	end
+
+	local compact = table.concat(parts)
+	return string.sub(compact, 1, 8)
+		.. "-" .. string.sub(compact, 9, 12)
+		.. "-" .. string.sub(compact, 13, 16)
+		.. "-" .. string.sub(compact, 17, 20)
+		.. "-" .. string.sub(compact, 21, 32)
+end
+
 local function writeGuidOrString(writer, value)
 	local compact = guidHex(value)
 	if compact == nil then
@@ -2429,7 +3307,7 @@ local function makeSessionRaw(session, config)
 
 	local writer = Writer.new(config.BufferWriterInitialCapacity or 32)
 	writer:U8(SESSION_MAGIC)
-	writer:U8(SESSION_FORMAT_VERSION)
+	writer:U8(LEGACY_SESSION_FORMAT_VERSION)
 	writer:U8(flags)
 	writeGuidOrString(writer, id)
 
@@ -2454,8 +3332,8 @@ local function decodeSessionRaw(raw)
 	end
 
 	local version = reader:U8()
-	if version ~= SESSION_FORMAT_VERSION then
-		error("Unsupported session lock format version " .. tostring(version), 2)
+	if version ~= LEGACY_SESSION_FORMAT_VERSION then
+		error("Unsupported legacy session lock format version " .. tostring(version), 2)
 	end
 
 	local flags = reader:U8()
@@ -2483,39 +3361,113 @@ local function decodeSessionRaw(raw)
 	return session
 end
 
-local function encodeSessionLock(session, config)
-	local raw, rawCompactInfo = makeSessionRaw(session, config)
-	local rawBytes = buffer.len(raw)
-	local stored = raw
-	local compressed = false
-	local mode = "CompactRaw"
-
-	if config.SessionCompressionEnabled then
-		local codec = getCompression()
-		local ok, packed, didCompress = pcall(codec.CompressBufferSmart, raw, compressionOptions(config))
-		if ok and typeof(packed) == "buffer" then
-			stored = packed
-			compressed = didCompress == true
-			if compressed then
-				mode = "Compression/" .. (type(codec.BufferMode) == "function" and codec.BufferMode(stored) or "Buffer")
-			end
-		else
-			debugWarn(config, "Session compression failed; using compact raw lock:", packed)
-		end
+local function getSessionCompressionLayout(config)
+	if config._SessionCompressionLayout ~= nil then
+		return config._SessionCompressionLayout
 	end
 
-	local storedBytes = buffer.len(stored)
-	return stored, {
+	local codec = getCompression()
+	local layout = codec.IndexedLayout(SESSION_TEMPLATE, SESSION_LAYOUT_VERSION)
+	config._SessionCompressionLayout = layout
+	return layout
+end
+
+local function sessionAsTable(session, config)
+	local released = session.Released == true
+	local diagnostics = not released and config.SessionStoreDiagnostics == true
+
+	return {
+		Id = tostring(assert(session.Id, "Session lock requires Id")),
+		JobId = diagnostics and tostring(session.JobId or "") or "",
+		PlaceId = diagnostics and (session.PlaceId or 0) or 0,
+		TouchedAt = diagnostics and (session.TouchedAt or os.time()) or 0,
+		Released = released,
+	}
+end
+
+local function normalizeSessionForCompression(session, config)
+	local plain = sessionAsTable(session, config)
+	local idBuffer = guidToBuffer(plain.Id)
+	if idBuffer == nil then
+		error("Compression v3 session locking requires a GUID session Id", 2)
+	end
+
+	plain.Id = idBuffer
+	return plain
+end
+
+local function cleanDecodedSession(session, config)
+	if type(session) ~= "table" then
+		return nil
+	end
+
+	local id
+	if type(session.Id) == "string" then
+		id = session.Id
+	elseif typeof(session.Id) == "buffer" then
+		id = bufferToGuid(session.Id)
+	end
+	if id == nil then
+		return nil
+	end
+
+	local out = {
+		Id = id,
+	}
+
+	if session.Released == true then
+		out.Released = true
+	elseif config.SessionStoreDiagnostics == true then
+		out.JobId = type(session.JobId) == "string" and session.JobId or ""
+		out.PlaceId = type(session.PlaceId) == "number" and session.PlaceId or 0
+		out.TouchedAt = type(session.TouchedAt) == "number" and session.TouchedAt or 0
+	end
+
+	return out
+end
+
+local function encodeSessionLock(session, config)
+	if not config.SessionCompressionEnabled then
+		local plain = sessionAsTable(session, config)
+		return deepCopy(plain), {
+			RawBytes = nil,
+			StoredBytes = nil,
+			SavedBytes = 0,
+			SavingsPercent = 0,
+			Compressed = false,
+			Mode = "Table",
+			Format = SESSION_FORMAT_VERSION,
+			WorkingBufferBytes = nil,
+			CompactedPayloadBytes = nil,
+			UnusedWorkingBytesRemoved = 0,
+		}
+	end
+
+	local normalized = normalizeSessionForCompression(session, config)
+	local layout = getSessionCompressionLayout(config)
+	local packet = layout:Encode(normalized, tableCompressionOptions(config))
+	if type(packet) ~= "table" or typeof(packet.Data) ~= "buffer" then
+		error("Compression v3 session layout returned an invalid packet", 2)
+	end
+
+	local storedBytes = buffer.len(packet.Data)
+	local rawBytes = type(packet.RawBytes) == "number" and packet.RawBytes or storedBytes
+	local savedBytes = math.max(0, rawBytes - storedBytes)
+
+	return packet.Data, {
 		RawBytes = rawBytes,
 		StoredBytes = storedBytes,
-		SavedBytes = math.max(0, rawBytes - storedBytes),
-		SavingsPercent = rawBytes > 0 and math.max(0, rawBytes - storedBytes) / rawBytes * 100 or 0,
-		Compressed = compressed,
-		Mode = mode,
+		SavedBytes = savedBytes,
+		SavingsPercent = rawBytes > 0 and savedBytes / rawBytes * 100 or 0,
+		Compressed = true,
+		Mode = "CompressionV3/" .. tostring(packet.Codec or "IndexedSchema"),
 		Format = SESSION_FORMAT_VERSION,
-		WorkingBufferBytes = rawCompactInfo and rawCompactInfo.WorkingBytes or rawBytes,
-		CompactedPayloadBytes = rawCompactInfo and rawCompactInfo.UsedBytes or rawBytes,
-		UnusedWorkingBytesRemoved = rawCompactInfo and rawCompactInfo.RemovedBytes or 0,
+		WorkingBufferBytes = storedBytes,
+		CompactedPayloadBytes = storedBytes,
+		UnusedWorkingBytesRemoved = 0,
+		UsefulBits = packet.UsefulBits or packet.Bits,
+		PhysicalBits = packet.PhysicalBits or storedBytes * 8,
+		PaddingBits = packet.PaddingBits,
 	}
 end
 
@@ -2524,19 +3476,32 @@ local function decodeSessionLock(value, config)
 		return nil, "Empty"
 	end
 
-	-- v1.7.1 and older stored session locks as normal tables. Keep reading them
-	-- so a live rollout does not break ownership between old and new servers.
+	-- v1.7.1 and older, plus SessionCompressionEnabled=false in v2.0.0.
 	if type(value) == "table" then
-		if type(value.Id) ~= "string" then
-			return nil, "Legacy session lock is missing Id"
+		local session = cleanDecodedSession(value, config)
+		if session == nil then
+			return nil, "Session lock table is missing Id"
 		end
-		return deepCopy(value), "LegacyTable"
+		return session, "Table"
 	end
 
 	if typeof(value) ~= "buffer" then
 		return nil, "Unsupported session lock type " .. typeof(value)
 	end
 
+	-- v2.0.0: Compression v3 owns the entire session table representation.
+	local layout = getSessionCompressionLayout(config)
+	local okNew, decodedNew = pcall(function()
+		return layout:Decode(value, tableCompressionOptions(config))
+	end)
+	if okNew then
+		local session = cleanDecodedSession(decodedNew, config)
+		if session ~= nil then
+			return session, "CompressionV3Indexed"
+		end
+	end
+
+	-- Rollout compatibility for v1.9 CompactBufferV1 session locks.
 	local codec = getCompression()
 	local okDecompress, raw = pcall(codec.DecompressBuffer, value)
 	if not okDecompress or typeof(raw) ~= "buffer" then
@@ -2726,7 +3691,7 @@ function Profile:SaveAsync()
 		return false, result
 	end
 
-	-- v1.8.4: only remove the old player key after the compact-key write succeeds.
+	-- v1.9.0: only remove the old player key after the compact-key write succeeds.
 	-- A failed cleanup is non-destructive; the compact copy is already durable and
 	-- the old key is retried on a later save instead of risking data loss.
 	if self._legacyKeyToDelete ~= nil then
@@ -2757,6 +3722,10 @@ function Profile:SaveAsync()
 	self._lastSchemaCandidateBytes = prepared.SchemaCandidateBytes
 	self._lastSchemaCandidateMode = prepared.SchemaCandidateMode
 	self._lastSchemaRawBytes = prepared.SchemaRawBytes
+	self._lastSchemaRawBits = prepared.SchemaRawBits
+	self._lastSchemaUsefulBits = prepared.SchemaUsefulBits
+	self._lastSchemaPaddingBits = prepared.SchemaPaddingBits
+	self._lastSchemaVarUIntMode = prepared.SchemaVarUIntMode
 	self._lastSchemaFieldCount = prepared.SchemaFieldCount
 	self._lastSchemaPresentFields = prepared.SchemaPresentFields
 	self._lastSchemaDefaultFieldsOmitted = prepared.SchemaDefaultFieldsOmitted
@@ -2816,13 +3785,15 @@ function DataStore.new(config)
 	assert(#merged.CompactKeyPrefix <= 16, "Config.CompactKeyPrefix must be at most 16 bytes")
 	assert(merged.StorageMode == "Buffer" or merged.StorageMode == "Table", "Config.StorageMode must be Buffer or Table")
 	assert(type(merged.CompressionEnabled) == "boolean", "Config.CompressionEnabled must be a boolean")
-	assert(type(merged.BufferUtilEnabled) == "boolean", "Config.BufferUtilEnabled must be a boolean")
-	assert(merged.BufferUtilEnabled or (merged.StorageMode == "Table" and not merged.SessionLocking), "BufferUtilEnabled=false is only valid with Table storage and SessionLocking=false")
+	assert(type(merged.BufferUtilEnabled) == "boolean", "Config.BufferUtilEnabled must be a boolean compatibility flag")
 	assert(type(merged.BufferWriterInitialCapacity) == "number" and merged.BufferWriterInitialCapacity >= 1 and merged.BufferWriterInitialCapacity == math.floor(merged.BufferWriterInitialCapacity), "Config.BufferWriterInitialCapacity must be a positive integer")
 	assert(type(merged.SchemaBufferEnabled) == "boolean", "Config.SchemaBufferEnabled must be a boolean")
 	assert(type(merged.SchemaBufferCompress) == "boolean", "Config.SchemaBufferCompress must be a boolean")
 	assert(type(merged.SchemaFallbackToGeneric) == "boolean", "Config.SchemaFallbackToGeneric must be a boolean")
 	assert(merged.SchemaHistory == nil or type(merged.SchemaHistory) == "table", "Config.SchemaHistory must be nil or a table keyed by DataTemplate version")
+	assert(type(merged.CompressionIndexedLayout) == "boolean", "Config.CompressionIndexedLayout must be a boolean")
+	assert(type(merged.CompressionCompareAdaptiveTable) == "boolean", "Config.CompressionCompareAdaptiveTable must be a boolean")
+	assert(merged.CompressionLayoutHistory == nil or type(merged.CompressionLayoutHistory) == "table", "Config.CompressionLayoutHistory must be nil or a table keyed by DataTemplate version")
 	assert(
 		merged.CompressionTableStrategy == "Auto"
 			or merged.CompressionTableStrategy == "Compact"
@@ -2868,18 +3839,17 @@ function DataStore.new(config)
 	assert(type(merged.MaxTableEntries) == "number" and merged.MaxTableEntries >= 1, "Config.MaxTableEntries must be >= 1")
 
 	validateSavable(merged.DataTemplate, "DataTemplate", nil, 0, nil, merged)
-	SchemaCodec.ensureConfig(merged)
-	if merged.SchemaBufferEnabled and merged._SchemaCurrent == nil and merged.SchemaFallbackToGeneric ~= true then
-		error("Config.DataTemplate is not eligible for SchemaBuffer: " .. tostring(merged._SchemaReason), 2)
-	end
 
-	-- Preload both codecs outside MemoryStore UpdateAsync callbacks. Those callbacks cannot yield.
-	-- BufferUtil is also used by the compact session writer, so it must already be cached.
-	if merged.BufferUtilEnabled then
-		getBufferUtil()
-	end
+	-- Compression must be required/compiled before MemoryStore UpdateAsync callbacks,
+	-- because callback bodies cannot yield. BufferUtil is no longer required.
 	if merged.SessionLocking or merged.StorageMode == "Buffer" then
 		getCompression()
+	end
+	if merged.StorageMode == "Buffer" then
+		prepareCompressionLayouts(merged)
+	end
+	if merged.SessionLocking and merged.SessionCompressionEnabled then
+		getSessionCompressionLayout(merged)
 	end
 
 	if merged.StorageMode == "Buffer" then
@@ -2889,7 +3859,7 @@ function DataStore.new(config)
 			type(decodedTemplate) == "table"
 				and type(decodedTemplate.Version) == "number"
 				and type(decodedTemplate.Data) == "table",
-			"DataTemplate v1.8.4 storage self-test failed"
+			"DataTemplate v2.0.0 Compression storage self-test failed"
 		)
 	end
 
@@ -2980,7 +3950,45 @@ function DataStore:GetKeyInfo(subject)
 	}
 end
 
-function DataStore:GetSchemaInfo()
+function DataStore:GetCompressionLayoutInfo()
+	prepareCompressionLayouts(self.Config)
+
+	local layout = self.Config._CompressionLayoutsByVersion
+		and self.Config._CompressionLayoutsByVersion[self.Config.DataVersion]
+	local reason = self.Config._CompressionLayoutErrors
+		and self.Config._CompressionLayoutErrors[self.Config.DataVersion]
+		or nil
+
+	if layout == nil then
+		return {
+			Enabled = self.Config.CompressionIndexedLayout == true,
+			Available = false,
+			Reason = reason or "No indexed layout compiled",
+			DataVersion = self.Config.DataVersion,
+			StorageFormatVersion = STORAGE_FORMAT_VERSION,
+			CompressionVersion = DataStore.CompressionVersion(),
+		}
+	end
+
+	return {
+		Enabled = self.Config.CompressionIndexedLayout == true,
+		Available = true,
+		Reason = nil,
+		DataVersion = self.Config.DataVersion,
+		LayoutVersion = layout.Version,
+		Mode = layout.Mode,
+		FieldCount = #layout.Keys,
+		Keys = table.clone(layout.Keys),
+		StorageFormatVersion = STORAGE_FORMAT_VERSION,
+		CompressionVersion = DataStore.CompressionVersion(),
+	}
+end
+
+-- v2.0: GetSchemaInfo now describes the active Compression v3 indexed layout.
+DataStore.GetSchemaInfo = DataStore.GetCompressionLayoutInfo
+
+-- Legacy v1.9 SchemaBitBuffer inspector retained only for migration debugging.
+function DataStore:GetLegacySchemaInfo()
 	SchemaCodec.ensureConfig(self.Config)
 	local schema = self.Config._SchemaCurrent
 	if schema == nil then
@@ -3214,6 +4222,10 @@ function DataStore:OpenPlayerAsync(subject, options)
 				_lastSchemaCandidateBytes = nil,
 				_lastSchemaCandidateMode = nil,
 				_lastSchemaRawBytes = nil,
+				_lastSchemaRawBits = nil,
+				_lastSchemaUsefulBits = nil,
+				_lastSchemaPaddingBits = nil,
+				_lastSchemaVarUIntMode = nil,
 				_lastSchemaFieldCount = self.Config._SchemaCurrent and self.Config._SchemaCurrent.FieldCount or nil,
 				_lastSchemaPresentFields = nil,
 				_lastSchemaDefaultFieldsOmitted = nil,
@@ -3417,6 +4429,8 @@ end
 
 function DataStore.CompressDataTemplate(dataTemplate, options)
 	assert(type(dataTemplate) == "table", "CompressDataTemplate expects a table")
+	assert(type(dataTemplate.Version) == "number", "CompressDataTemplate expects DataTemplate.Version")
+	assert(type(dataTemplate.Data) == "table", "CompressDataTemplate expects DataTemplate.Data")
 
 	local config = table.clone(DEFAULTS)
 	if type(options) == "table" then
@@ -3425,9 +4439,26 @@ function DataStore.CompressDataTemplate(dataTemplate, options)
 		end
 	end
 
-	validateSavable(dataTemplate, "DataTemplate", nil, 0, nil, config)
-	local codec = getCompression()
-	return codec.CompressTablePacket(dataTemplate, tableCompressionOptions(config))
+	config.DataVersion = dataTemplate.Version
+	config.Template = deepCopy(dataTemplate.Data)
+	config.DataTemplate = deepCopy(dataTemplate)
+
+	local stored, stats = compressStorageTable(dataTemplate, config)
+	return {
+		Data = stored,
+		Bytes = stats.StoredBytes,
+		Bits = stats.PhysicalBits or (stats.StoredBytes * 8),
+		UsefulBits = stats.UsefulBits,
+		PhysicalBits = stats.PhysicalBits,
+		PaddingBits = stats.PaddingBits,
+		RawBytes = stats.RawBytes,
+		SavedBytes = stats.SavedBytes,
+		SavingsPercent = stats.SavingsPercent,
+		Codec = stats.Mode,
+		IndexedSelected = stats.SchemaSelected == true,
+		IndexedCandidateBytes = stats.SchemaCandidateBytes,
+		AdaptiveCandidateBytes = stats.AdaptiveCandidateBytes,
+	}
 end
 
 function DataStore.DecompressDataTemplate(dataBuffer, options)
@@ -3438,44 +4469,59 @@ function DataStore.DecompressDataTemplate(dataBuffer, options)
 		for key, value in pairs(options) do
 			config[key] = value
 		end
+		if type(options.DataTemplate) == "table"
+			and type(options.DataTemplate.Data) == "table" then
+			config.DataVersion = options.DataTemplate.Version
+			config.Template = deepCopy(options.DataTemplate.Data)
+		end
 	end
 
-	local decoded = tryDecodeCompressionTable(dataBuffer, config)
-	if decoded == nil then
-		error("DataStore could not decode Compression v2.6.7 DataTemplate buffer", 2)
+	if isCompressionStorageFrame(dataBuffer) then
+		local decoded = decodeCompressionStorageFrame(dataBuffer, config)
+		return decoded
 	end
-	return decoded
+
+	-- Compatibility with v1.8/v1.9 direct Compression table buffers.
+	local decoded = tryDecodeCompressionTable(dataBuffer, config)
+	if decoded ~= nil then
+		return decoded
+	end
+
+	error("DataStore could not decode Compression DataTemplate buffer", 2)
 end
 
 function DataStore.Encode(data, options)
 	local config = table.clone(DEFAULTS)
-
 	if type(options) == "table" then
 		for key, value in pairs(options) do
 			config[key] = value
 		end
 	end
 
-	return encodeBuffer(data, config)
+	local codec = getCompression()
+	local packet = codec.Pack(data, tableCompressionOptions(config))
+	return packet.Data
 end
 
 function DataStore.Decode(dataBuffer, options)
-	local config = table.clone(DEFAULTS)
+	assert(typeof(dataBuffer) == "buffer", "Decode expects a buffer")
 
+	local config = table.clone(DEFAULTS)
 	if type(options) == "table" then
 		for key, value in pairs(options) do
 			config[key] = value
 		end
 	end
 
-	return decodeBuffer(dataBuffer, config)
+	return getCompression().Unpack(dataBuffer, tableCompressionOptions(config))
 end
 
+-- Compatibility helpers for old raw BufferV1 payloads. New DataStore saves do
+-- not use this path.
 function DataStore.CompressStorageBuffer(dataBuffer, options)
 	assert(typeof(dataBuffer) == "buffer", "CompressStorageBuffer expects a buffer")
 
 	local config = table.clone(DEFAULTS)
-
 	if type(options) == "table" then
 		for key, value in pairs(options) do
 			config[key] = value
@@ -3489,7 +4535,6 @@ function DataStore.DecompressStorageBuffer(dataBuffer, options)
 	assert(typeof(dataBuffer) == "buffer", "DecompressStorageBuffer expects a buffer")
 
 	local config = table.clone(DEFAULTS)
-
 	if type(options) == "table" then
 		for key, value in pairs(options) do
 			config[key] = value
@@ -3507,7 +4552,7 @@ function DataStore.CompactBufferExact(dataBuffer, usedBytes)
 	end
 	assert(type(actualUsed) == "number" and actualUsed >= 0 and actualUsed == math.floor(actualUsed), "CompactBufferExact usedBytes must be a non-negative integer")
 	assert(actualUsed <= buffer.len(dataBuffer), "CompactBufferExact usedBytes exceeds buffer length")
-	return getBufferUtil().compactBytes(dataBuffer, actualUsed)
+	return compactBufferBytes(dataBuffer, actualUsed)
 end
 
 function DataStore.EncodeUserIdKey(userId)
@@ -3528,8 +4573,7 @@ function DataStore.FormatVersion()
 end
 
 function DataStore.BufferUtilVersion()
-	local util = getBufferUtil()
-	return tostring(util.VERSION or "Unknown")
+	return "Removed"
 end
 
 function DataStore.CompressionVersion()
@@ -3541,6 +4585,6 @@ DataStore.Profile = Profile
 DataStore.Signal = Signal
 DataStore.BufferEncoding = BUFFER_ENCODING
 DataStore.SessionFormatVersion = SESSION_FORMAT_VERSION
-DataStore.SchemaFormatVersion = SchemaCodec.VERSION
+DataStore.SchemaFormatVersion = SchemaCodec.VERSION -- legacy decode format
 
 return DataStore
