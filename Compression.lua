@@ -4,7 +4,7 @@
 local Compression = {}
 local INTERNAL: any = {}
 
-Compression.VERSION = "3.0.0"
+Compression.VERSION = "3.1.0"
 
 export type Mode = "Binary" | "BinaryWithHash"
 export type StringStrategy = "Auto" | "Raw" | "LZ" | "ASCII7" | "LowASCII5" | "Identifier6" | "Numeric4"
@@ -190,6 +190,15 @@ local FMT = {
 	COMPACT_NUMBER_MAGIC = 0xD7,
 	SCHEMA_V29_MAGIC = 0xD1,
 	DELTA_V29_MAGIC = 0xD0,
+
+	-- v3.1 ultra-compact schema markers.
+	-- D8..DF encode schema versions 1..8 directly in the marker byte, removing
+	-- the separate schema-version bitstream from the common fixed-layout path.
+	-- C8..CF encode an entire all-default schema value in exactly one byte.
+	SCHEMA_INLINE_BASE = 0xD8,
+	SCHEMA_INLINE_MAX = 0xDF,
+	SCHEMA_ALL_DEFAULT_BASE = 0xC8,
+	SCHEMA_ALL_DEFAULT_MAX = 0xCF,
 	COMPACT_BUFFER_ZERO_RUN_MAGIC = 0xD6,
 	COMPACT_TABLE_MAGIC = 0xD5,
 	COMPACT_MAPPED_TABLE_MAGIC = 0xD2,
@@ -1443,6 +1452,108 @@ FMT.CloneDefault = function(value: any): any
 	local result = {}
 	for key, child in pairs(value) do
 		result[FMT.CloneDefault(key)] = FMT.CloneDefault(child)
+	end
+	return result
+end
+
+
+-- Returns a complete default value for a descriptor when one can be reconstructed
+-- without reading payload bits. Object descriptors infer their default from their
+-- child defaults, which lets nested fixed DataStore templates participate in the
+-- v3.1 one-byte all-default schema frame.
+FMT.DescriptorDefaultValue = function(descriptor: Descriptor): (boolean, any)
+	if descriptor.Default ~= nil then
+		return true, FMT.CloneDefault(descriptor.Default)
+	end
+
+	if descriptor.Kind == "Object" then
+		local fields = descriptor.Fields :: {[string]: Descriptor}
+		local result = {}
+		for name, child in pairs(fields) do
+			local ok, childDefault = FMT.DescriptorDefaultValue(child)
+			if not ok then
+				return false, nil
+			end
+			result[name] = childDefault
+		end
+		return true, result
+	end
+
+	return false, nil
+end
+
+-- Tests whether a runtime value is exactly represented by a descriptor's defaults.
+-- This works recursively for fixed nested objects and does not serialize anything.
+FMT.DescriptorMatchesDefault = function(descriptor: Descriptor, value: any): boolean
+	if descriptor.Default ~= nil then
+		return FMT.DeepEqual(value, descriptor.Default)
+	end
+
+	if descriptor.Kind ~= "Object" or typeof(value) ~= "table" or isArray(value) then
+		return false
+	end
+
+	local fields = descriptor.Fields :: {[string]: Descriptor}
+	for key in pairs(value) do
+		if typeof(key) ~= "string" or fields[key] == nil then
+			return false
+		end
+	end
+
+	for name, child in pairs(fields) do
+		local childValue = value[name]
+		if childValue == nil then
+			local ok, childDefault = FMT.DescriptorDefaultValue(child)
+			if not ok then
+				return false
+			end
+			childValue = childDefault
+		end
+		if not FMT.DescriptorMatchesDefault(child, childValue) then
+			return false
+		end
+	end
+
+	return true
+end
+
+FMT.SchemaValueIsAllDefault = function(fields: {Field}, value: {[string]: any}): boolean
+	local known: {[string]: boolean} = {}
+	for _, field in ipairs(fields) do
+		known[field.Name] = true
+	end
+	for key in pairs(value) do
+		if typeof(key) ~= "string" or known[key] ~= true then
+			return false
+		end
+	end
+
+	for _, field in ipairs(fields) do
+		local descriptor = field.Descriptor
+		local fieldValue = value[field.Name]
+		if fieldValue == nil then
+			local ok, defaultValue = FMT.DescriptorDefaultValue(descriptor)
+			if not ok then
+				return false
+			end
+			fieldValue = defaultValue
+		end
+		if not FMT.DescriptorMatchesDefault(descriptor, fieldValue) then
+			return false
+		end
+	end
+
+	return true
+end
+
+FMT.BuildSchemaDefaults = function(fields: {Field}): {[string]: any}
+	local result: {[string]: any} = {}
+	for _, field in ipairs(fields) do
+		local ok, defaultValue = FMT.DescriptorDefaultValue(field.Descriptor)
+		if not ok then
+			fail("all-default schema marker used for a field without a complete default: " .. field.Name, 3)
+		end
+		result[field.Name] = defaultValue
 	end
 	return result
 end
@@ -3734,15 +3845,32 @@ end
 -- v2.9 schema frames remove the generic CP/version/mode bytes. The marker implies
 -- binary v29 + mode, and the schema version continues directly in the bit stream.
 FMT.WriteSchemaHeader = function(w: Writer, mode: number, schemaVersion: number?)
+	local resolvedVersion = schemaVersion or 1
+
+	-- v3.1: schema versions 1..8 are embedded directly in the marker byte.
+	-- This removes 1..8+ version bits from every common IndexedSchema packet.
+	if mode == MODE.SCHEMA and resolvedVersion >= 1 and resolvedVersion <= 8 then
+		writeByte(w, FMT.SCHEMA_INLINE_BASE + resolvedVersion - 1)
+		return
+	end
+
 	if mode == MODE.SCHEMA then writeByte(w, FMT.SCHEMA_V29_MAGIC)
 	elseif mode == MODE.DELTA then writeByte(w, FMT.DELTA_V29_MAGIC)
 	else fail("invalid compact schema mode", 3) end
-	INTERNAL.writeAdaptiveUIntBits(w, (schemaVersion or 1) - 1)
+	INTERNAL.writeAdaptiveUIntBits(w, resolvedVersion - 1)
 end
 
 FMT.ReadSchemaHeader = function(r: Reader, expectedMode: number): (number, number)
 	if r.Position >= r.Length then fail("unexpected end of schema payload", 3) end
 	local first = buffer.readu8(r.Buffer, r.Position)
+
+	if expectedMode == MODE.SCHEMA
+		and first >= FMT.SCHEMA_INLINE_BASE
+		and first <= FMT.SCHEMA_INLINE_MAX then
+		r.Position += 1
+		return first - FMT.SCHEMA_INLINE_BASE + 1, 30
+	end
+
 	local expectedMagic = expectedMode == MODE.SCHEMA and FMT.SCHEMA_V29_MAGIC or FMT.DELTA_V29_MAGIC
 	if first == expectedMagic then
 		r.Position += 1
@@ -4206,6 +4334,33 @@ function Schema:Encode(value: {[string]: any}, options: Options?): Packet
 		)
 	end
 
+	-- v3.1 floor case: if every schema field equals its recursively inferred
+	-- default and the schema version fits inline, the entire value is represented
+	-- by one byte. No field bitmap, names, type tags, or version payload follows.
+	if self.Version >= 1
+		and self.Version <= 8
+		and FMT.SchemaValueIsAllDefault(self.Fields, value) then
+		local data = buffer.create(1)
+		buffer.writeu8(
+			data,
+			0,
+			FMT.SCHEMA_ALL_DEFAULT_BASE + self.Version - 1
+		)
+		local packet = packetFromBuffer(
+			data,
+			options,
+			self.Version,
+			rawValueBits(value),
+			8,
+			0
+		)
+		packet.Entropy = "None"
+		packet.EntropyBytesBefore = 1
+		packet.EntropyBytesAfter = 1
+		packet.EntropySavedBytes = 0
+		return packet
+	end
+
 	local w = newWriter()
 	FMT.WriteSchemaHeader(w, MODE.SCHEMA, self.Version)
 	for _, field in ipairs(self.Fields) do
@@ -4243,6 +4398,18 @@ end
 -- Handles schema.
 function Schema:Decode(packet: Packet | buffer, options: Options?): {[string]: any}
 	local data, packetVersion = unwrapPacket(packet, options)
+
+	if buffer.len(data) == 1 then
+		local first = buffer.readu8(data, 0)
+		if first >= FMT.SCHEMA_ALL_DEFAULT_BASE
+			and first <= FMT.SCHEMA_ALL_DEFAULT_MAX then
+			local encodedVersion = first - FMT.SCHEMA_ALL_DEFAULT_BASE + 1
+			if packetVersion ~= nil and packetVersion ~= encodedVersion then fail("packet/schema version mismatch", 2) end
+			if encodedVersion ~= self.Version then fail("schema version mismatch", 2) end
+			return FMT.BuildSchemaDefaults(self.Fields)
+		end
+	end
+
 	local r = newReader(data)
 	local encodedVersion, binaryVersion = FMT.ReadSchemaHeader(r, MODE.SCHEMA)
 	if packetVersion ~= nil and packetVersion ~= encodedVersion then fail("packet/schema version mismatch", 2) end
@@ -4469,6 +4636,53 @@ function Schema:AnalyzeBits(value: {[string]: any}): BitLayout
 			"Schema:AnalyzeBits expects table",
 			2
 		)
+	end
+
+	if self.Version >= 1
+		and self.Version <= 8
+		and FMT.SchemaValueIsAllDefault(self.Fields, value) then
+		local fields = {}
+		local rawBits = 0
+		for _, field in ipairs(self.Fields) do
+			local fieldValue = value[field.Name]
+			if fieldValue == nil then
+				local ok, defaultValue = FMT.DescriptorDefaultValue(field.Descriptor)
+				if not ok then
+					fail("all-default schema analysis missing default for " .. field.Name, 2)
+				end
+				fieldValue = defaultValue
+			end
+			local raw = rawValueBits(fieldValue)
+			rawBits += raw
+			fields[#fields + 1] = {
+				Name = field.Name,
+				Type = field.Descriptor.Kind,
+				Present = true,
+				Defaulted = true,
+				UsefulBits = 0,
+				PaddingBits = 0,
+				PhysicalBits = 0,
+				RawBits = raw,
+				SavedBits = raw,
+				ExpandedBits = 0,
+				SavingsPercent = raw > 0 and 100 or 0,
+			}
+		end
+		local savedBits = math.max(0, rawBits - 8)
+		return {
+			HeaderBits = 8,
+			DefaultFields = #self.Fields,
+			ElidedRawBits = rawBits,
+			UsefulBits = 8,
+			PaddingBits = 0,
+			PhysicalBits = 8,
+			PhysicalBytes = 1,
+			RawBits = rawBits,
+			SavedBits = savedBits,
+			ExpandedBits = math.max(0, 8 - rawBits),
+			SavingsPercent = rawBits > 0 and math.max(0, (rawBits - 8) / rawBits * 100) or 0,
+			Fields = fields,
+		}
 	end
 
 	local w = newWriter()
@@ -7654,6 +7868,54 @@ function INTERNAL.buildIndexedLayoutNode(template: any, path: string): IndexedLa
 	}
 end
 
+-- Validates a named value against the reusable indexed layout without allocating
+-- the positional conversion. v3.0's schema fast path could otherwise ignore an
+-- unknown runtime field because Schema itself only reads declared fields.
+function INTERNAL.validateIndexedNode(node: IndexedLayoutNode, value: any, path: string)
+	if node.Kind == "Value" then
+		return
+	end
+
+	if node.Kind == "Array" then
+		if typeof(value) ~= "table" or not isArray(value) then
+			fail(path .. " expected array", 3)
+		end
+		local item = node.Item
+		if item ~= nil then
+			for i = 1, #value do
+				INTERNAL.validateIndexedNode(item, value[i], path .. "[" .. tostring(i) .. "]")
+			end
+		end
+		return
+	end
+
+	if typeof(value) ~= "table" or isArray(value) then
+		fail(path .. " expected named table", 3)
+	end
+
+	local indexByKey = node.IndexByKey :: {[string]: number}
+	local keys = node.Keys :: {string}
+	local children = node.Children :: {IndexedLayoutNode}
+	local defaults = node.Defaults :: {any}
+
+	for key in pairs(value) do
+		if typeof(key) ~= "string" or indexByKey[key] == nil then
+			fail(path .. " contains unknown indexed field " .. tostring(key), 3)
+		end
+	end
+
+	for i, key in ipairs(keys) do
+		local childValue = value[key]
+		if childValue == nil then
+			childValue = FMT.CloneDefault(defaults[i])
+		end
+		if childValue == nil then
+			fail(path .. "." .. key .. " is missing", 3)
+		end
+		INTERNAL.validateIndexedNode(children[i], childValue, path .. "." .. key)
+	end
+end
+
 -- Copies an unknown-shape value without changing its map keys. This is used for
 -- empty template arrays, where no stable child layout can be inferred safely.
 function INTERNAL.cloneIndexedUnknown(value: any, active: {[any]: boolean}?): any
@@ -7770,7 +8032,17 @@ function IndexedLayout:Encode(value: {[string]: any}, options: Options?): Packet
 	if typeof(value) ~= "table" or isArray(value) then fail("IndexedLayout:Encode expects a named table", 2) end
 	local schema = (self :: any)._Schema
 	if schema ~= nil then
+		-- Validate against the reusable layout before entering Schema's direct
+		-- fast path so unknown runtime fields can never be silently discarded.
+		INTERNAL.validateIndexedNode((self :: any)._Node, value, "$indexed")
 		local packet = (schema :: SchemaObject):Encode(value, options)
+		if buffer.len(packet.Data) == 1 then
+			local marker = buffer.readu8(packet.Data, 0)
+			if marker >= FMT.SCHEMA_ALL_DEFAULT_BASE and marker <= FMT.SCHEMA_ALL_DEFAULT_MAX then
+				packet.Codec = "IndexedSchemaDefault1B"
+				return packet
+			end
+		end
 		packet.Codec = packet.Entropy == "Huffman" and "IndexedSchema+Huffman" or "IndexedSchema"
 		return packet
 	end
@@ -7844,6 +8116,47 @@ end
 function Compression.FromIndexedTable(value: {any}, layout: IndexedLayoutObject): {[string]: any}
 	if typeof(layout) ~= "table" or typeof((layout :: any).FromIndexed) ~= "function" then fail("FromIndexedTable expects IndexedLayout", 2) end
 	return layout:FromIndexed(value)
+end
+
+-- Returns the schema/layout version encoded by a Compression schema packet.
+-- This is intentionally public so persistence layers can store IndexedSchema
+-- packets directly without adding another DataVersion envelope.
+function Compression.SchemaPacketVersion(packet: Packet | buffer, options: Options?): number?
+	local ok, result = pcall(function(): number?
+		local data = unwrapPacket(packet, options)
+		if isHuffmanFrame(data) then
+			data = huffmanDecodeFrame(data)
+		end
+		if buffer.len(data) < 1 then
+			return nil
+		end
+
+		local first = buffer.readu8(data, 0)
+		if first >= FMT.SCHEMA_ALL_DEFAULT_BASE
+			and first <= FMT.SCHEMA_ALL_DEFAULT_MAX then
+			return first - FMT.SCHEMA_ALL_DEFAULT_BASE + 1
+		end
+		if first >= FMT.SCHEMA_INLINE_BASE
+			and first <= FMT.SCHEMA_INLINE_MAX then
+			return first - FMT.SCHEMA_INLINE_BASE + 1
+		end
+		if first ~= FMT.SCHEMA_V29_MAGIC then
+			return nil
+		end
+
+		local r = newReader(data)
+		local version = FMT.ReadSchemaHeader(r, MODE.SCHEMA)
+		return version
+	end)
+
+	if not ok then
+		return nil
+	end
+	return result
+end
+
+function Compression.IsSchemaPacket(packet: Packet | buffer, options: Options?): boolean
+	return Compression.SchemaPacketVersion(packet, options) ~= nil
 end
 
 -- Handles string mode.
