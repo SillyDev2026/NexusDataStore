@@ -10,9 +10,6 @@ INTERNAL.CompactAtom = {}
 
 Compression.VERSION = "3.1.0"
 
--- v4.2 register-safe layout: high-level helper families live under INTERNAL
--- so the module chunk stays comfortably below Luau's 200-local/register ceiling.
-
 export type Mode = "Binary" | "BinaryWithHash"
 export type StringStrategy = "Auto" | "Raw" | "LZ" | "ASCII7" | "LowASCII5" | "Identifier6" | "Numeric4" | "PrefixUInt" | "UInt"
 export type TableStrategy = "Auto" | "Compact" | "Dynamic"
@@ -223,6 +220,7 @@ local FMT = {
 	HUFFMAN_MAGIC_D = 0x31,
 	COMPACT_NUMBER_MAGIC = 0xD7,
 	SCHEMA_V29_MAGIC = 0xD1,
+	SCHEMA_SPARSE_MAGIC = 0xCF,
 	DELTA_V29_MAGIC = 0xD0,
 	COMPACT_BUFFER_ZERO_RUN_MAGIC = 0xD6,
 	COMPACT_TABLE_MAGIC = 0xD5,
@@ -231,7 +229,6 @@ local FMT = {
 	COMPACT_BUFFER_RAW_MAGIC = 0xD3,
 }
 
--- Returns true when the buffer begins with a Compression-owned buffer frame marker.
 local function hasCompressionBufferMagic(data: buffer): boolean
 	if buffer.len(data) == 0 then return false end
 	local first = buffer.readu8(data, 0)
@@ -4324,6 +4321,19 @@ FMT.ReadSchemaHeader = function(r: Reader, expectedMode: number): number
 	return INTERNAL.readAdaptiveUIntBits(r) + 1
 end
 
+-- Sparse schema frames store only fields whose values differ from their defaults.
+-- They use a distinct magic byte so every existing 0xD1 schema remains readable.
+FMT.WriteSparseSchemaHeader = function(w: Writer, schemaVersion: number?)
+	writeByte(w, FMT.SCHEMA_SPARSE_MAGIC)
+	INTERNAL.writeAdaptiveUIntBits(w, (schemaVersion or 1) - 1)
+end
+
+FMT.ReadSparseSchemaHeader = function(r: Reader): number
+	if r.Position >= r.Length then fail("unexpected end of sparse schema payload", 3) end
+	if readByte(r) ~= FMT.SCHEMA_SPARSE_MAGIC then fail("unsupported sparse schema frame", 3) end
+	return INTERNAL.readAdaptiveUIntBits(r) + 1
+end
+
 -- Handles packet from buffer.
 function INTERNAL.SchemaCore.packetFromBuffer(
 	data: buffer,
@@ -4533,6 +4543,43 @@ function INTERNAL.SchemaCore.unwrapPacket(packet: Packet | buffer, options: Opti
 	end
 	local decoded = entropyDecodeIfNeeded(object.Data)
 	return decoded, object.SchemaVersion
+end
+
+
+-- Reads only the schema/delta version from a Compression packet.
+-- This lets persistence systems route an old payload to the exact historical
+-- schema before attempting a full decode.
+function Compression.SchemaPacketVersion(packet: Packet | buffer): number?
+	local data, packetVersion = INTERNAL.SchemaCore.unwrapPacket(packet, nil)
+
+	if buffer.len(data) < 1 then
+		return nil
+	end
+
+	local first = buffer.readu8(data, 0)
+	local mode: number
+
+	local reader = newReader(data)
+	local encodedVersion: number
+
+	if first == FMT.SCHEMA_V29_MAGIC then
+		mode = MODE.SCHEMA
+		encodedVersion = FMT.ReadSchemaHeader(reader, mode)
+	elseif first == FMT.SCHEMA_SPARSE_MAGIC then
+		mode = MODE.SCHEMA
+		encodedVersion = FMT.ReadSparseSchemaHeader(reader)
+	elseif first == FMT.DELTA_V29_MAGIC then
+		mode = MODE.DELTA
+		encodedVersion = FMT.ReadSchemaHeader(reader, mode)
+	else
+		return nil
+	end
+
+	if packetVersion ~= nil and packetVersion ~= encodedVersion then
+		fail("packet/schema version mismatch", 2)
+	end
+
+	return encodedVersion
 end
 
 -- Handles raw value bits.
@@ -4770,6 +4817,165 @@ function Compression.Schema(definition: {[string]: Descriptor}, version: number?
 	return setmetatable({Fields = fields, Version = schemaVersion}, Schema) :: any
 end
 
+-- Returns true when every root field can be reconstructed entirely from a
+-- default value. Optional/non-default fields keep using the legacy bitmap schema.
+function INTERNAL.SchemaCore.canUseSparseDefaults(schema: SchemaObject): boolean
+	if #schema.Fields == 0 then
+		return true
+	end
+
+	for _, field in ipairs(schema.Fields) do
+		local descriptor = field.Descriptor
+		if descriptor.Optional or descriptor.Default == nil then
+			return false
+		end
+	end
+
+	return true
+end
+
+-- Encodes the legacy/default bitmap representation. Kept unchanged for backwards
+-- compatibility and as the dense-data fallback.
+function INTERNAL.SchemaCore.encodeSchemaBitmap(schema: SchemaObject, value: {[string]: any}): (buffer, number, number)
+	local w = newWriter()
+	FMT.WriteSchemaHeader(w, MODE.SCHEMA, schema.Version)
+
+	for _, field in ipairs(schema.Fields) do
+		local descriptor = field.Descriptor
+		local fieldValue = value[field.Name]
+		local present = fieldValue ~= nil
+
+		if not present and descriptor.Default ~= nil and not descriptor.Optional then
+			fieldValue = descriptor.Default
+			present = true
+		end
+
+		if descriptor.Optional then
+			writeBits(w, present and 1 or 0, 1)
+		elseif not present then
+			fail("missing required field " .. field.Name, 3)
+		end
+
+		if present then
+			INTERNAL.SchemaCore.validate(descriptor, fieldValue, field.Name)
+
+			if descriptor.Default ~= nil then
+				local defaulted = FMT.DeepEqual(fieldValue, descriptor.Default)
+				writeBits(w, defaulted and 0 or 1, 1)
+
+				if not defaulted then
+					INTERNAL.SchemaCore.writeDescriptor(w, descriptor, fieldValue)
+				end
+			else
+				INTERNAL.SchemaCore.writeDescriptor(w, descriptor, fieldValue)
+			end
+		end
+	end
+
+	local data = finish(w)
+	return data, w.UsedBits, w.PaddingBits
+end
+
+-- Encodes only fields that differ from their defaults.
+--
+-- Layout:
+--   sparse magic
+--   schema version
+--   changed field count
+--   repeated:
+--       delta-from-previous field index
+--       encoded field value
+--
+-- Field names/types/defaults still live in the compiled Schema exactly like the
+-- existing IndexedSchema format; only the per-field zero bitmap is removed.
+function INTERNAL.SchemaCore.encodeSchemaSparse(schema: SchemaObject, value: {[string]: any}): (buffer, number, number)
+	local changedIndexes = {}
+
+	for index, field in ipairs(schema.Fields) do
+		local descriptor = field.Descriptor
+		local fieldValue = value[field.Name]
+
+		if fieldValue == nil then
+			fieldValue = descriptor.Default
+		end
+
+		INTERNAL.SchemaCore.validate(descriptor, fieldValue, field.Name)
+
+		if not FMT.DeepEqual(fieldValue, descriptor.Default) then
+			changedIndexes[#changedIndexes + 1] = index
+		end
+	end
+
+	local w = newWriter()
+	FMT.WriteSparseSchemaHeader(w, schema.Version)
+	INTERNAL.writeAdaptiveUIntBits(w, #changedIndexes)
+
+	local previousIndex = 0
+
+	for _, index in ipairs(changedIndexes) do
+		local field = schema.Fields[index]
+		local fieldValue = value[field.Name]
+
+		-- zero means "the immediately next field", which is very cheap for nearby
+		-- changed fields and still compact for sparse distant fields.
+		INTERNAL.writeAdaptiveUIntBits(w, index - previousIndex - 1)
+		INTERNAL.SchemaCore.writeDescriptor(w, field.Descriptor, fieldValue)
+		previousIndex = index
+	end
+
+	local data = finish(w)
+	return data, w.UsedBits, w.PaddingBits
+end
+
+function INTERNAL.SchemaCore.decodeSchemaSparse(schema: SchemaObject, data: buffer, packetVersion: number?): {[string]: any}
+	local r = newReader(data)
+	local encodedVersion = FMT.ReadSparseSchemaHeader(r)
+
+	if packetVersion ~= nil and packetVersion ~= encodedVersion then
+		fail("packet/schema version mismatch", 3)
+	end
+
+	if encodedVersion ~= schema.Version then
+		fail("schema version mismatch", 3)
+	end
+
+	local result = table.create(#schema.Fields)
+
+	-- Reconstruct the complete table from schema defaults first.
+	for _, field in ipairs(schema.Fields) do
+		result[field.Name] = FMT.CloneDefault(field.Descriptor.Default)
+	end
+
+	local changedCount = INTERNAL.readAdaptiveUIntBits(r)
+
+	if changedCount > #schema.Fields then
+		fail("sparse schema changed-field count exceeds schema field count", 3)
+	end
+
+	local previousIndex = 0
+
+	for _ = 1, changedCount do
+		local delta = INTERNAL.readAdaptiveUIntBits(r)
+		local index = previousIndex + delta + 1
+
+		if index <= previousIndex or index > #schema.Fields then
+			fail("invalid sparse schema field index", 3)
+		end
+
+		local field = schema.Fields[index]
+		result[field.Name] = INTERNAL.SchemaCore.readDescriptor(r, field.Descriptor)
+		previousIndex = index
+	end
+
+	alignReader(r)
+
+	if r.Position ~= r.Length then
+		fail("trailing bytes in sparse schema payload", 3)
+	end
+
+	return result
+end
+
 -- Handles schema.
 function Schema:Encode(value: {[string]: any}, options: Options?): Packet
 	if typeof(value) ~= "table" then
@@ -4779,63 +4985,100 @@ function Schema:Encode(value: {[string]: any}, options: Options?): Packet
 		)
 	end
 
-	local w = newWriter()
-	FMT.WriteSchemaHeader(w, MODE.SCHEMA, self.Version)
-	for _, field in ipairs(self.Fields) do
-		local descriptor = field.Descriptor
-		local fieldValue = value[field.Name]
-		local present = fieldValue ~= nil
-		if not present and descriptor.Default ~= nil and not descriptor.Optional then
-			fieldValue = descriptor.Default
-			present = true
-		end
-		if descriptor.Optional then writeBits(w, present and 1 or 0, 1)
-		elseif not present then fail("missing required field " .. field.Name, 2) end
-		if present then
-			INTERNAL.SchemaCore.validate(descriptor, fieldValue, field.Name)
-			if descriptor.Default ~= nil then
-				local defaulted = FMT.DeepEqual(fieldValue, descriptor.Default)
-				writeBits(w, defaulted and 0 or 1, 1)
-				if not defaulted then INTERNAL.SchemaCore.writeDescriptor(w, descriptor, fieldValue) end
-			else
-				INTERNAL.SchemaCore.writeDescriptor(w, descriptor, fieldValue)
-			end
+	local bitmapData, bitmapBits, bitmapPadding =
+		INTERNAL.SchemaCore.encodeSchemaBitmap(self, value)
+
+	local selectedData = bitmapData
+	local selectedBits = bitmapBits
+	local selectedPadding = bitmapPadding
+
+	if INTERNAL.SchemaCore.canUseSparseDefaults(self) then
+		local sparseData, sparseBits, sparsePadding =
+			INTERNAL.SchemaCore.encodeSchemaSparse(self, value)
+
+		-- Compare physical bytes first because DataStore persists Packet.Data.
+		-- On an exact byte tie, keep the form with fewer useful bits.
+		if buffer.len(sparseData) < buffer.len(bitmapData)
+			or (
+				buffer.len(sparseData) == buffer.len(bitmapData)
+					and sparseBits < bitmapBits
+			)
+		then
+			selectedData = sparseData
+			selectedBits = sparseBits
+			selectedPadding = sparsePadding
 		end
 	end
-	local data = finish(w)
+
 	return INTERNAL.SchemaCore.packetFromEntropy(
-		data,
+		selectedData,
 		options,
 		self.Version,
 		INTERNAL.SchemaCore.rawValueBits(value),
-		w.UsedBits,
-		w.PaddingBits
+		selectedBits,
+		selectedPadding
 	)
 end
 
 -- Handles schema.
 function Schema:Decode(packet: Packet | buffer, options: Options?): {[string]: any}
 	local data, packetVersion = INTERNAL.SchemaCore.unwrapPacket(packet, options)
+
+	if buffer.len(data) < 1 then
+		fail("unexpected end of schema payload", 2)
+	end
+
+	local first = buffer.readu8(data, 0)
+
+	if first == FMT.SCHEMA_SPARSE_MAGIC then
+		if not INTERNAL.SchemaCore.canUseSparseDefaults(self) then
+			fail("sparse schema payload requires defaulted non-optional fields", 2)
+		end
+
+		return INTERNAL.SchemaCore.decodeSchemaSparse(self, data, packetVersion)
+	end
+
+	-- Legacy/current 0xD1 bitmap schema path remains byte-for-byte compatible.
 	local r = newReader(data)
 	local encodedVersion = FMT.ReadSchemaHeader(r, MODE.SCHEMA)
-	if packetVersion ~= nil and packetVersion ~= encodedVersion then fail("packet/schema version mismatch", 2) end
-	if encodedVersion ~= self.Version then fail("schema version mismatch", 2) end
+
+	if packetVersion ~= nil and packetVersion ~= encodedVersion then
+		fail("packet/schema version mismatch", 2)
+	end
+
+	if encodedVersion ~= self.Version then
+		fail("schema version mismatch", 2)
+	end
+
 	local result = {}
+
 	for _, field in ipairs(self.Fields) do
 		local descriptor = field.Descriptor
 		local present = true
-		if descriptor.Optional then present = readBits(r, 1) == 1 end
+
+		if descriptor.Optional then
+			present = readBits(r, 1) == 1
+		end
+
 		if present then
 			if descriptor.Default ~= nil then
-				if readBits(r, 1) == 0 then result[field.Name] = FMT.CloneDefault(descriptor.Default)
-				else result[field.Name] = INTERNAL.SchemaCore.readDescriptor(r, descriptor) end
+				if readBits(r, 1) == 0 then
+					result[field.Name] = FMT.CloneDefault(descriptor.Default)
+				else
+					result[field.Name] = INTERNAL.SchemaCore.readDescriptor(r, descriptor)
+				end
 			else
 				result[field.Name] = INTERNAL.SchemaCore.readDescriptor(r, descriptor)
 			end
 		end
 	end
+
 	alignReader(r)
-	if r.Position ~= r.Length then fail("trailing bytes in schema payload", 2) end
+
+	if r.Position ~= r.Length then
+		fail("trailing bytes in schema payload", 2)
+	end
+
 	return result
 end
 
@@ -7836,7 +8079,7 @@ function Compression.Optional(descriptor: Descriptor): Descriptor
 	return copy
 end
 
--- Attaches a schema default; equal values use one state bit and omit the payload.
+-- Attaches a schema default; equal values omit the payload. Sparse schemas can also omit the per-field state bit.
 function Compression.Default(descriptor: Descriptor, defaultValue: any): Descriptor
 	if typeof(descriptor) ~= "table" or typeof(descriptor.Kind) ~= "string" then fail("Default expects Descriptor", 2) end
 	if defaultValue == nil then fail("Default value cannot be nil; use Optional instead", 2) end
