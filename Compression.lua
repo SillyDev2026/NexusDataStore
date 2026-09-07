@@ -7,7 +7,7 @@ local INTERNAL: any = {}
 Compression.VERSION = "3.1.0"
 
 export type Mode = "Binary" | "BinaryWithHash"
-export type StringStrategy = "Auto" | "Raw" | "LZ" | "ASCII7" | "LowASCII5" | "Identifier6" | "Numeric4"
+export type StringStrategy = "Auto" | "Raw" | "LZ" | "ASCII7" | "LowASCII5" | "Identifier6" | "Numeric4" | "PrefixUInt" | "UInt"
 export type TableStrategy = "Auto" | "Compact" | "Dynamic"
 export type BufferStrategy = "Auto" | "Raw" | "LZ" | "Sparse" | "Nibble"
 export type EntropyStrategy = "Auto" | "Huffman" | "None"
@@ -190,15 +190,6 @@ local FMT = {
 	COMPACT_NUMBER_MAGIC = 0xD7,
 	SCHEMA_V29_MAGIC = 0xD1,
 	DELTA_V29_MAGIC = 0xD0,
-
-	-- v3.1 ultra-compact schema markers.
-	-- D8..DF encode schema versions 1..8 directly in the marker byte, removing
-	-- the separate schema-version bitstream from the common fixed-layout path.
-	-- C8..CF encode an entire all-default schema value in exactly one byte.
-	SCHEMA_INLINE_BASE = 0xD8,
-	SCHEMA_INLINE_MAX = 0xDF,
-	SCHEMA_ALL_DEFAULT_BASE = 0xC8,
-	SCHEMA_ALL_DEFAULT_MAX = 0xCF,
 	COMPACT_BUFFER_ZERO_RUN_MAGIC = 0xD6,
 	COMPACT_TABLE_MAGIC = 0xD5,
 	COMPACT_MAPPED_TABLE_MAGIC = 0xD2,
@@ -1456,108 +1447,6 @@ FMT.CloneDefault = function(value: any): any
 	return result
 end
 
-
--- Returns a complete default value for a descriptor when one can be reconstructed
--- without reading payload bits. Object descriptors infer their default from their
--- child defaults, which lets nested fixed DataStore templates participate in the
--- v3.1 one-byte all-default schema frame.
-FMT.DescriptorDefaultValue = function(descriptor: Descriptor): (boolean, any)
-	if descriptor.Default ~= nil then
-		return true, FMT.CloneDefault(descriptor.Default)
-	end
-
-	if descriptor.Kind == "Object" then
-		local fields = descriptor.Fields :: {[string]: Descriptor}
-		local result = {}
-		for name, child in pairs(fields) do
-			local ok, childDefault = FMT.DescriptorDefaultValue(child)
-			if not ok then
-				return false, nil
-			end
-			result[name] = childDefault
-		end
-		return true, result
-	end
-
-	return false, nil
-end
-
--- Tests whether a runtime value is exactly represented by a descriptor's defaults.
--- This works recursively for fixed nested objects and does not serialize anything.
-FMT.DescriptorMatchesDefault = function(descriptor: Descriptor, value: any): boolean
-	if descriptor.Default ~= nil then
-		return FMT.DeepEqual(value, descriptor.Default)
-	end
-
-	if descriptor.Kind ~= "Object" or typeof(value) ~= "table" or isArray(value) then
-		return false
-	end
-
-	local fields = descriptor.Fields :: {[string]: Descriptor}
-	for key in pairs(value) do
-		if typeof(key) ~= "string" or fields[key] == nil then
-			return false
-		end
-	end
-
-	for name, child in pairs(fields) do
-		local childValue = value[name]
-		if childValue == nil then
-			local ok, childDefault = FMT.DescriptorDefaultValue(child)
-			if not ok then
-				return false
-			end
-			childValue = childDefault
-		end
-		if not FMT.DescriptorMatchesDefault(child, childValue) then
-			return false
-		end
-	end
-
-	return true
-end
-
-FMT.SchemaValueIsAllDefault = function(fields: {Field}, value: {[string]: any}): boolean
-	local known: {[string]: boolean} = {}
-	for _, field in ipairs(fields) do
-		known[field.Name] = true
-	end
-	for key in pairs(value) do
-		if typeof(key) ~= "string" or known[key] ~= true then
-			return false
-		end
-	end
-
-	for _, field in ipairs(fields) do
-		local descriptor = field.Descriptor
-		local fieldValue = value[field.Name]
-		if fieldValue == nil then
-			local ok, defaultValue = FMT.DescriptorDefaultValue(descriptor)
-			if not ok then
-				return false
-			end
-			fieldValue = defaultValue
-		end
-		if not FMT.DescriptorMatchesDefault(descriptor, fieldValue) then
-			return false
-		end
-	end
-
-	return true
-end
-
-FMT.BuildSchemaDefaults = function(fields: {Field}): {[string]: any}
-	local result: {[string]: any} = {}
-	for _, field in ipairs(fields) do
-		local ok, defaultValue = FMT.DescriptorDefaultValue(field.Descriptor)
-		if not ok then
-			fail("all-default schema marker used for a field without a complete default: " .. field.Name, 3)
-		end
-		result[field.Name] = defaultValue
-	end
-	return result
-end
-
 -- Handles dictionary score.
 local function dictionaryScore(value: string, count: number): number
 	local rawEntryCost = #value + varUIntByteLength(#value)
@@ -1633,6 +1522,248 @@ NUMERIC4_ENCODE[string.byte(".")] = 12
 NUMERIC4_ENCODE[string.byte("e")] = 13
 NUMERIC4_ENCODE[string.byte("E")] = 14
 local NUMERIC4_DECODE = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "-", "+", ".", "e", "E"}
+
+-- v3.1 structured decimal string codecs.
+--
+-- Self-contained PrefixUInt/UInt frames reuse Numeric4 packets that were invalid
+-- in every previous version: a Numeric4 packet with no 0xF terminator nibble.
+-- Each payload nibble is a base-15 digit (0..14), so old decoders reject these
+-- frames instead of silently decoding them as another string. This preserves
+-- backwards decoding while giving structured decimal strings a much denser path.
+--
+-- Structured code:
+--   code % 4 == 0 -> canonical unsigned decimal ("UInt")
+--   code % 4 == 1 -> "Player_" .. canonical unsigned decimal
+--   code % 4 == 2 -> "User_" .. canonical unsigned decimal
+--   code % 4 == 3 -> reserved/invalid
+local STRUCTURED_RADIX = 15
+local STRUCTURED_KIND_COUNT = 4
+local STRUCTURED_KIND_UINT = 0
+local STRUCTURED_KIND_PLAYER = 1
+local STRUCTURED_KIND_USER = 2
+local STRUCTURED_KIND_RESERVED = 3
+local STRUCTURED_PREFIXES = table.freeze({
+	[STRUCTURED_KIND_PLAYER] = "Player_",
+	[STRUCTURED_KIND_USER] = "User_",
+})
+
+-- Smart string compression has an out-of-band compressed flag, so it can use a
+-- denser packed header without needing a self-describing legacy-safe marker.
+-- This mirrors BufferUtil v1.3's packed UInt layout and lets
+-- "Player_134233636" fit in four bytes.
+local SMART_STRING_CODEC_PREFIX_UINT = 5
+local SMART_STRING_CODEC_UINT = 6
+local SMART_STRING_CODEC_SHIFT = 3
+local SMART_STRING_CODEC_MASK = 0x7
+local SMART_PREFIX_UINT_MAX = 4_503_599_627_370_495 -- 2^52 - 1
+
+local function parseCanonicalUnsignedDecimal(value: string, startIndex: number?): number?
+	local first = startIndex or 1
+	local length = #value
+	if first > length then return nil end
+
+	local firstByte = string.byte(value, first)
+	if firstByte == nil or firstByte < 48 or firstByte > 57 then return nil end
+	if firstByte == 48 and first < length then return nil end
+
+	local result = 0
+	for i = first, length do
+		local byte = string.byte(value, i)
+		if byte == nil or byte < 48 or byte > 57 then return nil end
+		local digit = byte - 48
+		if result > math.floor((MAX_SAFE_INTEGER - digit) / 10) then return nil end
+		result = result * 10 + digit
+	end
+	return result
+end
+
+local function exactUnsignedIntegerString(value: number): string
+	return string.format("%.0f", value)
+end
+
+local function structuredStringCode(value: string, wantedKind: string?): (number?, string?)
+	if wantedKind == nil or wantedKind == "UInt" then
+		local integer = parseCanonicalUnsignedDecimal(value)
+		if integer ~= nil then
+			local maximum = math.floor((MAX_SAFE_INTEGER - STRUCTURED_KIND_UINT) / STRUCTURED_KIND_COUNT)
+			if integer <= maximum then
+				return integer * STRUCTURED_KIND_COUNT + STRUCTURED_KIND_UINT, "UInt"
+			end
+		end
+	end
+
+	if wantedKind == nil or wantedKind == "PrefixUInt" then
+		for kind, prefix in pairs(STRUCTURED_PREFIXES) do
+			local prefixLength = #prefix
+			if #value > prefixLength and string.sub(value, 1, prefixLength) == prefix then
+				local integer = parseCanonicalUnsignedDecimal(value, prefixLength + 1)
+				if integer ~= nil then
+					local maximum = math.floor((MAX_SAFE_INTEGER - kind) / STRUCTURED_KIND_COUNT)
+					if integer <= maximum then
+						return integer * STRUCTURED_KIND_COUNT + kind, "PrefixUInt"
+					end
+				end
+			end
+		end
+	end
+
+	return nil, nil
+end
+
+local function structuredTailBytes(code: number): number
+	local bytes = 1
+	local remaining = math.floor(code / (STRUCTURED_RADIX * STRUCTURED_RADIX))
+	while remaining > 0 do
+		bytes += 1
+		remaining = math.floor(remaining / (STRUCTURED_RADIX * STRUCTURED_RADIX))
+	end
+	return bytes
+end
+
+local function structuredStringPacket(value: string, wantedKind: string?): (buffer?, string?)
+	local code, codec = structuredStringCode(value, wantedKind)
+	if code == nil or codec == nil then return nil, nil end
+
+	local tailBytes = structuredTailBytes(code)
+	local out = buffer.create(1 + tailBytes)
+	buffer.writeu8(out, 0, STR.NUMERIC4)
+
+	local remaining = code
+	for offset = 1, tailBytes do
+		local low = remaining % STRUCTURED_RADIX
+		remaining = math.floor(remaining / STRUCTURED_RADIX)
+		local high = remaining % STRUCTURED_RADIX
+		remaining = math.floor(remaining / STRUCTURED_RADIX)
+		buffer.writeu8(out, offset, low + high * 16)
+	end
+	if remaining ~= 0 then fail("structured string integer overflow", 3) end
+	return out, codec
+end
+
+local function tryDecodeStructuredNumeric4(data: buffer): (string?, string?)
+	local length = buffer.len(data)
+	if length < 2 or length > 8 or buffer.readu8(data, 0) ~= STR.NUMERIC4 then return nil, nil end
+
+	local code = 0
+	local multiplier = 1
+	for offset = 1, length - 1 do
+		local packed = buffer.readu8(data, offset)
+		local low = packed % 16
+		local high = math.floor(packed / 16)
+		if low >= STRUCTURED_RADIX or high >= STRUCTURED_RADIX then return nil, nil end
+
+		code += low * multiplier
+		multiplier *= STRUCTURED_RADIX
+		code += high * multiplier
+		multiplier *= STRUCTURED_RADIX
+		if code > MAX_SAFE_INTEGER or multiplier > MAX_SAFE_INTEGER * STRUCTURED_RADIX then return nil, nil end
+	end
+
+	-- Reject non-canonical overlong encodings and the reserved subtype.
+	if structuredTailBytes(code) ~= length - 1 then return nil, nil end
+	local kind = code % STRUCTURED_KIND_COUNT
+	if kind == STRUCTURED_KIND_RESERVED then return nil, nil end
+
+	local integer = math.floor(code / STRUCTURED_KIND_COUNT)
+	if kind == STRUCTURED_KIND_UINT then
+		return exactUnsignedIntegerString(integer), "UInt"
+	end
+
+	local prefix = STRUCTURED_PREFIXES[kind]
+	if prefix == nil then return nil, nil end
+	return prefix .. exactUnsignedIntegerString(integer), "PrefixUInt"
+end
+
+local function smartPackedCapacity(byteLength: number): number
+	return 5 + math.max(0, byteLength - 1) * 8
+end
+
+local function smartPackedByteLength(payloadBits: number): number
+	local bytes = 1
+	while smartPackedCapacity(bytes) < payloadBits do bytes += 1 end
+	return bytes
+end
+
+local function bitsNeededUnsigned(value: number): number
+	if value <= 0 then return 1 end
+	local bits = math.clamp(math.floor(math.log(value) / 0.6931471805599453) + 1, 1, 53)
+	while bits > 1 and value < 2 ^ (bits - 1) do bits -= 1 end
+	while bits < 53 and value >= 2 ^ bits do bits += 1 end
+	return bits
+end
+
+local function makeSmartPackedUInt(codec: number, value: number): buffer
+	local payloadBits = bitsNeededUnsigned(value)
+	local byteLength = smartPackedByteLength(payloadBits)
+	local out = buffer.create(byteLength)
+
+	local low3 = value % 8
+	local afterLow3 = math.floor(value / 8)
+	local next2 = afterLow3 % 4
+	local tail = math.floor(afterLow3 / 4)
+	local header = bit32.bor(low3, bit32.lshift(codec, SMART_STRING_CODEC_SHIFT), bit32.lshift(next2, 6))
+	buffer.writeu8(out, 0, header)
+
+	for offset = 1, byteLength - 1 do
+		buffer.writeu8(out, offset, tail % 256)
+		tail = math.floor(tail / 256)
+	end
+	if tail ~= 0 then fail("smart string integer overflow", 3) end
+	return out
+end
+
+local function readSmartPackedUInt(data: buffer): number?
+	local byteLength = buffer.len(data)
+	if byteLength < 1 or byteLength > 7 then return nil end
+	local header = buffer.readu8(data, 0)
+	local low3 = bit32.band(header, 0x7)
+	local next2 = bit32.extract(header, 6, 2)
+	local tail = 0
+	local multiplier = 1
+	for offset = 1, byteLength - 1 do
+		tail += buffer.readu8(data, offset) * multiplier
+		multiplier *= 256
+	end
+	local value = low3 + next2 * 8 + tail * 32
+	if value > MAX_SAFE_INTEGER then return nil end
+	if smartPackedByteLength(bitsNeededUnsigned(value)) ~= byteLength then return nil end
+	return value
+end
+
+local function smartStructuredPacket(value: string, wantedKind: string?): (buffer?, string?)
+	if wantedKind == nil or wantedKind == "PrefixUInt" then
+		for prefixId, prefix in ipairs({"Player_", "User_"}) do
+			local prefixLength = #prefix
+			if #value > prefixLength and string.sub(value, 1, prefixLength) == prefix then
+				local integer = parseCanonicalUnsignedDecimal(value, prefixLength + 1)
+				if integer ~= nil and integer <= SMART_PREFIX_UINT_MAX then
+					return makeSmartPackedUInt(SMART_STRING_CODEC_PREFIX_UINT, integer * 2 + (prefixId - 1)), "PrefixUInt"
+				end
+			end
+		end
+	end
+
+	if wantedKind == nil or wantedKind == "UInt" then
+		local integer = parseCanonicalUnsignedDecimal(value)
+		if integer ~= nil then return makeSmartPackedUInt(SMART_STRING_CODEC_UINT, integer), "UInt" end
+	end
+	return nil, nil
+end
+
+local function tryDecodeSmartStructured(data: buffer): (string?, string?)
+	if buffer.len(data) == 0 then return nil, nil end
+	local header = buffer.readu8(data, 0)
+	local codec = bit32.extract(header, SMART_STRING_CODEC_SHIFT, 3)
+	if codec ~= SMART_STRING_CODEC_PREFIX_UINT and codec ~= SMART_STRING_CODEC_UINT then return nil, nil end
+	local packed = readSmartPackedUInt(data)
+	if packed == nil then return nil, nil end
+
+	if codec == SMART_STRING_CODEC_UINT then return exactUnsignedIntegerString(packed), "UInt" end
+	local prefixId = packed % 2
+	local integer = math.floor(packed / 2)
+	local prefix = prefixId == 0 and "Player_" or "User_"
+	return prefix .. exactUnsignedIntegerString(integer), "PrefixUInt"
+end
 
 -- Handles raw string packet.
 local function rawStringPacket(value: string): buffer
@@ -2040,6 +2171,14 @@ function Compression.CompressString(value: string, options: Options?): buffer
 	local best: buffer
 	if strategy == "Raw" then
 		best = rawStringPacket(value)
+	elseif strategy == "PrefixUInt" then
+		local candidate = structuredStringPacket(value, "PrefixUInt")
+		if candidate == nil then fail("PrefixUInt strategy expects Player_<uint> or User_<uint>", 2) end
+		best = candidate
+	elseif strategy == "UInt" then
+		local candidate = structuredStringPacket(value, "UInt")
+		if candidate == nil then fail("UInt strategy expects a canonical unsigned decimal string", 2) end
+		best = candidate
 	elseif strategy == "Numeric4" then
 		local candidate = numeric4Packet(value)
 		if candidate == nil then fail("Numeric4 strategy only supports 0-9 + - . e E", 2) end
@@ -2070,6 +2209,12 @@ function Compression.CompressString(value: string, options: Options?): buffer
 		-- A codec only counts as compression when it beats the original source bytes.
 		-- Self-contained RAW framing is only a fallback when no true compression wins.
 		local bestBytes = analysis.Length
+
+		local structured = structuredStringPacket(value)
+		if structured ~= nil and buffer.len(structured) < bestBytes then
+			bestCandidate = structured
+			bestBytes = buffer.len(structured)
+		end
 
 		if analysis.Numeric4 then
 			local bytes = estimatedNumeric4Bytes(analysis.Length)
@@ -2254,7 +2399,7 @@ function Compression.DecompressString(data: buffer): string
 	end
 
 	if first > STR.RAW_V3 then
-		return buffer.readstring(data, 0, buffer.len(data))
+		return buffer.readstring(data, 0, dataLength)
 	end
 	local r = newReader(data)
 	local mode = readByte(r)
@@ -2272,6 +2417,8 @@ function Compression.DecompressString(data: buffer): string
 		if r.Position ~= r.Length then fail("trailing bytes in legacy string payload", 2) end
 		return value
 	elseif mode == STR.NUMERIC4 then
+		local structured = tryDecodeStructuredNumeric4(data)
+		if structured ~= nil then return structured end
 		local output = {}
 		local terminated = false
 		while r.Position < r.Length do
@@ -3845,32 +3992,15 @@ end
 -- v2.9 schema frames remove the generic CP/version/mode bytes. The marker implies
 -- binary v29 + mode, and the schema version continues directly in the bit stream.
 FMT.WriteSchemaHeader = function(w: Writer, mode: number, schemaVersion: number?)
-	local resolvedVersion = schemaVersion or 1
-
-	-- v3.1: schema versions 1..8 are embedded directly in the marker byte.
-	-- This removes 1..8+ version bits from every common IndexedSchema packet.
-	if mode == MODE.SCHEMA and resolvedVersion >= 1 and resolvedVersion <= 8 then
-		writeByte(w, FMT.SCHEMA_INLINE_BASE + resolvedVersion - 1)
-		return
-	end
-
 	if mode == MODE.SCHEMA then writeByte(w, FMT.SCHEMA_V29_MAGIC)
 	elseif mode == MODE.DELTA then writeByte(w, FMT.DELTA_V29_MAGIC)
 	else fail("invalid compact schema mode", 3) end
-	INTERNAL.writeAdaptiveUIntBits(w, resolvedVersion - 1)
+	INTERNAL.writeAdaptiveUIntBits(w, (schemaVersion or 1) - 1)
 end
 
 FMT.ReadSchemaHeader = function(r: Reader, expectedMode: number): (number, number)
 	if r.Position >= r.Length then fail("unexpected end of schema payload", 3) end
 	local first = buffer.readu8(r.Buffer, r.Position)
-
-	if expectedMode == MODE.SCHEMA
-		and first >= FMT.SCHEMA_INLINE_BASE
-		and first <= FMT.SCHEMA_INLINE_MAX then
-		r.Position += 1
-		return first - FMT.SCHEMA_INLINE_BASE + 1, 30
-	end
-
 	local expectedMagic = expectedMode == MODE.SCHEMA and FMT.SCHEMA_V29_MAGIC or FMT.DELTA_V29_MAGIC
 	if first == expectedMagic then
 		r.Position += 1
@@ -4334,33 +4464,6 @@ function Schema:Encode(value: {[string]: any}, options: Options?): Packet
 		)
 	end
 
-	-- v3.1 floor case: if every schema field equals its recursively inferred
-	-- default and the schema version fits inline, the entire value is represented
-	-- by one byte. No field bitmap, names, type tags, or version payload follows.
-	if self.Version >= 1
-		and self.Version <= 8
-		and FMT.SchemaValueIsAllDefault(self.Fields, value) then
-		local data = buffer.create(1)
-		buffer.writeu8(
-			data,
-			0,
-			FMT.SCHEMA_ALL_DEFAULT_BASE + self.Version - 1
-		)
-		local packet = packetFromBuffer(
-			data,
-			options,
-			self.Version,
-			rawValueBits(value),
-			8,
-			0
-		)
-		packet.Entropy = "None"
-		packet.EntropyBytesBefore = 1
-		packet.EntropyBytesAfter = 1
-		packet.EntropySavedBytes = 0
-		return packet
-	end
-
 	local w = newWriter()
 	FMT.WriteSchemaHeader(w, MODE.SCHEMA, self.Version)
 	for _, field in ipairs(self.Fields) do
@@ -4398,18 +4501,6 @@ end
 -- Handles schema.
 function Schema:Decode(packet: Packet | buffer, options: Options?): {[string]: any}
 	local data, packetVersion = unwrapPacket(packet, options)
-
-	if buffer.len(data) == 1 then
-		local first = buffer.readu8(data, 0)
-		if first >= FMT.SCHEMA_ALL_DEFAULT_BASE
-			and first <= FMT.SCHEMA_ALL_DEFAULT_MAX then
-			local encodedVersion = first - FMT.SCHEMA_ALL_DEFAULT_BASE + 1
-			if packetVersion ~= nil and packetVersion ~= encodedVersion then fail("packet/schema version mismatch", 2) end
-			if encodedVersion ~= self.Version then fail("schema version mismatch", 2) end
-			return FMT.BuildSchemaDefaults(self.Fields)
-		end
-	end
-
 	local r = newReader(data)
 	local encodedVersion, binaryVersion = FMT.ReadSchemaHeader(r, MODE.SCHEMA)
 	if packetVersion ~= nil and packetVersion ~= encodedVersion then fail("packet/schema version mismatch", 2) end
@@ -4636,53 +4727,6 @@ function Schema:AnalyzeBits(value: {[string]: any}): BitLayout
 			"Schema:AnalyzeBits expects table",
 			2
 		)
-	end
-
-	if self.Version >= 1
-		and self.Version <= 8
-		and FMT.SchemaValueIsAllDefault(self.Fields, value) then
-		local fields = {}
-		local rawBits = 0
-		for _, field in ipairs(self.Fields) do
-			local fieldValue = value[field.Name]
-			if fieldValue == nil then
-				local ok, defaultValue = FMT.DescriptorDefaultValue(field.Descriptor)
-				if not ok then
-					fail("all-default schema analysis missing default for " .. field.Name, 2)
-				end
-				fieldValue = defaultValue
-			end
-			local raw = rawValueBits(fieldValue)
-			rawBits += raw
-			fields[#fields + 1] = {
-				Name = field.Name,
-				Type = field.Descriptor.Kind,
-				Present = true,
-				Defaulted = true,
-				UsefulBits = 0,
-				PaddingBits = 0,
-				PhysicalBits = 0,
-				RawBits = raw,
-				SavedBits = raw,
-				ExpandedBits = 0,
-				SavingsPercent = raw > 0 and 100 or 0,
-			}
-		end
-		local savedBits = math.max(0, rawBits - 8)
-		return {
-			HeaderBits = 8,
-			DefaultFields = #self.Fields,
-			ElidedRawBits = rawBits,
-			UsefulBits = 8,
-			PaddingBits = 0,
-			PhysicalBits = 8,
-			PhysicalBytes = 1,
-			RawBits = rawBits,
-			SavedBits = savedBits,
-			ExpandedBits = math.max(0, 8 - rawBits),
-			SavingsPercent = rawBits > 0 and math.max(0, (rawBits - 8) / rawBits * 100) or 0,
-			Fields = fields,
-		}
 	end
 
 	local w = newWriter()
@@ -7868,54 +7912,6 @@ function INTERNAL.buildIndexedLayoutNode(template: any, path: string): IndexedLa
 	}
 end
 
--- Validates a named value against the reusable indexed layout without allocating
--- the positional conversion. v3.0's schema fast path could otherwise ignore an
--- unknown runtime field because Schema itself only reads declared fields.
-function INTERNAL.validateIndexedNode(node: IndexedLayoutNode, value: any, path: string)
-	if node.Kind == "Value" then
-		return
-	end
-
-	if node.Kind == "Array" then
-		if typeof(value) ~= "table" or not isArray(value) then
-			fail(path .. " expected array", 3)
-		end
-		local item = node.Item
-		if item ~= nil then
-			for i = 1, #value do
-				INTERNAL.validateIndexedNode(item, value[i], path .. "[" .. tostring(i) .. "]")
-			end
-		end
-		return
-	end
-
-	if typeof(value) ~= "table" or isArray(value) then
-		fail(path .. " expected named table", 3)
-	end
-
-	local indexByKey = node.IndexByKey :: {[string]: number}
-	local keys = node.Keys :: {string}
-	local children = node.Children :: {IndexedLayoutNode}
-	local defaults = node.Defaults :: {any}
-
-	for key in pairs(value) do
-		if typeof(key) ~= "string" or indexByKey[key] == nil then
-			fail(path .. " contains unknown indexed field " .. tostring(key), 3)
-		end
-	end
-
-	for i, key in ipairs(keys) do
-		local childValue = value[key]
-		if childValue == nil then
-			childValue = FMT.CloneDefault(defaults[i])
-		end
-		if childValue == nil then
-			fail(path .. "." .. key .. " is missing", 3)
-		end
-		INTERNAL.validateIndexedNode(children[i], childValue, path .. "." .. key)
-	end
-end
-
 -- Copies an unknown-shape value without changing its map keys. This is used for
 -- empty template arrays, where no stable child layout can be inferred safely.
 function INTERNAL.cloneIndexedUnknown(value: any, active: {[any]: boolean}?): any
@@ -8032,17 +8028,7 @@ function IndexedLayout:Encode(value: {[string]: any}, options: Options?): Packet
 	if typeof(value) ~= "table" or isArray(value) then fail("IndexedLayout:Encode expects a named table", 2) end
 	local schema = (self :: any)._Schema
 	if schema ~= nil then
-		-- Validate against the reusable layout before entering Schema's direct
-		-- fast path so unknown runtime fields can never be silently discarded.
-		INTERNAL.validateIndexedNode((self :: any)._Node, value, "$indexed")
 		local packet = (schema :: SchemaObject):Encode(value, options)
-		if buffer.len(packet.Data) == 1 then
-			local marker = buffer.readu8(packet.Data, 0)
-			if marker >= FMT.SCHEMA_ALL_DEFAULT_BASE and marker <= FMT.SCHEMA_ALL_DEFAULT_MAX then
-				packet.Codec = "IndexedSchemaDefault1B"
-				return packet
-			end
-		end
 		packet.Codec = packet.Entropy == "Huffman" and "IndexedSchema+Huffman" or "IndexedSchema"
 		return packet
 	end
@@ -8118,47 +8104,6 @@ function Compression.FromIndexedTable(value: {any}, layout: IndexedLayoutObject)
 	return layout:FromIndexed(value)
 end
 
--- Returns the schema/layout version encoded by a Compression schema packet.
--- This is intentionally public so persistence layers can store IndexedSchema
--- packets directly without adding another DataVersion envelope.
-function Compression.SchemaPacketVersion(packet: Packet | buffer, options: Options?): number?
-	local ok, result = pcall(function(): number?
-		local data = unwrapPacket(packet, options)
-		if isHuffmanFrame(data) then
-			data = huffmanDecodeFrame(data)
-		end
-		if buffer.len(data) < 1 then
-			return nil
-		end
-
-		local first = buffer.readu8(data, 0)
-		if first >= FMT.SCHEMA_ALL_DEFAULT_BASE
-			and first <= FMT.SCHEMA_ALL_DEFAULT_MAX then
-			return first - FMT.SCHEMA_ALL_DEFAULT_BASE + 1
-		end
-		if first >= FMT.SCHEMA_INLINE_BASE
-			and first <= FMT.SCHEMA_INLINE_MAX then
-			return first - FMT.SCHEMA_INLINE_BASE + 1
-		end
-		if first ~= FMT.SCHEMA_V29_MAGIC then
-			return nil
-		end
-
-		local r = newReader(data)
-		local version = FMT.ReadSchemaHeader(r, MODE.SCHEMA)
-		return version
-	end)
-
-	if not ok then
-		return nil
-	end
-	return result
-end
-
-function Compression.IsSchemaPacket(packet: Packet | buffer, options: Options?): boolean
-	return Compression.SchemaPacketVersion(packet, options) ~= nil
-end
-
 -- Handles string mode.
 function Compression.StringMode(data: buffer): string
 	if typeof(data) ~= "buffer" then return "Invalid" end
@@ -8186,7 +8131,11 @@ function Compression.StringMode(data: buffer): string
 	if mode > STR.RAW_V3 then return "RawPassthrough" end
 	if mode == STR.RAW then return "Raw" end
 	if mode == STR.LZ_V1 then return "LZ-v1" end
-	if mode == STR.NUMERIC4 then return "Numeric4" end
+	if mode == STR.NUMERIC4 then
+		local _, structuredMode = tryDecodeStructuredNumeric4(data)
+		if structuredMode ~= nil then return structuredMode end
+		return "Numeric4"
+	end
 	if mode == STR.IDENTIFIER6 then return "Identifier6" end
 	if mode == STR.ASCII7 then return "ASCII7" end
 	if mode == STR.LZ_V2 then
@@ -8210,6 +8159,48 @@ function Compression.StringMode(data: buffer): string
 	return "Unknown"
 end
 
+local function stringPaddingBits(data: buffer): number
+	if isHuffmanFrame(data) then return 0 end
+	local length = buffer.len(data)
+	if length == 0 then return 0 end
+	local mode = buffer.readu8(data, 0)
+
+	if mode == STR.IDENTIFIER6 or mode == STR.ASCII7 then
+		local r = newReader(data)
+		readByte(r)
+		local count = readVarUInt(r)
+		local width = mode == STR.IDENTIFIER6 and 6 or 7
+		local headerBits = r.Position * 8
+		local useful = headerBits + count * width
+		return math.max(0, length * 8 - useful)
+	end
+
+	if mode == STR.RAW and length >= 6 then
+		local originalLength = buffer.readu8(data, 1)
+		local compactBytes = estimatedCompactLowASCII5Bytes(originalLength)
+		if compactBytes ~= nil and length == compactBytes then
+			return math.max(0, length * 8 - (16 + originalLength * 5))
+		end
+	end
+
+	if mode == STR.LZ_V2 then
+		local ok, padding = pcall(function(): number
+			local r = newReader(data)
+			readByte(r)
+			local originalLength = readVarUInt(r)
+			if r.Position >= r.Length then return 0 end
+			local token = readByte(r)
+			if token ~= LZ_EXT_LOW_ASCII5_TOKEN then return 0 end
+			if readVarUInt(r) ~= 0 then return 0 end
+			local useful = r.Position * 8 + originalLength * 5
+			return math.max(0, length * 8 - useful)
+		end)
+		if ok then return padding end
+	end
+
+	return 0
+end
+
 -- Handles string stats.
 function Compression.StringStats(value: string, options: Options?): {[string]: any}
 	if typeof(value) ~= "string" then fail("StringStats expects string", 2) end
@@ -8219,12 +8210,16 @@ function Compression.StringStats(value: string, options: Options?): {[string]: a
 	local delta = rawBytes - bytes
 	local saved = math.max(0, delta)
 	local expanded = math.max(0, -delta)
+	local physicalBits = bytes * 8
+	local paddingBits = stringPaddingBits(data)
+	local usefulBits = physicalBits - paddingBits
 	return {
 		Mode = Compression.StringMode(data),
 		Bytes = bytes,
-		Bits = bytes * 8,
-		UsefulBits = bytes * 8,
-		PhysicalBits = bytes * 8,
+		Bits = physicalBits,
+		UsefulBits = usefulBits,
+		PhysicalBits = physicalBits,
+		PaddingBits = paddingBits,
 		SavedBits = saved * 8,
 		ExpandedBits = expanded * 8,
 		BitSavingsPercent = rawBytes > 0 and math.max(0, delta / rawBytes * 100) or 0,
@@ -8281,8 +8276,27 @@ end
 -- Compresses string smart.
 function Compression.CompressStringSmart(value: string, options: Options?): (buffer, boolean)
 	if typeof(value) ~= "string" then fail("CompressStringSmart expects string", 2) end
+
 	local packed = Compression.CompressString(value, options)
-	if buffer.len(packed) < #value then return packed, true end
+	local best = packed
+	local bestBytes = buffer.len(packed)
+
+	-- The Smart API already carries a compressed boolean, so structured decimal
+	-- strings can use the denser BufferUtil-v1.3-style header without a legacy-safe
+	-- self-describing wrapper. Explicit non-structured strategies remain respected.
+	local strategy: StringStrategy = options and options.StringStrategy or "Auto"
+	if not options or options.CompressStrings ~= false then
+		if strategy == "Auto" or strategy == "PrefixUInt" or strategy == "UInt" then
+			local wantedKind = if strategy == "Auto" then nil else strategy
+			local structured = smartStructuredPacket(value, wantedKind)
+			if structured ~= nil and buffer.len(structured) < bestBytes then
+				best = structured
+				bestBytes = buffer.len(structured)
+			end
+		end
+	end
+
+	if bestBytes < #value then return best, true end
 	local raw = buffer.create(#value)
 	if #value > 0 then buffer.writestring(raw, 0, value) end
 	return raw, false
@@ -8291,7 +8305,11 @@ end
 -- Decompresses string smart.
 function Compression.DecompressStringSmart(data: buffer, compressed: boolean): string
 	if typeof(data) ~= "buffer" then fail("DecompressStringSmart expects buffer", 2) end
-	if compressed then return Compression.DecompressString(data) end
+	if compressed then
+		local structured = tryDecodeSmartStructured(data)
+		if structured ~= nil then return structured end
+		return Compression.DecompressString(data)
+	end
 	local length = buffer.len(data)
 	return length > 0 and buffer.readstring(data, 0, length) or ""
 end
