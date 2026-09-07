@@ -3,8 +3,15 @@
 
 local Compression = {}
 local INTERNAL: any = {}
+INTERNAL.String = {}
+INTERNAL.Buffer = {}
+INTERNAL.SchemaCore = {}
+INTERNAL.CompactAtom = {}
 
 Compression.VERSION = "3.1.0"
+
+-- v4.2 register-safe layout: high-level helper families live under INTERNAL
+-- so the module chunk stays comfortably below Luau's 200-local/register ceiling.
 
 export type Mode = "Binary" | "BinaryWithHash"
 export type StringStrategy = "Auto" | "Raw" | "LZ" | "ASCII7" | "LowASCII5" | "Identifier6" | "Numeric4" | "PrefixUInt" | "UInt"
@@ -88,6 +95,34 @@ export type Packet = {
 	EntropySavedBytes: number?,
 }
 
+export type BufferLayoutEntry = {
+	Type: string,
+	Bytes: number?,
+	Count: number?,
+	Offset: number?,
+}
+
+export type BufferLayout = {BufferLayoutEntry}
+
+export type BufferStageObject = {
+	WriteI8: (self: BufferStageObject, value: number) -> BufferStageObject,
+	WriteU8: (self: BufferStageObject, value: number) -> BufferStageObject,
+	WriteI16: (self: BufferStageObject, value: number) -> BufferStageObject,
+	WriteU16: (self: BufferStageObject, value: number) -> BufferStageObject,
+	WriteI32: (self: BufferStageObject, value: number) -> BufferStageObject,
+	WriteU32: (self: BufferStageObject, value: number) -> BufferStageObject,
+	WriteF32: (self: BufferStageObject, value: number) -> BufferStageObject,
+	WriteF64: (self: BufferStageObject, value: number) -> BufferStageObject,
+	WriteString: (self: BufferStageObject, value: string) -> BufferStageObject,
+	WriteBuffer: (self: BufferStageObject, value: buffer, label: string?) -> BufferStageObject,
+	Pad: (self: BufferStageObject, bytes: number, value: number?) -> BufferStageObject,
+	Bytes: (self: BufferStageObject) -> number,
+	ToBuffer: (self: BufferStageObject) -> buffer,
+	Layout: (self: BufferStageObject) -> BufferLayout,
+	Stats: (self: BufferStageObject, options: Options?) -> {[string]: any},
+	PrintStats: (self: BufferStageObject, options: Options?) -> {[string]: any},
+}
+
 export type BitLayoutField = {
 	Name: string,
 	Type: string,
@@ -134,7 +169,6 @@ type Reader = {
 	Length: number,
 	BitBuffer: number,
 	BitCount: number,
-	LegacyVarUInt: boolean,
 	KeyMapDecode: {string}?,
 }
 
@@ -346,7 +380,6 @@ local function newReader(data: buffer): Reader
 		Length = buffer.len(data),
 		BitBuffer = 0,
 		BitCount = 0,
-		LegacyVarUInt = false,
 		KeyMapDecode = nil,
 	}
 end
@@ -486,22 +519,11 @@ local function writeVarUInt(w: Writer, value: number)
 	until value == 0
 end
 
--- Handles read var uint.
+-- Reads a current-format VarUInt.
 local function readVarUInt(r: Reader): number
 	alignReader(r)
 	local result = 0
 	local multiplier = 1
-	if r.LegacyVarUInt then
-		for _ = 1, 256 do
-			local byte = readByte(r)
-			result += (byte % 128) * multiplier
-			if byte < 128 then return result end
-			multiplier *= 128
-			if multiplier == math.huge then fail("legacy VarUInt overflow", 2) end
-		end
-		fail("invalid legacy VarUInt", 2)
-		return 0
-	end
 	for _ = 1, 8 do
 		local byte = readByte(r)
 		result += (byte % 128) * multiplier
@@ -980,7 +1002,6 @@ local function huffmanDecodeFrame(data: buffer): buffer
 		Length = r.Length,
 		BitBuffer = 0,
 		BitCount = 0,
-		LegacyVarUInt = false,
 		KeyMapDecode = nil,
 	}
 	local result = buffer.create(originalLength)
@@ -1168,7 +1189,7 @@ function INTERNAL.readAdaptiveIntBits(r: Reader): number
 	return zigzagDecode(INTERNAL.readAdaptiveUIntBits(r))
 end
 
--- Byte payloads can remain inside an existing bit stream in v2.9.
+-- Small byte payloads remain inside the active bit stream.
 function INTERNAL.writeBufferBits(w: Writer, data: buffer)
 	local length = buffer.len(data)
 	if length >= 32 then
@@ -1448,7 +1469,7 @@ FMT.CloneDefault = function(value: any): any
 end
 
 -- Handles dictionary score.
-local function dictionaryScore(value: string, count: number): number
+function INTERNAL.String.dictionaryScore(value: string, count: number): number
 	local rawEntryCost = #value + varUIntByteLength(#value)
 	local approximateReferenceCost = count
 	local approximateInlineCost = count * (#value + 2)
@@ -1456,7 +1477,7 @@ local function dictionaryScore(value: string, count: number): number
 end
 
 -- Handles collect strings safe.
-local function collectStringsSafe(value: any, counts: {[string]: number}, seen: {[any]: boolean})
+function INTERNAL.String.collectStringsSafe(value: any, counts: {[string]: number}, seen: {[any]: boolean})
 	local kind = typeof(value)
 	if kind == "string" then
 		counts[value] = (counts[value] or 0) + 1
@@ -1464,22 +1485,22 @@ local function collectStringsSafe(value: any, counts: {[string]: number}, seen: 
 		if seen[value] then return end
 		seen[value] = true
 		for key, child in pairs(value) do
-			collectStringsSafe(key, counts, seen)
-			collectStringsSafe(child, counts, seen)
+			INTERNAL.String.collectStringsSafe(key, counts, seen)
+			INTERNAL.String.collectStringsSafe(child, counts, seen)
 		end
 	end
 end
 
 -- Handles make dictionary.
-local function makeDictionary(value: any, options: Options?): DictionaryState
+function INTERNAL.String.makeDictionary(value: any, options: Options?): DictionaryState
 	local state: DictionaryState = {Encode = {}, Decode = {}}
 	if options and options.UseStringDictionary == false then return state end
 	local counts = {}
-	collectStringsSafe(value, counts, {})
+	INTERNAL.String.collectStringsSafe(value, counts, {})
 	local minUses = math.max(2, options and options.DictionaryMinUses or 2)
 	local candidates = {}
 	for stringValue, count in pairs(counts) do
-		local score = dictionaryScore(stringValue, count)
+		local score = INTERNAL.String.dictionaryScore(stringValue, count)
 		if count >= minUses and #stringValue >= 2 and score > 0 then
 			candidates[#candidates + 1] = {Value = stringValue, Count = count, Score = score}
 		end
@@ -1502,7 +1523,7 @@ end
 
 local STR = {
 	RAW = 0,
-	LZ_V1 = 1,
+	TINY_FILL = 1,
 	NUMERIC4 = 2,
 	IDENTIFIER6 = 3,
 	ASCII7 = 4,
@@ -1523,13 +1544,13 @@ NUMERIC4_ENCODE[string.byte("e")] = 13
 NUMERIC4_ENCODE[string.byte("E")] = 14
 local NUMERIC4_DECODE = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "-", "+", ".", "e", "E"}
 
--- v3.1 structured decimal string codecs.
+-- Structured decimal string codecs.
 --
 -- Self-contained PrefixUInt/UInt frames reuse Numeric4 packets that were invalid
 -- in every previous version: a Numeric4 packet with no 0xF terminator nibble.
 -- Each payload nibble is a base-15 digit (0..14), so old decoders reject these
 -- frames instead of silently decoding them as another string. This preserves
--- backwards decoding while giving structured decimal strings a much denser path.
+-- self-contained decoding while giving structured decimal strings a much denser path.
 --
 -- Structured code:
 --   code % 4 == 0 -> canonical unsigned decimal ("UInt")
@@ -1548,8 +1569,8 @@ local STRUCTURED_PREFIXES = table.freeze({
 })
 
 -- Smart string compression has an out-of-band compressed flag, so it can use a
--- denser packed header without needing a self-describing legacy-safe marker.
--- This mirrors BufferUtil v1.3's packed UInt layout and lets
+-- denser packed header without needing a self-describing self-describing marker.
+-- This packed UInt layout lets
 -- "Player_134233636" fit in four bytes.
 local SMART_STRING_CODEC_PREFIX_UINT = 5
 local SMART_STRING_CODEC_UINT = 6
@@ -1557,7 +1578,7 @@ local SMART_STRING_CODEC_SHIFT = 3
 local SMART_STRING_CODEC_MASK = 0x7
 local SMART_PREFIX_UINT_MAX = 4_503_599_627_370_495 -- 2^52 - 1
 
-local function parseCanonicalUnsignedDecimal(value: string, startIndex: number?): number?
+function INTERNAL.String.parseCanonicalUnsignedDecimal(value: string, startIndex: number?): number?
 	local first = startIndex or 1
 	local length = #value
 	if first > length then return nil end
@@ -1577,13 +1598,13 @@ local function parseCanonicalUnsignedDecimal(value: string, startIndex: number?)
 	return result
 end
 
-local function exactUnsignedIntegerString(value: number): string
+function INTERNAL.String.exactUnsignedIntegerString(value: number): string
 	return string.format("%.0f", value)
 end
 
-local function structuredStringCode(value: string, wantedKind: string?): (number?, string?)
+function INTERNAL.String.structuredStringCode(value: string, wantedKind: string?): (number?, string?)
 	if wantedKind == nil or wantedKind == "UInt" then
-		local integer = parseCanonicalUnsignedDecimal(value)
+		local integer = INTERNAL.String.parseCanonicalUnsignedDecimal(value)
 		if integer ~= nil then
 			local maximum = math.floor((MAX_SAFE_INTEGER - STRUCTURED_KIND_UINT) / STRUCTURED_KIND_COUNT)
 			if integer <= maximum then
@@ -1596,7 +1617,7 @@ local function structuredStringCode(value: string, wantedKind: string?): (number
 		for kind, prefix in pairs(STRUCTURED_PREFIXES) do
 			local prefixLength = #prefix
 			if #value > prefixLength and string.sub(value, 1, prefixLength) == prefix then
-				local integer = parseCanonicalUnsignedDecimal(value, prefixLength + 1)
+				local integer = INTERNAL.String.parseCanonicalUnsignedDecimal(value, prefixLength + 1)
 				if integer ~= nil then
 					local maximum = math.floor((MAX_SAFE_INTEGER - kind) / STRUCTURED_KIND_COUNT)
 					if integer <= maximum then
@@ -1610,7 +1631,7 @@ local function structuredStringCode(value: string, wantedKind: string?): (number
 	return nil, nil
 end
 
-local function structuredTailBytes(code: number): number
+function INTERNAL.String.structuredTailBytes(code: number): number
 	local bytes = 1
 	local remaining = math.floor(code / (STRUCTURED_RADIX * STRUCTURED_RADIX))
 	while remaining > 0 do
@@ -1620,11 +1641,11 @@ local function structuredTailBytes(code: number): number
 	return bytes
 end
 
-local function structuredStringPacket(value: string, wantedKind: string?): (buffer?, string?)
-	local code, codec = structuredStringCode(value, wantedKind)
+function INTERNAL.String.structuredStringPacket(value: string, wantedKind: string?): (buffer?, string?)
+	local code, codec = INTERNAL.String.structuredStringCode(value, wantedKind)
 	if code == nil or codec == nil then return nil, nil end
 
-	local tailBytes = structuredTailBytes(code)
+	local tailBytes = INTERNAL.String.structuredTailBytes(code)
 	local out = buffer.create(1 + tailBytes)
 	buffer.writeu8(out, 0, STR.NUMERIC4)
 
@@ -1640,7 +1661,7 @@ local function structuredStringPacket(value: string, wantedKind: string?): (buff
 	return out, codec
 end
 
-local function tryDecodeStructuredNumeric4(data: buffer): (string?, string?)
+function INTERNAL.String.tryDecodeStructuredNumeric4(data: buffer): (string?, string?)
 	local length = buffer.len(data)
 	if length < 2 or length > 8 or buffer.readu8(data, 0) ~= STR.NUMERIC4 then return nil, nil end
 
@@ -1660,31 +1681,31 @@ local function tryDecodeStructuredNumeric4(data: buffer): (string?, string?)
 	end
 
 	-- Reject non-canonical overlong encodings and the reserved subtype.
-	if structuredTailBytes(code) ~= length - 1 then return nil, nil end
+	if INTERNAL.String.structuredTailBytes(code) ~= length - 1 then return nil, nil end
 	local kind = code % STRUCTURED_KIND_COUNT
 	if kind == STRUCTURED_KIND_RESERVED then return nil, nil end
 
 	local integer = math.floor(code / STRUCTURED_KIND_COUNT)
 	if kind == STRUCTURED_KIND_UINT then
-		return exactUnsignedIntegerString(integer), "UInt"
+		return INTERNAL.String.exactUnsignedIntegerString(integer), "UInt"
 	end
 
 	local prefix = STRUCTURED_PREFIXES[kind]
 	if prefix == nil then return nil, nil end
-	return prefix .. exactUnsignedIntegerString(integer), "PrefixUInt"
+	return prefix .. INTERNAL.String.exactUnsignedIntegerString(integer), "PrefixUInt"
 end
 
-local function smartPackedCapacity(byteLength: number): number
+function INTERNAL.String.smartPackedCapacity(byteLength: number): number
 	return 5 + math.max(0, byteLength - 1) * 8
 end
 
-local function smartPackedByteLength(payloadBits: number): number
+function INTERNAL.String.smartPackedByteLength(payloadBits: number): number
 	local bytes = 1
-	while smartPackedCapacity(bytes) < payloadBits do bytes += 1 end
+	while INTERNAL.String.smartPackedCapacity(bytes) < payloadBits do bytes += 1 end
 	return bytes
 end
 
-local function bitsNeededUnsigned(value: number): number
+function INTERNAL.String.bitsNeededUnsigned(value: number): number
 	if value <= 0 then return 1 end
 	local bits = math.clamp(math.floor(math.log(value) / 0.6931471805599453) + 1, 1, 53)
 	while bits > 1 and value < 2 ^ (bits - 1) do bits -= 1 end
@@ -1692,9 +1713,9 @@ local function bitsNeededUnsigned(value: number): number
 	return bits
 end
 
-local function makeSmartPackedUInt(codec: number, value: number): buffer
-	local payloadBits = bitsNeededUnsigned(value)
-	local byteLength = smartPackedByteLength(payloadBits)
+function INTERNAL.String.makeSmartPackedUInt(codec: number, value: number): buffer
+	local payloadBits = INTERNAL.String.bitsNeededUnsigned(value)
+	local byteLength = INTERNAL.String.smartPackedByteLength(payloadBits)
 	local out = buffer.create(byteLength)
 
 	local low3 = value % 8
@@ -1712,7 +1733,7 @@ local function makeSmartPackedUInt(codec: number, value: number): buffer
 	return out
 end
 
-local function readSmartPackedUInt(data: buffer): number?
+function INTERNAL.String.readSmartPackedUInt(data: buffer): number?
 	local byteLength = buffer.len(data)
 	if byteLength < 1 or byteLength > 7 then return nil end
 	local header = buffer.readu8(data, 0)
@@ -1726,47 +1747,47 @@ local function readSmartPackedUInt(data: buffer): number?
 	end
 	local value = low3 + next2 * 8 + tail * 32
 	if value > MAX_SAFE_INTEGER then return nil end
-	if smartPackedByteLength(bitsNeededUnsigned(value)) ~= byteLength then return nil end
+	if INTERNAL.String.smartPackedByteLength(INTERNAL.String.bitsNeededUnsigned(value)) ~= byteLength then return nil end
 	return value
 end
 
-local function smartStructuredPacket(value: string, wantedKind: string?): (buffer?, string?)
+function INTERNAL.String.smartStructuredPacket(value: string, wantedKind: string?): (buffer?, string?)
 	if wantedKind == nil or wantedKind == "PrefixUInt" then
 		for prefixId, prefix in ipairs({"Player_", "User_"}) do
 			local prefixLength = #prefix
 			if #value > prefixLength and string.sub(value, 1, prefixLength) == prefix then
-				local integer = parseCanonicalUnsignedDecimal(value, prefixLength + 1)
+				local integer = INTERNAL.String.parseCanonicalUnsignedDecimal(value, prefixLength + 1)
 				if integer ~= nil and integer <= SMART_PREFIX_UINT_MAX then
-					return makeSmartPackedUInt(SMART_STRING_CODEC_PREFIX_UINT, integer * 2 + (prefixId - 1)), "PrefixUInt"
+					return INTERNAL.String.makeSmartPackedUInt(SMART_STRING_CODEC_PREFIX_UINT, integer * 2 + (prefixId - 1)), "PrefixUInt"
 				end
 			end
 		end
 	end
 
 	if wantedKind == nil or wantedKind == "UInt" then
-		local integer = parseCanonicalUnsignedDecimal(value)
-		if integer ~= nil then return makeSmartPackedUInt(SMART_STRING_CODEC_UINT, integer), "UInt" end
+		local integer = INTERNAL.String.parseCanonicalUnsignedDecimal(value)
+		if integer ~= nil then return INTERNAL.String.makeSmartPackedUInt(SMART_STRING_CODEC_UINT, integer), "UInt" end
 	end
 	return nil, nil
 end
 
-local function tryDecodeSmartStructured(data: buffer): (string?, string?)
+function INTERNAL.String.tryDecodeSmartStructured(data: buffer): (string?, string?)
 	if buffer.len(data) == 0 then return nil, nil end
 	local header = buffer.readu8(data, 0)
 	local codec = bit32.extract(header, SMART_STRING_CODEC_SHIFT, 3)
 	if codec ~= SMART_STRING_CODEC_PREFIX_UINT and codec ~= SMART_STRING_CODEC_UINT then return nil, nil end
-	local packed = readSmartPackedUInt(data)
+	local packed = INTERNAL.String.readSmartPackedUInt(data)
 	if packed == nil then return nil, nil end
 
-	if codec == SMART_STRING_CODEC_UINT then return exactUnsignedIntegerString(packed), "UInt" end
+	if codec == SMART_STRING_CODEC_UINT then return INTERNAL.String.exactUnsignedIntegerString(packed), "UInt" end
 	local prefixId = packed % 2
 	local integer = math.floor(packed / 2)
 	local prefix = prefixId == 0 and "Player_" or "User_"
-	return prefix .. exactUnsignedIntegerString(integer), "PrefixUInt"
+	return prefix .. INTERNAL.String.exactUnsignedIntegerString(integer), "PrefixUInt"
 end
 
 -- Handles raw string packet.
-local function rawStringPacket(value: string): buffer
+function INTERNAL.String.rawStringPacket(value: string): buffer
 	local length = #value
 	if length == 0 then return buffer.create(0) end
 	if length == 1 then
@@ -1791,7 +1812,7 @@ local function rawStringPacket(value: string): buffer
 end
 
 -- Returns the exact raw-string fallback size without allocating it.
-local function rawStringPacketByteLength(value: string): number
+function INTERNAL.String.rawStringPacketByteLength(value: string): number
 	local length = #value
 	if length <= 1 then return length end
 	local first = string.byte(value, 1)
@@ -1810,7 +1831,7 @@ type StringAnalysis = {
 }
 
 -- Scans string codec eligibility once so Auto does not rescan for Numeric4, Identifier6, and ASCII7.
-local function analyzeString(value: string): StringAnalysis
+function INTERNAL.String.analyzeString(value: string): StringAnalysis
 	local length = #value
 	local numeric = length > 0
 	local identifier = length > 0
@@ -1840,40 +1861,39 @@ local function analyzeString(value: string): StringAnalysis
 end
 
 -- Returns the exact Numeric4 encoded size for an eligible non-empty string.
-local function estimatedNumeric4Bytes(length: number): number
+function INTERNAL.String.estimatedNumeric4Bytes(length: number): number
 	return math.floor(length / 2) + 2
 end
 
 -- Returns the exact Identifier6 encoded size for an eligible string.
-local function estimatedIdentifier6Bytes(length: number): number
+function INTERNAL.String.estimatedIdentifier6Bytes(length: number): number
 	return 1 + varUIntByteLength(length) + math.ceil(length * 6 / 8)
 end
 
 -- Returns the exact ASCII7 encoded size for an eligible string.
-local function estimatedASCII7Bytes(length: number): number
+function INTERNAL.String.estimatedASCII7Bytes(length: number): number
 	return 1 + varUIntByteLength(length) + math.ceil(length * 7 / 8)
 end
 
--- Tiny fill packets reuse legacy LZ-v1 packet lengths that were never valid outputs.
--- 2 bytes: [LZ_V1, byte] means byte x2.
--- 3 bytes: [LZ_V1, byte, countMinus2] means byte x3..x257.
--- This is backwards-safe because valid LZ-v1 frames require both lengths and payload data.
-local function estimatedTinyFillBytes(length: number, firstByte: number?): number?
+-- Tiny fill packets use the dedicated compact marker.
+-- 2 bytes: [TINY_FILL, byte] means byte x2.
+-- 3 bytes: [TINY_FILL, byte, countMinus2] means byte x3..x257.
+function INTERNAL.String.estimatedTinyFillBytes(length: number, firstByte: number?): number?
 	if length == 2 then return 2 end
 	if length >= 3 and length <= 257 then
-		-- Zero gets an even denser two-byte frame using truncated legacy RAW.
+		-- Zero uses an even denser two-byte compact RAW frame.
 		if firstByte == 0 then return 2 end
 		return 3
 	end
 	return nil
 end
 
-local function tinyFillPacket(value: string, analysis: StringAnalysis?): buffer?
-	local info = analysis or analyzeString(value)
+function INTERNAL.String.tinyFillPacket(value: string, analysis: StringAnalysis?): buffer?
+	local info = analysis or INTERNAL.String.analyzeString(value)
 	if info.Length < 2 or info.Length > 257 or not info.AllSame or info.FirstByte == nil then return nil end
 	if info.Length == 2 then
 		local result = buffer.create(2)
-		buffer.writeu8(result, 0, STR.LZ_V1)
+		buffer.writeu8(result, 0, STR.TINY_FILL)
 		buffer.writeu8(result, 1, info.FirstByte)
 		return result
 	end
@@ -1884,23 +1904,23 @@ local function tinyFillPacket(value: string, analysis: StringAnalysis?): buffer?
 		return result
 	end
 	local result = buffer.create(3)
-	buffer.writeu8(result, 0, STR.LZ_V1)
+	buffer.writeu8(result, 0, STR.TINY_FILL)
 	buffer.writeu8(result, 1, info.FirstByte)
 	buffer.writeu8(result, 2, info.Length - 2)
 	return result
 end
 
 -- Compact fill extension: [LZ_V2, 0, byte, VarUInt(length)].
--- An old decoder sees originalLength=0 followed by trailing bytes, which was invalid.
-local function estimatedCompactFillBytes(length: number, firstByte: number?): number
+-- The zero-length sentinel selects the compact fill extension.
+function INTERNAL.String.estimatedCompactFillBytes(length: number, firstByte: number?): number
 	-- Zero can reuse [RAW, 0, VarUInt(length)] and saves one extra byte.
 	return (firstByte == 0 and 2 or 3) + varUIntByteLength(length)
 end
 
-local function compactFillPacket(value: string, analysis: StringAnalysis?): buffer?
-	local info = analysis or analyzeString(value)
+function INTERNAL.String.compactFillPacket(value: string, analysis: StringAnalysis?): buffer?
+	local info = analysis or INTERNAL.String.analyzeString(value)
 	if info.Length < 258 or not info.AllSame or info.FirstByte == nil then return nil end
-	local w = newWriter(estimatedCompactFillBytes(info.Length, info.FirstByte))
+	local w = newWriter(INTERNAL.String.estimatedCompactFillBytes(info.Length, info.FirstByte))
 	if info.FirstByte == 0 then
 		writeByte(w, STR.RAW)
 		writeByte(w, 0)
@@ -1915,17 +1935,16 @@ local function compactFillPacket(value: string, analysis: StringAnalysis?): buff
 end
 
 -- Short LowASCII5 frame: [RAW, length, packed5].
--- For lengths 6..127, the payload is no larger than source bytes and shorter than a valid legacy RAW frame,
--- so older decoders would reject it as truncated instead of mis-decoding it.
-local function estimatedCompactLowASCII5Bytes(length: number): number?
+-- For lengths 6..127, this compact form is no larger than the source bytes.
+function INTERNAL.String.estimatedCompactLowASCII5Bytes(length: number): number?
 	if length < 6 or length > 127 then return nil end
 	return 2 + math.ceil(length * 5 / 8)
 end
 
-local function compactLowASCII5Packet(value: string, analysis: StringAnalysis?): buffer?
-	local info = analysis or analyzeString(value)
+function INTERNAL.String.compactLowASCII5Packet(value: string, analysis: StringAnalysis?): buffer?
+	local info = analysis or INTERNAL.String.analyzeString(value)
 	if not info.LowASCII5 then return nil end
-	local estimated = estimatedCompactLowASCII5Bytes(info.Length)
+	local estimated = INTERNAL.String.estimatedCompactLowASCII5Bytes(info.Length)
 	if estimated == nil then return nil end
 	local w = newWriter(estimated)
 	writeByte(w, STR.RAW)
@@ -1942,21 +1961,21 @@ local LZ_EXT_LOW_ASCII5_TOKEN = 192
 local LZ_EXT_FILL_TOKEN = 193
 
 -- Returns the exact LowASCII5 encoded size for bytes 0-31.
-local function estimatedLowASCII5Bytes(length: number): number
+function INTERNAL.String.estimatedLowASCII5Bytes(length: number): number
 	return 1 + varUIntByteLength(length) + 2 + math.ceil(length * 5 / 8)
 end
 
 -- Returns the exact compact fill-frame size for a non-empty repeated-byte string.
-local function estimatedStringFillBytes(length: number): number
+function INTERNAL.String.estimatedStringFillBytes(length: number): number
 	return 1 + varUIntByteLength(length) + 3
 end
 
 -- Packs bytes 0-31 at five bits each inside an LZ-v2 extension frame.
-local function lowASCII5Packet(value: string, analysis: StringAnalysis?): buffer?
-	local info = analysis or analyzeString(value)
+function INTERNAL.String.lowASCII5Packet(value: string, analysis: StringAnalysis?): buffer?
+	local info = analysis or INTERNAL.String.analyzeString(value)
 	if info.Length == 0 or not info.LowASCII5 then return nil end
 
-	local w = newWriter(math.max(8, estimatedLowASCII5Bytes(info.Length)))
+	local w = newWriter(math.max(8, INTERNAL.String.estimatedLowASCII5Bytes(info.Length)))
 	writeByte(w, STR.LZ_V2)
 	writeVarUInt(w, info.Length)
 	writeByte(w, LZ_EXT_LOW_ASCII5_TOKEN)
@@ -1968,11 +1987,11 @@ local function lowASCII5Packet(value: string, analysis: StringAnalysis?): buffer
 end
 
 -- Packs a long single-byte string into a constant-size LZ-v2 extension frame.
-local function stringFillPacket(value: string, analysis: StringAnalysis?): buffer?
-	local info = analysis or analyzeString(value)
+function INTERNAL.String.stringFillPacket(value: string, analysis: StringAnalysis?): buffer?
+	local info = analysis or INTERNAL.String.analyzeString(value)
 	if info.Length == 0 or not info.AllSame or info.FirstByte == nil then return nil end
 
-	local w = newWriter(math.max(8, estimatedStringFillBytes(info.Length)))
+	local w = newWriter(math.max(8, INTERNAL.String.estimatedStringFillBytes(info.Length)))
 	writeByte(w, STR.LZ_V2)
 	writeVarUInt(w, info.Length)
 	writeByte(w, LZ_EXT_FILL_TOKEN)
@@ -1982,7 +2001,7 @@ local function stringFillPacket(value: string, analysis: StringAnalysis?): buffe
 end
 
 -- Handles numeric4 packet.
-local function numeric4Packet(value: string): buffer?
+function INTERNAL.String.numeric4Packet(value: string): buffer?
 	if #value == 0 then return nil end
 	for i = 1, #value do if NUMERIC4_ENCODE[string.byte(value, i)] == nil then return nil end end
 	local w = newWriter(math.max(4, math.ceil(#value / 2) + 2))
@@ -2001,7 +2020,7 @@ local function numeric4Packet(value: string): buffer?
 end
 
 -- Handles identifier6 packet.
-local function identifier6Packet(value: string): buffer?
+function INTERNAL.String.identifier6Packet(value: string): buffer?
 	if #value == 0 then return nil end
 	for i = 1, #value do if IDENTIFIER_ENCODE[string.byte(value, i)] == nil then return nil end end
 	local w = newWriter(math.max(8, math.ceil(#value * 0.75) + 4))
@@ -2012,7 +2031,7 @@ local function identifier6Packet(value: string): buffer?
 end
 
 -- Handles ascii7 packet.
-local function ascii7Packet(value: string): buffer?
+function INTERNAL.String.ascii7Packet(value: string): buffer?
 	if #value == 0 then return nil end
 	for i = 1, #value do if string.byte(value, i) > 127 then return nil end end
 	local w = newWriter(math.max(8, math.ceil(#value * 0.875) + 4))
@@ -2023,18 +2042,18 @@ local function ascii7Packet(value: string): buffer?
 end
 
 -- Builds a numeric 3-byte LZ key without allocating a temporary substring.
-local function stringIndexKey(value: string, position: number, length: number): number?
+function INTERNAL.String.stringIndexKey(value: string, position: number, length: number): number?
 	if position + 2 > length then return nil end
 	local a, b, c = string.byte(value, position, position + 2)
 	return (a :: number) + (b :: number) * 256 + (c :: number) * 65536
 end
 
 -- Short strings below the normal LZ threshold are cheap to inspect for a repeated 3-byte seed.
-local function shortStringHasLZPotential(value: string, length: number): boolean
+function INTERNAL.String.shortStringHasLZPotential(value: string, length: number): boolean
 	if length < 8 then return false end
 	local seen: {[number]: boolean} = {}
 	for position = 1, length - 2 do
-		local key = stringIndexKey(value, position, length)
+		local key = INTERNAL.String.stringIndexKey(value, position, length)
 		if key ~= nil then
 			if seen[key] then return true end
 			seen[key] = true
@@ -2044,8 +2063,8 @@ local function shortStringHasLZPotential(value: string, length: number): boolean
 end
 
 -- Adds a string position to the LZ index using allocation-free numeric keys.
-local function addStringIndex(index: {[number]: {number}}, value: string, position: number, length: number)
-	local key = stringIndexKey(value, position, length)
+function INTERNAL.String.addStringIndex(index: {[number]: {number}}, value: string, position: number, length: number)
+	local key = INTERNAL.String.stringIndexKey(value, position, length)
 	if key == nil then return end
 	local list = index[key]
 	if list == nil then list = {}; index[key] = list end
@@ -2053,8 +2072,8 @@ local function addStringIndex(index: {[number]: {number}}, value: string, positi
 end
 
 -- Finds the best string LZ match using the same candidate order as previous versions.
-local function indexedStringMatch(value: string, position: number, lengthTotal: number, index: {[number]: {number}}, window: number, maxMatch: number, depth: number): (number, number)
-	local key = stringIndexKey(value, position, lengthTotal)
+function INTERNAL.String.indexedStringMatch(value: string, position: number, lengthTotal: number, index: {[number]: {number}}, window: number, maxMatch: number, depth: number): (number, number)
+	local key = INTERNAL.String.stringIndexKey(value, position, lengthTotal)
 	if key == nil then return 0, 0 end
 	local list = index[key]
 	if list == nil then return 0, 0 end
@@ -2085,7 +2104,7 @@ local function indexedStringMatch(value: string, position: number, lengthTotal: 
 end
 
 -- Counts a repeated-byte run while reusing the caller's cached string length.
-local function repeatedByteRun(value: string, position: number, maximum: number, lengthTotal: number): number
+function INTERNAL.String.repeatedByteRun(value: string, position: number, maximum: number, lengthTotal: number): number
 	local byte = string.byte(value, position)
 	local length = 1
 	local limit = math.min(lengthTotal, position + maximum - 1)
@@ -2097,7 +2116,7 @@ local function repeatedByteRun(value: string, position: number, maximum: number,
 end
 
 -- Handles lz v2 packet.
-local function lzV2Packet(value: string, options: Options?): buffer
+function INTERNAL.String.lzV2Packet(value: string, options: Options?): buffer
 	local searchDepth = math.clamp(options and options.StringSearchDepth or 24, 1, 128)
 	local window = math.clamp(options and options.StringWindowSize or 16383, 32, 65535)
 	local maxMatch = math.clamp(options and options.StringMaxMatch or 66, 3, 66)
@@ -2120,8 +2139,8 @@ local function lzV2Packet(value: string, options: Options?): buffer
 	end
 
 	while position <= lengthTotal do
-		local runLength = repeatedByteRun(value, position, maxMatch, lengthTotal)
-		local distance, matchLength = indexedStringMatch(value, position, lengthTotal, index, window, maxMatch, searchDepth)
+		local runLength = INTERNAL.String.repeatedByteRun(value, position, maxMatch, lengthTotal)
+		local distance, matchLength = INTERNAL.String.indexedStringMatch(value, position, lengthTotal, index, window, maxMatch, searchDepth)
 		local useRun = runLength >= 3 and runLength >= matchLength
 		local consume = useRun and runLength or matchLength
 		if consume >= 3 then
@@ -2133,13 +2152,13 @@ local function lzV2Packet(value: string, options: Options?): buffer
 				writeByte(body, 192 + matchLength - 3)
 				writeVarUInt(body, distance)
 			end
-			for p = position, position + consume - 1 do addStringIndex(index, value, p, lengthTotal) end
+			for p = position, position + consume - 1 do INTERNAL.String.addStringIndex(index, value, p, lengthTotal) end
 			position += consume
 			literalStart = position
 		else
 			if literalLength == 0 then literalStart = position end
 			literalLength += 1
-			addStringIndex(index, value, position, lengthTotal)
+			INTERNAL.String.addStringIndex(index, value, position, lengthTotal)
 			position += 1
 			if literalLength == 128 then flushLiteral(); literalStart = position end
 		end
@@ -2157,7 +2176,7 @@ local function lzV2Packet(value: string, options: Options?): buffer
 end
 
 -- Handles choose smaller.
-local function chooseSmaller(current: buffer, candidate: buffer?): buffer
+function INTERNAL.String.chooseSmaller(current: buffer, candidate: buffer?): buffer
 	if candidate ~= nil and buffer.len(candidate) < buffer.len(current) then return candidate end
 	return current
 end
@@ -2165,113 +2184,113 @@ end
 -- Compresses a string with lazy raw allocation while preserving the previous codec ordering and byte format.
 function Compression.CompressString(value: string, options: Options?): buffer
 	if typeof(value) ~= "string" then fail("CompressString expects string", 2) end
-	if options and options.CompressStrings == false then return rawStringPacket(value) end
+	if options and options.CompressStrings == false then return INTERNAL.String.rawStringPacket(value) end
 
 	local strategy: StringStrategy = options and options.StringStrategy or "Auto"
 	local best: buffer
 	if strategy == "Raw" then
-		best = rawStringPacket(value)
+		best = INTERNAL.String.rawStringPacket(value)
 	elseif strategy == "PrefixUInt" then
-		local candidate = structuredStringPacket(value, "PrefixUInt")
+		local candidate = INTERNAL.String.structuredStringPacket(value, "PrefixUInt")
 		if candidate == nil then fail("PrefixUInt strategy expects Player_<uint> or User_<uint>", 2) end
 		best = candidate
 	elseif strategy == "UInt" then
-		local candidate = structuredStringPacket(value, "UInt")
+		local candidate = INTERNAL.String.structuredStringPacket(value, "UInt")
 		if candidate == nil then fail("UInt strategy expects a canonical unsigned decimal string", 2) end
 		best = candidate
 	elseif strategy == "Numeric4" then
-		local candidate = numeric4Packet(value)
+		local candidate = INTERNAL.String.numeric4Packet(value)
 		if candidate == nil then fail("Numeric4 strategy only supports 0-9 + - . e E", 2) end
 		best = candidate
 	elseif strategy == "Identifier6" then
-		local candidate = identifier6Packet(value)
+		local candidate = INTERNAL.String.identifier6Packet(value)
 		if candidate == nil then fail("Identifier6 strategy only supports A-Z a-z 0-9 _ -", 2) end
 		best = candidate
 	elseif strategy == "ASCII7" then
-		local candidate = ascii7Packet(value)
+		local candidate = INTERNAL.String.ascii7Packet(value)
 		if candidate == nil then fail("ASCII7 strategy only supports ASCII bytes 0-127", 2) end
 		best = candidate
 	elseif strategy == "LowASCII5" then
-		local analysis = analyzeString(value)
-		local candidate = compactLowASCII5Packet(value, analysis) or lowASCII5Packet(value, analysis)
+		local analysis = INTERNAL.String.analyzeString(value)
+		local candidate = INTERNAL.String.compactLowASCII5Packet(value, analysis) or INTERNAL.String.lowASCII5Packet(value, analysis)
 		if candidate == nil then fail("LowASCII5 strategy only supports bytes 0-31", 2) end
 		best = candidate
 	elseif strategy == "LZ" then
-		local analysis = analyzeString(value)
-		local fill = tinyFillPacket(value, analysis) or compactFillPacket(value, analysis)
+		local analysis = INTERNAL.String.analyzeString(value)
+		local fill = INTERNAL.String.tinyFillPacket(value, analysis) or INTERNAL.String.compactFillPacket(value, analysis)
 		if fill == nil and analysis.AllSame and analysis.Length >= 67 then
-			fill = stringFillPacket(value, analysis)
+			fill = INTERNAL.String.stringFillPacket(value, analysis)
 		end
-		best = fill or lzV2Packet(value, options)
+		best = fill or INTERNAL.String.lzV2Packet(value, options)
 	elseif strategy == "Auto" then
-		local analysis = analyzeString(value)
+		local analysis = INTERNAL.String.analyzeString(value)
 		local bestCandidate: buffer? = nil
 		-- A codec only counts as compression when it beats the original source bytes.
 		-- Self-contained RAW framing is only a fallback when no true compression wins.
 		local bestBytes = analysis.Length
 
-		local structured = structuredStringPacket(value)
+		local structured = INTERNAL.String.structuredStringPacket(value)
 		if structured ~= nil and buffer.len(structured) < bestBytes then
 			bestCandidate = structured
 			bestBytes = buffer.len(structured)
 		end
 
 		if analysis.Numeric4 then
-			local bytes = estimatedNumeric4Bytes(analysis.Length)
+			local bytes = INTERNAL.String.estimatedNumeric4Bytes(analysis.Length)
 			if bytes < bestBytes then
-				bestCandidate = numeric4Packet(value)
+				bestCandidate = INTERNAL.String.numeric4Packet(value)
 				bestBytes = bestCandidate and buffer.len(bestCandidate) or bestBytes
 			end
 		end
 
 		if analysis.Identifier6 then
-			local bytes = estimatedIdentifier6Bytes(analysis.Length)
+			local bytes = INTERNAL.String.estimatedIdentifier6Bytes(analysis.Length)
 			if bytes < bestBytes then
-				bestCandidate = identifier6Packet(value)
+				bestCandidate = INTERNAL.String.identifier6Packet(value)
 				bestBytes = bestCandidate and buffer.len(bestCandidate) or bestBytes
 			end
 		end
 
 		if analysis.ASCII7 then
-			local bytes = estimatedASCII7Bytes(analysis.Length)
+			local bytes = INTERNAL.String.estimatedASCII7Bytes(analysis.Length)
 			if bytes < bestBytes then
-				bestCandidate = ascii7Packet(value)
+				bestCandidate = INTERNAL.String.ascii7Packet(value)
 				bestBytes = bestCandidate and buffer.len(bestCandidate) or bestBytes
 			end
 		end
 
 		if analysis.LowASCII5 then
-			local compactBytes = estimatedCompactLowASCII5Bytes(analysis.Length)
+			local compactBytes = INTERNAL.String.estimatedCompactLowASCII5Bytes(analysis.Length)
 			if compactBytes ~= nil and compactBytes <= bestBytes then
-				bestCandidate = compactLowASCII5Packet(value, analysis)
+				bestCandidate = INTERNAL.String.compactLowASCII5Packet(value, analysis)
 				bestBytes = bestCandidate and buffer.len(bestCandidate) or bestBytes
 			end
-			local bytes = estimatedLowASCII5Bytes(analysis.Length)
+			local bytes = INTERNAL.String.estimatedLowASCII5Bytes(analysis.Length)
 			if bytes < bestBytes then
-				bestCandidate = lowASCII5Packet(value, analysis)
+				bestCandidate = INTERNAL.String.lowASCII5Packet(value, analysis)
 				bestBytes = bestCandidate and buffer.len(bestCandidate) or bestBytes
 			end
 		end
 
 		if analysis.AllSame then
-			local tinyBytes = estimatedTinyFillBytes(analysis.Length, analysis.FirstByte)
+			local tinyBytes = INTERNAL.String.estimatedTinyFillBytes(analysis.Length, analysis.FirstByte)
 			if tinyBytes ~= nil and tinyBytes <= bestBytes then
-				bestCandidate = tinyFillPacket(value, analysis)
+				bestCandidate = INTERNAL.String.tinyFillPacket(value, analysis)
 				bestBytes = bestCandidate and buffer.len(bestCandidate) or bestBytes
 			end
 
 			if analysis.Length >= 258 then
-				local compactFillBytes = estimatedCompactFillBytes(analysis.Length, analysis.FirstByte)
+				local compactFillBytes = INTERNAL.String.estimatedCompactFillBytes(analysis.Length, analysis.FirstByte)
 				if compactFillBytes < bestBytes then
-					bestCandidate = compactFillPacket(value, analysis)
+					bestCandidate = INTERNAL.String.compactFillPacket(value, analysis)
 					bestBytes = bestCandidate and buffer.len(bestCandidate) or bestBytes
 				end
 			end
 
 			if analysis.Length >= 67 then
-				local bytes = estimatedStringFillBytes(analysis.Length)
+				local bytes = INTERNAL.String.estimatedStringFillBytes(analysis.Length)
 				if bytes < bestBytes then
-					bestCandidate = stringFillPacket(value, analysis)
+					bestCandidate = INTERNAL.String.stringFillPacket(value, analysis)
 					bestBytes = bestCandidate and buffer.len(bestCandidate) or bestBytes
 				end
 			end
@@ -2280,64 +2299,30 @@ function Compression.CompressString(value: string, options: Options?): buffer
 		local minLength = math.max(3, options and options.StringMinLength or 16)
 		local tryLZ = analysis.Length >= minLength
 			or (analysis.AllSame and analysis.Length >= 4)
-			or (analysis.Length < minLength and shortStringHasLZPotential(value, analysis.Length))
+			or (analysis.Length < minLength and INTERNAL.String.shortStringHasLZPotential(value, analysis.Length))
 
 		if tryLZ then
-			local lz = lzV2Packet(value, options)
+			local lz = INTERNAL.String.lzV2Packet(value, options)
 			if buffer.len(lz) < bestBytes then
 				bestCandidate = lz
 				bestBytes = buffer.len(lz)
 			end
 		end
 
-		best = bestCandidate or rawStringPacket(value)
+		best = bestCandidate or INTERNAL.String.rawStringPacket(value)
 	else
 		fail("invalid StringStrategy " .. tostring(strategy), 2)
-		best = rawStringPacket(value)
+		best = INTERNAL.String.rawStringPacket(value)
 	end
 
 	if strategy ~= "Raw"
 		and (not options or options.AllowExpansion ~= true)
-		and buffer.len(best) > rawStringPacketByteLength(value) then
-		best = rawStringPacket(value)
+		and buffer.len(best) > INTERNAL.String.rawStringPacketByteLength(value) then
+		best = INTERNAL.String.rawStringPacket(value)
 	end
 
 	local entropyData = maybeHuffman(best, options)
 	return entropyData
-end
-
--- Handles decompress string legacy v1.
-local function decompressStringLegacyV1(r: Reader): string
-	local originalLength = readVarUInt(r)
-	if originalLength > MAX_DECODE_STRING_BYTES then
-		fail("legacy string exceeds decode limit", 2)
-	end
-	local compressedLength = readVarUInt(r)
-	local compressedEnd = r.Position + compressedLength
-	if compressedEnd > r.Length then fail("truncated compressed string", 2) end
-	local output = table.create(originalLength)
-	while r.Position < compressedEnd and #output < originalLength do
-		local token = readByte(r)
-		if token == 0 then
-			local count = readByte(r)
-			if count < 1 or r.Position + count > compressedEnd or #output + count > originalLength then fail("invalid legacy literal run", 2) end
-			for _ = 1, count do output[#output + 1] = string.char(readByte(r)) end
-		elseif token == 1 then
-			if r.Position + 2 > compressedEnd then fail("truncated legacy back-reference", 2) end
-			local packed = readByte(r) * 256 + readByte(r)
-			local distance = math.floor(packed / 16) + 1
-			local length = packed % 16 + 3
-			if distance > #output or #output + length > originalLength then fail("invalid legacy back-reference", 2) end
-			for _ = 1, length do
-				local index = #output - distance + 1
-				output[#output + 1] = output[index]
-			end
-		else
-			fail("invalid legacy compressed string token", 2)
-		end
-	end
-	if r.Position ~= compressedEnd or #output ~= originalLength then fail("legacy decompressed string length mismatch", 2) end
-	return table.concat(output)
 end
 
 -- Decompresses string.
@@ -2348,14 +2333,13 @@ function Compression.DecompressString(data: buffer): string
 	if dataLength == 0 then return "" end
 	local first = buffer.readu8(data, 0)
 
-	-- One-byte packets 0..6 were never emitted as complete legacy strings.
-	-- Treating them as inline literals removes the old 1 -> 2 byte expansion case.
+	-- One-byte marker values are reserved for inline literals.
 	if dataLength == 1 and first <= STR.RAW_V3 then
 		return string.char(first)
 	end
 
-	-- Tiny fill frames occupy legacy LZ-v1 lengths that were invalid except [1,0,0].
-	if first == STR.LZ_V1 then
+	-- Decode current tiny-fill frames before normal mode dispatch.
+	if first == STR.TINY_FILL then
 		if dataLength == 2 then
 			return string.rep(string.char(buffer.readu8(data, 1)), 2)
 		elseif dataLength == 3 then
@@ -2368,8 +2352,7 @@ function Compression.DecompressString(data: buffer): string
 
 	-- Compact LowASCII5 reuses a RAW frame whose declared payload would otherwise be truncated.
 	if first == STR.RAW and dataLength >= 2 then
-		-- Two-byte RAW packets with a non-zero declared length were truncated legacy frames.
-		-- Reuse them as a dense NUL run: count = code + 2.
+		-- Two-byte RAW packets encode a dense NUL run: count = code + 2.
 		if dataLength == 2 then
 			local zeroRunCode = buffer.readu8(data, 1)
 			if zeroRunCode > 0 then return string.rep("\0", zeroRunCode + 2) end
@@ -2386,7 +2369,7 @@ function Compression.DecompressString(data: buffer): string
 
 	if first == STR.RAW and dataLength >= 6 then
 		local originalLength = buffer.readu8(data, 1)
-		local compactBytes = estimatedCompactLowASCII5Bytes(originalLength)
+		local compactBytes = INTERNAL.String.estimatedCompactLowASCII5Bytes(originalLength)
 		if compactBytes ~= nil and dataLength == compactBytes then
 			local r5 = newReader(data)
 			readByte(r5)
@@ -2412,12 +2395,8 @@ function Compression.DecompressString(data: buffer): string
 		local value = readStringRaw(r)
 		if r.Position ~= r.Length then fail("trailing bytes in raw string payload", 2) end
 		return value
-	elseif mode == STR.LZ_V1 then
-		local value = decompressStringLegacyV1(r)
-		if r.Position ~= r.Length then fail("trailing bytes in legacy string payload", 2) end
-		return value
 	elseif mode == STR.NUMERIC4 then
-		local structured = tryDecodeStructuredNumeric4(data)
+		local structured = INTERNAL.String.tryDecodeStructuredNumeric4(data)
 		if structured ~= nil then return structured end
 		local output = {}
 		local terminated = false
@@ -2574,12 +2553,12 @@ BUF.ValidateDecodedBufferLength = function(length: number, label: string?)
 end
 
 -- Returns the encoded byte cost of a compact v2 buffer header for a given source length.
-local function bufferV2HeaderByteLength(length: number): number
+function INTERNAL.Buffer.bufferV2HeaderByteLength(length: number): number
 	return 2 + (length >= BUF.V2_LENGTH_EXT and varUIntByteLength(length) or 0)
 end
 
 -- Normalizes an integer buffer option and rejects NaN, infinity, and non-number values.
-local function bufferIntegerOption(value: any, defaultValue: number, minimum: number, maximum: number, name: string): number
+function INTERNAL.Buffer.bufferIntegerOption(value: any, defaultValue: number, minimum: number, maximum: number, name: string): number
 	if value == nil then return defaultValue end
 	if typeof(value) ~= "number" or value ~= value or value == math.huge or value == -math.huge then
 		fail(name .. " must be a finite number", 3)
@@ -2588,7 +2567,7 @@ local function bufferIntegerOption(value: any, defaultValue: number, minimum: nu
 end
 
 -- Scans a buffer once and caches the facts shared by Fill, ZeroRun, Sparse, and Nibble codecs.
-local function analyzeBuffer(value: buffer): BufferAnalysis
+function INTERNAL.Buffer.analyzeBuffer(value: buffer): BufferAnalysis
 	local length = buffer.len(value)
 	local firstByte = length > 0 and buffer.readu8(value, 0) or nil
 	local allSame = length > 0
@@ -2643,13 +2622,13 @@ local function analyzeBuffer(value: buffer): BufferAnalysis
 end
 
 -- Returns the exact encoded size of a Fill/Zero candidate, or nil when the codec cannot apply.
-local function estimatedFillBytes(analysis: BufferAnalysis): number?
+function INTERNAL.Buffer.estimatedFillBytes(analysis: BufferAnalysis): number?
 	if analysis.Length == 0 or not analysis.AllSame then return nil end
-	return bufferV2HeaderByteLength(analysis.Length) + ((analysis.FirstByte or 0) == 0 and 0 or 1)
+	return INTERNAL.Buffer.bufferV2HeaderByteLength(analysis.Length) + ((analysis.FirstByte or 0) == 0 and 0 or 1)
 end
 
 -- Returns the exact ZeroRun candidate size without constructing the candidate.
-local function estimatedZeroRunBytes(analysis: BufferAnalysis): number?
+function INTERNAL.Buffer.estimatedZeroRunBytes(analysis: BufferAnalysis): number?
 	local bestStart = analysis.BestZeroStart
 	local bestLength = analysis.BestZeroLength
 	if analysis.Length < 3 or bestStart < 0 or bestLength < 3 then return nil end
@@ -2662,15 +2641,15 @@ local function estimatedZeroRunBytes(analysis: BufferAnalysis): number?
 end
 
 -- Returns the exact SparseZero candidate size without writing its bitmap or values.
-local function estimatedSparseZeroBytes(analysis: BufferAnalysis): number?
+function INTERNAL.Buffer.estimatedSparseZeroBytes(analysis: BufferAnalysis): number?
 	if analysis.Length == 0 or analysis.NonZeroCount == 0 or analysis.NonZeroCount == analysis.Length then return nil end
-	return bufferV2HeaderByteLength(analysis.Length) + math.ceil(analysis.Length / 8) + analysis.NonZeroCount
+	return INTERNAL.Buffer.bufferV2HeaderByteLength(analysis.Length) + math.ceil(analysis.Length / 8) + analysis.NonZeroCount
 end
 
 -- Returns the exact SparsePower2 candidate size when every non-zero byte is a power of two.
-local function estimatedSparsePower2Bytes(analysis: BufferAnalysis): number?
+function INTERNAL.Buffer.estimatedSparsePower2Bytes(analysis: BufferAnalysis): number?
 	if analysis.Length == 0 or analysis.NonZeroCount == 0 or not analysis.AllPower2OrZero then return nil end
-	local headerBytes = bufferV2HeaderByteLength(analysis.Length)
+	local headerBytes = INTERNAL.Buffer.bufferV2HeaderByteLength(analysis.Length)
 	if analysis.Length <= 14 and analysis.NonZeroCount <= 7 then
 		return headerBytes + math.ceil(analysis.NonZeroCount * 7 / 8)
 	end
@@ -2678,15 +2657,15 @@ local function estimatedSparsePower2Bytes(analysis: BufferAnalysis): number?
 end
 
 -- Returns the exact Nibble4 candidate size when the selected nibble representation is valid.
-local function estimatedNibbleBytes(analysis: BufferAnalysis, high: boolean): number?
+function INTERNAL.Buffer.estimatedNibbleBytes(analysis: BufferAnalysis, high: boolean): number?
 	if analysis.Length == 0 then return nil end
 	local compatible = high and analysis.HighNibbleCompatible or analysis.LowNibbleCompatible
 	if not compatible then return nil end
-	return bufferV2HeaderByteLength(analysis.Length) + math.ceil(analysis.Length / 2)
+	return INTERNAL.Buffer.bufferV2HeaderByteLength(analysis.Length) + math.ceil(analysis.Length / 2)
 end
 
 -- Writes the compact v2 buffer mode/length header.
-local function writeBufferV2Header(w: Writer, mode: number, length: number)
+function INTERNAL.Buffer.writeBufferV2Header(w: Writer, mode: number, length: number)
 	if mode < 0 or mode > 7 then fail("invalid v2 buffer mode", 2) end
 	if length < 0 or length % 1 ~= 0 then fail("invalid buffer length", 2) end
 	writeByte(w, FMT.COMPACT_BUFFER_MAGIC)
@@ -2695,28 +2674,23 @@ local function writeBufferV2Header(w: Writer, mode: number, length: number)
 	if lengthCode == BUF.V2_LENGTH_EXT then writeVarUInt(w, length) end
 end
 
--- Reads a compact or legacy buffer header and returns mode, length, and format generation.
-local function readBufferHeader(r: Reader): (number, number, boolean)
+-- Reads the current compact buffer mode/length header.
+function INTERNAL.Buffer.readBufferHeader(r: Reader): (number, number)
 	if readByte(r) ~= FMT.COMPACT_BUFFER_MAGIC then fail("invalid compressed buffer header", 2) end
 	local control = readByte(r)
-	if control < BUF.V2_FLAG then
-		if control < BUF.RAW or control > BUF.LZ then fail("invalid legacy compressed buffer mode", 2) end
-		local length = readVarUInt(r)
-		BUF.ValidateDecodedBufferLength(length, "legacy buffer")
-		return control, length, false
-	end
+	if control < BUF.V2_FLAG then fail("unsupported compressed buffer generation", 2) end
 	local packed = control - BUF.V2_FLAG
 	local mode = math.floor(packed / 16)
 	local lengthCode = packed % 16
-	if mode < BUF.RAW or mode > BUF.NIBBLE_HIGH then fail("invalid v2 compressed buffer mode", 2) end
+	if mode < BUF.RAW or mode > BUF.NIBBLE_HIGH then fail("invalid compressed buffer mode", 2) end
 	local length = lengthCode
 	if lengthCode == BUF.V2_LENGTH_EXT then length = readVarUInt(r) end
 	BUF.ValidateDecodedBufferLength(length, "buffer")
-	return mode, length, true
+	return mode, length
 end
 
 -- Wraps raw bytes so Compression-owned magic bytes cannot be mistaken for compressed frames.
-local function bufferRawPacket(value: buffer): buffer
+function INTERNAL.Buffer.bufferRawPacket(value: buffer): buffer
 	local length = buffer.len(value)
 	local result = buffer.create(length + 1)
 	buffer.writeu8(result, 0, FMT.COMPACT_BUFFER_RAW_MAGIC)
@@ -2725,7 +2699,7 @@ local function bufferRawPacket(value: buffer): buffer
 end
 
 -- Returns the exact raw fallback byte count without allocating the fallback buffer.
-local function bufferRawCandidateByteLength(value: buffer): number
+function INTERNAL.Buffer.bufferRawCandidateByteLength(value: buffer): number
 	local length = buffer.len(value)
 	if length == 0 then return 0 end
 	if hasCompressionBufferMagic(value) or isHuffmanFrame(value) then return length + 1 end
@@ -2733,7 +2707,7 @@ local function bufferRawCandidateByteLength(value: buffer): number
 end
 
 -- Returns raw passthrough bytes when safe, otherwise returns an escaped raw buffer frame.
-local function bufferRawCandidate(value: buffer): buffer
+function INTERNAL.Buffer.bufferRawCandidate(value: buffer): buffer
 	local length = buffer.len(value)
 	if length == 0 then return buffer.create(0) end
 	if not hasCompressionBufferMagic(value) and not isHuffmanFrame(value) then
@@ -2741,30 +2715,30 @@ local function bufferRawCandidate(value: buffer): buffer
 		buffer.copy(raw, 0, value, 0, length)
 		return raw
 	end
-	return bufferRawPacket(value)
+	return INTERNAL.Buffer.bufferRawPacket(value)
 end
 
 -- Packs all-zero or single-byte-fill buffers into a tiny fill frame.
-local function bufferFillPacket(value: buffer, analysis: BufferAnalysis?): buffer?
-	local info = analysis or analyzeBuffer(value)
+function INTERNAL.Buffer.bufferFillPacket(value: buffer, analysis: BufferAnalysis?): buffer?
+	local info = analysis or INTERNAL.Buffer.analyzeBuffer(value)
 	local length = info.Length
 	if length == 0 or not info.AllSame then return nil end
 	local first = info.FirstByte :: number
 	local w = newWriter(6)
-	writeBufferV2Header(w, first == 0 and BUF.ZERO or BUF.FILL, length)
+	INTERNAL.Buffer.writeBufferV2Header(w, first == 0 and BUF.ZERO or BUF.FILL, length)
 	if first ~= 0 then writeByte(w, first) end
 	return finish(w)
 end
 
 -- Checks whether a sparse bitmap marks a byte position as present.
-local function bitmapHas(bitmap: buffer, position: number): boolean
+function INTERNAL.Buffer.bitmapHas(bitmap: buffer, position: number): boolean
 	local byteIndex = math.floor(position / 8)
 	local bitIndex = position % 8
 	return bit32.band(buffer.readu8(bitmap, byteIndex), bit32.lshift(1, bitIndex)) ~= 0
 end
 
 -- Appends raw buffer bytes to the current writer without changing their contents.
-local function appendRawBuffer(w: Writer, data: buffer)
+function INTERNAL.Buffer.appendRawBuffer(w: Writer, data: buffer)
 	local length = buffer.len(data)
 	flushBits(w)
 	ensureCapacity(w, length)
@@ -2774,15 +2748,15 @@ local function appendRawBuffer(w: Writer, data: buffer)
 end
 
 -- Packs mostly-zero buffers by reserving the bitmap directly inside the output frame.
-local function bufferSparseZeroPacket(value: buffer, analysis: BufferAnalysis?): buffer?
-	local info = analysis or analyzeBuffer(value)
+function INTERNAL.Buffer.bufferSparseZeroPacket(value: buffer, analysis: BufferAnalysis?): buffer?
+	local info = analysis or INTERNAL.Buffer.analyzeBuffer(value)
 	local length = info.Length
 	local nonZeroCount = info.NonZeroCount
 	if length == 0 or nonZeroCount == 0 or nonZeroCount == length then return nil end
 
 	local bitmapBytes = math.ceil(length / 8)
-	local w = newWriter(bufferV2HeaderByteLength(length) + bitmapBytes + nonZeroCount)
-	writeBufferV2Header(w, BUF.SPARSE_ZERO, length)
+	local w = newWriter(INTERNAL.Buffer.bufferV2HeaderByteLength(length) + bitmapBytes + nonZeroCount)
+	INTERNAL.Buffer.writeBufferV2Header(w, BUF.SPARSE_ZERO, length)
 	flushBits(w)
 	local bitmapStart = w.Position
 	ensureCapacity(w, bitmapBytes)
@@ -2804,8 +2778,8 @@ local function bufferSparseZeroPacket(value: buffer, analysis: BufferAnalysis?):
 end
 
 -- Removes the largest profitable contiguous zero run and stores compact reconstruction metadata.
-local function bufferZeroRunPacket(value: buffer, analysis: BufferAnalysis?): buffer?
-	local info = analysis or analyzeBuffer(value)
+function INTERNAL.Buffer.bufferZeroRunPacket(value: buffer, analysis: BufferAnalysis?): buffer?
+	local info = analysis or INTERNAL.Buffer.analyzeBuffer(value)
 	local length = info.Length
 	if length < 3 then return nil end
 
@@ -2851,15 +2825,15 @@ local function bufferZeroRunPacket(value: buffer, analysis: BufferAnalysis?): bu
 end
 
 -- Packs sparse power-of-two bytes while writing bitmap metadata directly into the result frame.
-local function bufferSparsePower2Packet(value: buffer, analysis: BufferAnalysis?): buffer?
-	local info = analysis or analyzeBuffer(value)
+function INTERNAL.Buffer.bufferSparsePower2Packet(value: buffer, analysis: BufferAnalysis?): buffer?
+	local info = analysis or INTERNAL.Buffer.analyzeBuffer(value)
 	local length = info.Length
 	local nonZeroCount = info.NonZeroCount
 	if length == 0 or nonZeroCount == 0 or not info.AllPower2OrZero then return nil end
 
 	if length <= 14 and nonZeroCount <= 7 then
-		local w = newWriter(bufferV2HeaderByteLength(length) + math.ceil(nonZeroCount * 7 / 8))
-		writeBufferV2Header(w, BUF.SPARSE_POWER2, length)
+		local w = newWriter(INTERNAL.Buffer.bufferV2HeaderByteLength(length) + math.ceil(nonZeroCount * 7 / 8))
+		INTERNAL.Buffer.writeBufferV2Header(w, BUF.SPARSE_POWER2, length)
 		for i = 0, length - 1 do
 			local byte = buffer.readu8(value, i)
 			if byte ~= 0 then
@@ -2872,8 +2846,8 @@ local function bufferSparsePower2Packet(value: buffer, analysis: BufferAnalysis?
 
 	local bitmapBytes = math.ceil(length / 8)
 	local exponentBytes = math.ceil(nonZeroCount * 3 / 8)
-	local w = newWriter(bufferV2HeaderByteLength(length) + bitmapBytes + exponentBytes)
-	writeBufferV2Header(w, BUF.SPARSE_POWER2, length)
+	local w = newWriter(INTERNAL.Buffer.bufferV2HeaderByteLength(length) + bitmapBytes + exponentBytes)
+	INTERNAL.Buffer.writeBufferV2Header(w, BUF.SPARSE_POWER2, length)
 	flushBits(w)
 	local bitmapStart = w.Position
 	ensureCapacity(w, bitmapBytes)
@@ -2895,8 +2869,8 @@ local function bufferSparsePower2Packet(value: buffer, analysis: BufferAnalysis?
 end
 
 -- Packs buffers whose bytes fit in low or high 4-bit nibbles.
-local function bufferNibblePacket(value: buffer, high: boolean, analysis: BufferAnalysis?): buffer?
-	local info = analysis or analyzeBuffer(value)
+function INTERNAL.Buffer.bufferNibblePacket(value: buffer, high: boolean, analysis: BufferAnalysis?): buffer?
+	local info = analysis or INTERNAL.Buffer.analyzeBuffer(value)
 	local length = info.Length
 	if length == 0 then return nil end
 	if high then
@@ -2907,7 +2881,7 @@ local function bufferNibblePacket(value: buffer, high: boolean, analysis: Buffer
 
 	local mode = high and BUF.NIBBLE_HIGH or BUF.NIBBLE_LOW
 	local w = newWriter(4 + math.ceil(length / 2))
-	writeBufferV2Header(w, mode, length)
+	INTERNAL.Buffer.writeBufferV2Header(w, mode, length)
 
 	local position = 0
 	while position < length do
@@ -2926,7 +2900,7 @@ local function bufferNibblePacket(value: buffer, high: boolean, analysis: Buffer
 end
 
 -- Builds the 3-byte lookup key used by the buffer LZ match index.
-local function bufferIndexKey(value: buffer, position: number, lengthTotal: number): number?
+function INTERNAL.Buffer.bufferIndexKey(value: buffer, position: number, lengthTotal: number): number?
 	if position + 2 >= lengthTotal then return nil end
 	return buffer.readu8(value, position)
 		+ buffer.readu8(value, position + 1) * 256
@@ -2934,8 +2908,8 @@ local function bufferIndexKey(value: buffer, position: number, lengthTotal: numb
 end
 
 -- Adds a buffer position to the LZ match index.
-local function addBufferIndex(index: {[number]: {number}}, value: buffer, position: number, lengthTotal: number)
-	local key = bufferIndexKey(value, position, lengthTotal)
+function INTERNAL.Buffer.addBufferIndex(index: {[number]: {number}}, value: buffer, position: number, lengthTotal: number)
+	local key = INTERNAL.Buffer.bufferIndexKey(value, position, lengthTotal)
 	if key == nil then return end
 	local list = index[key]
 	if list == nil then list = {}; index[key] = list end
@@ -2943,8 +2917,8 @@ local function addBufferIndex(index: {[number]: {number}}, value: buffer, positi
 end
 
 -- Finds the best recent LZ back-reference for the current buffer position.
-local function indexedBufferMatch(value: buffer, position: number, lengthTotal: number, index: {[number]: {number}}, window: number, maxMatch: number, depth: number): (number, number)
-	local key = bufferIndexKey(value, position, lengthTotal)
+function INTERNAL.Buffer.indexedBufferMatch(value: buffer, position: number, lengthTotal: number, index: {[number]: {number}}, window: number, maxMatch: number, depth: number): (number, number)
+	local key = INTERNAL.Buffer.bufferIndexKey(value, position, lengthTotal)
 	if key == nil then return 0, 0 end
 	local list = index[key]
 	if list == nil then return 0, 0 end
@@ -2975,7 +2949,7 @@ local function indexedBufferMatch(value: buffer, position: number, lengthTotal: 
 end
 
 -- Counts a repeated-byte run for the buffer LZ encoder.
-local function repeatedBufferByteRun(value: buffer, position: number, maximum: number, lengthTotal: number): number
+function INTERNAL.Buffer.repeatedBufferByteRun(value: buffer, position: number, maximum: number, lengthTotal: number): number
 	if position >= lengthTotal then return 0 end
 	local byte = buffer.readu8(value, position)
 	local length = 1
@@ -2988,10 +2962,10 @@ local function repeatedBufferByteRun(value: buffer, position: number, maximum: n
 end
 
 -- Compresses repeated buffer runs/back-references with the configurable LZ matcher.
-local function bufferLZPacket(value: buffer, options: Options?): buffer
-	local searchDepth = bufferIntegerOption(options and options.BufferSearchDepth, 32, 1, 192, "BufferSearchDepth")
-	local window = bufferIntegerOption(options and options.BufferWindowSize, 32767, 32, 65535, "BufferWindowSize")
-	local maxMatch = bufferIntegerOption(options and options.BufferMaxMatch, 66, 3, 66, "BufferMaxMatch")
+function INTERNAL.Buffer.bufferLZPacket(value: buffer, options: Options?): buffer
+	local searchDepth = INTERNAL.Buffer.bufferIntegerOption(options and options.BufferSearchDepth, 32, 1, 192, "BufferSearchDepth")
+	local window = INTERNAL.Buffer.bufferIntegerOption(options and options.BufferWindowSize, 32767, 32, 65535, "BufferWindowSize")
+	local maxMatch = INTERNAL.Buffer.bufferIntegerOption(options and options.BufferMaxMatch, 66, 3, 66, "BufferMaxMatch")
 	local lengthTotal = buffer.len(value)
 	local body = newWriter(math.max(16, lengthTotal))
 	local index: {[number]: {number}} = {}
@@ -3011,8 +2985,8 @@ local function bufferLZPacket(value: buffer, options: Options?): buffer
 	end
 
 	while position < lengthTotal do
-		local runLength = repeatedBufferByteRun(value, position, maxMatch, lengthTotal)
-		local distance, matchLength = indexedBufferMatch(value, position, lengthTotal, index, window, maxMatch, searchDepth)
+		local runLength = INTERNAL.Buffer.repeatedBufferByteRun(value, position, maxMatch, lengthTotal)
+		local distance, matchLength = INTERNAL.Buffer.indexedBufferMatch(value, position, lengthTotal, index, window, maxMatch, searchDepth)
 		local useRun = runLength >= 3 and runLength >= matchLength
 		local consume = useRun and runLength or matchLength
 		if consume >= 3 then
@@ -3024,13 +2998,13 @@ local function bufferLZPacket(value: buffer, options: Options?): buffer
 				writeByte(body, 192 + matchLength - 3)
 				writeVarUInt(body, distance)
 			end
-			for p = position, position + consume - 1 do addBufferIndex(index, value, p, lengthTotal) end
+			for p = position, position + consume - 1 do INTERNAL.Buffer.addBufferIndex(index, value, p, lengthTotal) end
 			position += consume
 			literalStart = position
 		else
 			if literalLength == 0 then literalStart = position end
 			literalLength += 1
-			addBufferIndex(index, value, position, lengthTotal)
+			INTERNAL.Buffer.addBufferIndex(index, value, position, lengthTotal)
 			position += 1
 			if literalLength == 128 then flushLiteral(); literalStart = position end
 		end
@@ -3039,151 +3013,151 @@ local function bufferLZPacket(value: buffer, options: Options?): buffer
 	flushLiteral()
 	local packedBody = finish(body)
 	local w = newWriter(buffer.len(packedBody) + 4)
-	writeBufferV2Header(w, BUF.LZ, lengthTotal)
-	appendRawBuffer(w, packedBody)
+	INTERNAL.Buffer.writeBufferV2Header(w, BUF.LZ, lengthTotal)
+	INTERNAL.Buffer.appendRawBuffer(w, packedBody)
 	return finish(w)
 end
 
 -- Chooses the smallest sparse-family representation while reusing one source-buffer analysis pass.
-local function bestSparseBuffer(value: buffer, raw: buffer, analysis: BufferAnalysis?): buffer
-	local info = analysis or analyzeBuffer(value)
+function INTERNAL.Buffer.bestSparseBuffer(value: buffer, raw: buffer, analysis: BufferAnalysis?): buffer
+	local info = analysis or INTERNAL.Buffer.analyzeBuffer(value)
 	local best = raw
 
-	local zeroRunBytes = estimatedZeroRunBytes(info)
+	local zeroRunBytes = INTERNAL.Buffer.estimatedZeroRunBytes(info)
 	if zeroRunBytes ~= nil and zeroRunBytes < buffer.len(best) then
-		best = chooseSmaller(best, bufferZeroRunPacket(value, info))
+		best = INTERNAL.String.chooseSmaller(best, INTERNAL.Buffer.bufferZeroRunPacket(value, info))
 	end
 
-	local power2Bytes = estimatedSparsePower2Bytes(info)
+	local power2Bytes = INTERNAL.Buffer.estimatedSparsePower2Bytes(info)
 	if power2Bytes ~= nil and power2Bytes < buffer.len(best) then
-		best = chooseSmaller(best, bufferSparsePower2Packet(value, info))
+		best = INTERNAL.String.chooseSmaller(best, INTERNAL.Buffer.bufferSparsePower2Packet(value, info))
 	end
 
-	local sparseBytes = estimatedSparseZeroBytes(info)
+	local sparseBytes = INTERNAL.Buffer.estimatedSparseZeroBytes(info)
 	if sparseBytes ~= nil and sparseBytes < buffer.len(best) then
-		best = chooseSmaller(best, bufferSparseZeroPacket(value, info))
+		best = INTERNAL.String.chooseSmaller(best, INTERNAL.Buffer.bufferSparseZeroPacket(value, info))
 	end
 
 	return best
 end
 
 -- Chooses the smaller low/high nibble representation without rescanning codec eligibility.
-local function bestNibbleBuffer(value: buffer, raw: buffer, analysis: BufferAnalysis?): buffer
-	local info = analysis or analyzeBuffer(value)
+function INTERNAL.Buffer.bestNibbleBuffer(value: buffer, raw: buffer, analysis: BufferAnalysis?): buffer
+	local info = analysis or INTERNAL.Buffer.analyzeBuffer(value)
 	local best = raw
 
-	local lowBytes = estimatedNibbleBytes(info, false)
+	local lowBytes = INTERNAL.Buffer.estimatedNibbleBytes(info, false)
 	if lowBytes ~= nil and lowBytes < buffer.len(best) then
-		best = chooseSmaller(best, bufferNibblePacket(value, false, info))
+		best = INTERNAL.String.chooseSmaller(best, INTERNAL.Buffer.bufferNibblePacket(value, false, info))
 	end
 
-	local highBytes = estimatedNibbleBytes(info, true)
+	local highBytes = INTERNAL.Buffer.estimatedNibbleBytes(info, true)
 	if highBytes ~= nil and highBytes < buffer.len(best) then
-		best = chooseSmaller(best, bufferNibblePacket(value, true, info))
+		best = INTERNAL.String.chooseSmaller(best, INTERNAL.Buffer.bufferNibblePacket(value, true, info))
 	end
 
 	return best
 end
 
 -- Runs buffer codec selection with lazy raw fallback allocation and one shared analysis pass.
-local function compressBufferBase(value: buffer, options: Options?): buffer
-	if options and options.CompressBuffers == false then return bufferRawCandidate(value) end
+function INTERNAL.Buffer.compressBufferBase(value: buffer, options: Options?): buffer
+	if options and options.CompressBuffers == false then return INTERNAL.Buffer.bufferRawCandidate(value) end
 
 	local length = buffer.len(value)
 	-- Framed codecs are bounded on decode; oversized inputs stay lossless via raw passthrough/escape.
-	if length > MAX_DECODE_BUFFER_BYTES then return bufferRawCandidate(value) end
+	if length > MAX_DECODE_BUFFER_BYTES then return INTERNAL.Buffer.bufferRawCandidate(value) end
 
 	local strategy: BufferStrategy = options and options.BufferStrategy or "Auto"
 	if strategy == "Raw" then
-		return bufferRawCandidate(value)
+		return INTERNAL.Buffer.bufferRawCandidate(value)
 	elseif strategy == "LZ" then
-		local candidate = bufferLZPacket(value, options)
+		local candidate = INTERNAL.Buffer.bufferLZPacket(value, options)
 		if options and options.AllowExpansion == true then return candidate end
-		local rawBytes = bufferRawCandidateByteLength(value)
-		return buffer.len(candidate) <= rawBytes and candidate or bufferRawCandidate(value)
+		local rawBytes = INTERNAL.Buffer.bufferRawCandidateByteLength(value)
+		return buffer.len(candidate) <= rawBytes and candidate or INTERNAL.Buffer.bufferRawCandidate(value)
 	elseif strategy == "Sparse" then
-		local analysis = analyzeBuffer(value)
-		local rawBytes = bufferRawCandidateByteLength(value)
+		local analysis = INTERNAL.Buffer.analyzeBuffer(value)
+		local rawBytes = INTERNAL.Buffer.bufferRawCandidateByteLength(value)
 		local best: buffer? = nil
 		local bestBytes = rawBytes
 
-		local zeroRunBytes = estimatedZeroRunBytes(analysis)
+		local zeroRunBytes = INTERNAL.Buffer.estimatedZeroRunBytes(analysis)
 		if zeroRunBytes ~= nil and zeroRunBytes < bestBytes then
-			best = bufferZeroRunPacket(value, analysis)
+			best = INTERNAL.Buffer.bufferZeroRunPacket(value, analysis)
 			bestBytes = best and buffer.len(best) or bestBytes
 		end
-		local power2Bytes = estimatedSparsePower2Bytes(analysis)
+		local power2Bytes = INTERNAL.Buffer.estimatedSparsePower2Bytes(analysis)
 		if power2Bytes ~= nil and power2Bytes < bestBytes then
-			best = bufferSparsePower2Packet(value, analysis)
+			best = INTERNAL.Buffer.bufferSparsePower2Packet(value, analysis)
 			bestBytes = best and buffer.len(best) or bestBytes
 		end
-		local sparseBytes = estimatedSparseZeroBytes(analysis)
+		local sparseBytes = INTERNAL.Buffer.estimatedSparseZeroBytes(analysis)
 		if sparseBytes ~= nil and sparseBytes < bestBytes then
-			best = bufferSparseZeroPacket(value, analysis)
+			best = INTERNAL.Buffer.bufferSparseZeroPacket(value, analysis)
 			bestBytes = best and buffer.len(best) or bestBytes
 		end
-		return best or bufferRawCandidate(value)
+		return best or INTERNAL.Buffer.bufferRawCandidate(value)
 	elseif strategy == "Nibble" then
-		local analysis = analyzeBuffer(value)
-		local rawBytes = bufferRawCandidateByteLength(value)
+		local analysis = INTERNAL.Buffer.analyzeBuffer(value)
+		local rawBytes = INTERNAL.Buffer.bufferRawCandidateByteLength(value)
 		local best: buffer? = nil
 		local bestBytes = rawBytes
 
-		local lowBytes = estimatedNibbleBytes(analysis, false)
+		local lowBytes = INTERNAL.Buffer.estimatedNibbleBytes(analysis, false)
 		if lowBytes ~= nil and lowBytes < bestBytes then
-			best = bufferNibblePacket(value, false, analysis)
+			best = INTERNAL.Buffer.bufferNibblePacket(value, false, analysis)
 			bestBytes = best and buffer.len(best) or bestBytes
 		end
-		local highBytes = estimatedNibbleBytes(analysis, true)
+		local highBytes = INTERNAL.Buffer.estimatedNibbleBytes(analysis, true)
 		if highBytes ~= nil and highBytes < bestBytes then
-			best = bufferNibblePacket(value, true, analysis)
+			best = INTERNAL.Buffer.bufferNibblePacket(value, true, analysis)
 		end
-		return best or bufferRawCandidate(value)
+		return best or INTERNAL.Buffer.bufferRawCandidate(value)
 	elseif strategy == "Auto" then
-		local analysis = analyzeBuffer(value)
-		local rawBytes = bufferRawCandidateByteLength(value)
+		local analysis = INTERNAL.Buffer.analyzeBuffer(value)
+		local rawBytes = INTERNAL.Buffer.bufferRawCandidateByteLength(value)
 		local best: buffer? = nil
 		local bestBytes = rawBytes
 
-		local fillBytes = estimatedFillBytes(analysis)
+		local fillBytes = INTERNAL.Buffer.estimatedFillBytes(analysis)
 		if fillBytes ~= nil and fillBytes < bestBytes then
-			best = bufferFillPacket(value, analysis)
+			best = INTERNAL.Buffer.bufferFillPacket(value, analysis)
 			bestBytes = best and buffer.len(best) or bestBytes
 		end
 
-		local zeroRunBytes = estimatedZeroRunBytes(analysis)
+		local zeroRunBytes = INTERNAL.Buffer.estimatedZeroRunBytes(analysis)
 		if zeroRunBytes ~= nil and zeroRunBytes < bestBytes then
-			best = bufferZeroRunPacket(value, analysis)
+			best = INTERNAL.Buffer.bufferZeroRunPacket(value, analysis)
 			bestBytes = best and buffer.len(best) or bestBytes
 		end
 
-		local power2Bytes = estimatedSparsePower2Bytes(analysis)
+		local power2Bytes = INTERNAL.Buffer.estimatedSparsePower2Bytes(analysis)
 		if power2Bytes ~= nil and power2Bytes < bestBytes then
-			best = bufferSparsePower2Packet(value, analysis)
+			best = INTERNAL.Buffer.bufferSparsePower2Packet(value, analysis)
 			bestBytes = best and buffer.len(best) or bestBytes
 		end
 
-		local sparseBytes = estimatedSparseZeroBytes(analysis)
+		local sparseBytes = INTERNAL.Buffer.estimatedSparseZeroBytes(analysis)
 		if sparseBytes ~= nil and sparseBytes < bestBytes then
-			best = bufferSparseZeroPacket(value, analysis)
+			best = INTERNAL.Buffer.bufferSparseZeroPacket(value, analysis)
 			bestBytes = best and buffer.len(best) or bestBytes
 		end
 
-		local lowNibbleBytes = estimatedNibbleBytes(analysis, false)
+		local lowNibbleBytes = INTERNAL.Buffer.estimatedNibbleBytes(analysis, false)
 		if lowNibbleBytes ~= nil and lowNibbleBytes < bestBytes then
-			best = bufferNibblePacket(value, false, analysis)
+			best = INTERNAL.Buffer.bufferNibblePacket(value, false, analysis)
 			bestBytes = best and buffer.len(best) or bestBytes
 		end
 
-		local highNibbleBytes = estimatedNibbleBytes(analysis, true)
+		local highNibbleBytes = INTERNAL.Buffer.estimatedNibbleBytes(analysis, true)
 		if highNibbleBytes ~= nil and highNibbleBytes < bestBytes then
-			best = bufferNibblePacket(value, true, analysis)
+			best = INTERNAL.Buffer.bufferNibblePacket(value, true, analysis)
 			bestBytes = best and buffer.len(best) or bestBytes
 		end
 
-		local minimum = bufferIntegerOption(options and options.BufferMinLength, 6, 3, MAX_DECODE_BUFFER_BYTES, "BufferMinLength")
+		local minimum = INTERNAL.Buffer.bufferIntegerOption(options and options.BufferMinLength, 6, 3, MAX_DECODE_BUFFER_BYTES, "BufferMinLength")
 		if analysis.Length >= minimum then
-			local lz = bufferLZPacket(value, options)
+			local lz = INTERNAL.Buffer.bufferLZPacket(value, options)
 			local lzBytes = buffer.len(lz)
 			if lzBytes < bestBytes then
 				best = lz
@@ -3191,22 +3165,22 @@ local function compressBufferBase(value: buffer, options: Options?): buffer
 			end
 		end
 
-		return best or bufferRawCandidate(value)
+		return best or INTERNAL.Buffer.bufferRawCandidate(value)
 	end
 
 	fail("invalid BufferStrategy " .. tostring(strategy), 2)
-	return bufferRawCandidate(value)
+	return INTERNAL.Buffer.bufferRawCandidate(value)
 end
 
 -- Compresses a buffer using the selected buffer codec, then applies Huffman only when profitable.
 function Compression.CompressBuffer(value: buffer, options: Options?): buffer
 	if typeof(value) ~= "buffer" then fail("CompressBuffer expects buffer", 2) end
-	local best = compressBufferBase(value, options)
+	local best = INTERNAL.Buffer.compressBufferBase(value, options)
 	local entropyData = maybeHuffman(best, options)
 	return entropyData
 end
 -- Reconstructs an LZ buffer body after its decoded length has been validated.
-local function decompressLZBufferBody(r: Reader, originalLength: number): buffer
+function INTERNAL.Buffer.decompressLZBufferBody(r: Reader, originalLength: number): buffer
 	local result = buffer.create(originalLength)
 	local outputPosition = 0
 
@@ -3242,7 +3216,7 @@ local function decompressLZBufferBody(r: Reader, originalLength: number): buffer
 end
 
 -- Verifies that unused bits in the final sparse bitmap byte are zero.
-local function validateBitmapPadding(bitmap: buffer, originalLength: number, label: string)
+function INTERNAL.Buffer.validateBitmapPadding(bitmap: buffer, originalLength: number, label: string)
 	local bitmapBytes = buffer.len(bitmap)
 	if bitmapBytes == 0 or originalLength % 8 == 0 then return end
 	local usedBits = originalLength % 8
@@ -3254,27 +3228,27 @@ local function validateBitmapPadding(bitmap: buffer, originalLength: number, lab
 end
 
 -- Counts present entries in a sparse bitmap up to the declared decoded length.
-local function countBitmapBits(bitmap: buffer, originalLength: number): number
+function INTERNAL.Buffer.countBitmapBits(bitmap: buffer, originalLength: number): number
 	local count = 0
 	for i = 0, originalLength - 1 do
-		if bitmapHas(bitmap, i) then count += 1 end
+		if INTERNAL.Buffer.bitmapHas(bitmap, i) then count += 1 end
 	end
 	return count
 end
 
 -- Restores a SparseZero frame from its bitmap and non-zero payload.
-local function decompressSparseZero(r: Reader, originalLength: number): buffer
+function INTERNAL.Buffer.decompressSparseZero(r: Reader, originalLength: number): buffer
 	local bitmapBytes = math.ceil(originalLength / 8)
 	if r.Position + bitmapBytes > r.Length then fail("truncated sparse-zero bitmap", 2) end
 
 	local bitmap = buffer.create(bitmapBytes)
 	if bitmapBytes > 0 then buffer.copy(bitmap, 0, r.Buffer, r.Position, bitmapBytes) end
 	r.Position += bitmapBytes
-	validateBitmapPadding(bitmap, originalLength, "sparse-zero")
+	INTERNAL.Buffer.validateBitmapPadding(bitmap, originalLength, "sparse-zero")
 
 	local result = buffer.create(originalLength)
 	for i = 0, originalLength - 1 do
-		if bitmapHas(bitmap, i) then
+		if INTERNAL.Buffer.bitmapHas(bitmap, i) then
 			if r.Position >= r.Length then fail("truncated sparse-zero values", 2) end
 			buffer.writeu8(result, i, readByte(r))
 		end
@@ -3285,16 +3259,16 @@ local function decompressSparseZero(r: Reader, originalLength: number): buffer
 end
 
 -- Decodes the bitmap form of SparsePower2 after validating bitmap and exponent sizes.
-local function decodeSparsePower2Bitmap(r: Reader, originalLength: number): buffer
+function INTERNAL.Buffer.decodeSparsePower2Bitmap(r: Reader, originalLength: number): buffer
 	local bitmapBytes = math.ceil(originalLength / 8)
 	if r.Position + bitmapBytes > r.Length then fail("truncated sparse-power2 bitmap", 2) end
 
 	local bitmap = buffer.create(bitmapBytes)
 	if bitmapBytes > 0 then buffer.copy(bitmap, 0, r.Buffer, r.Position, bitmapBytes) end
 	r.Position += bitmapBytes
-	validateBitmapPadding(bitmap, originalLength, "sparse-power2")
+	INTERNAL.Buffer.validateBitmapPadding(bitmap, originalLength, "sparse-power2")
 
-	local nonZeroCount = countBitmapBits(bitmap, originalLength)
+	local nonZeroCount = INTERNAL.Buffer.countBitmapBits(bitmap, originalLength)
 	local requiredExponentBytes = math.ceil(nonZeroCount * 3 / 8)
 	if r.Position + requiredExponentBytes ~= r.Length then
 		fail("sparse-power2 exponent payload length mismatch", 2)
@@ -3302,7 +3276,7 @@ local function decodeSparsePower2Bitmap(r: Reader, originalLength: number): buff
 
 	local result = buffer.create(originalLength)
 	for i = 0, originalLength - 1 do
-		if bitmapHas(bitmap, i) then
+		if INTERNAL.Buffer.bitmapHas(bitmap, i) then
 			local exponent = readBits(r, 3)
 			buffer.writeu8(result, i, 2 ^ exponent)
 		end
@@ -3314,8 +3288,8 @@ local function decodeSparsePower2Bitmap(r: Reader, originalLength: number): buff
 	return result
 end
 
--- Detects the ambiguous short SparsePower2 bitmap form emitted by older compatible versions.
-local function shortSparsePower2LooksLegacyBitmap(r: Reader, originalLength: number): boolean
+-- Detects the short SparsePower2 bitmap form when compact 7-bit entries cannot represent the frame.
+function INTERNAL.Buffer.shortSparsePower2UsesBitmapForm(r: Reader, originalLength: number): boolean
 	local bitmapBytes = math.ceil(originalLength / 8)
 	local remaining = r.Length - r.Position
 	if remaining < bitmapBytes then return false end
@@ -3330,19 +3304,17 @@ local function shortSparsePower2LooksLegacyBitmap(r: Reader, originalLength: num
 		if bit32.band(last, 255 - validMask) ~= 0 then return false end
 	end
 
-	local nonZeroCount = countBitmapBits(bitmap, originalLength)
+	local nonZeroCount = INTERNAL.Buffer.countBitmapBits(bitmap, originalLength)
 	if nonZeroCount <= 7 then return false end
 	local expected = bitmapBytes + math.ceil(nonZeroCount * 3 / 8)
 	return remaining == expected
 end
 
--- Restores compact or bitmap SparsePower2 frames, including legacy recovery.
-local function decompressSparsePower2(r: Reader, originalLength: number): buffer
-	-- v2.3.1 could emit the bitmap form for short buffers when there were
-	-- more than seven non-zero power-of-two entries. The old short decoder
-	-- could confuse that payload with the compact 7-bit-entry form.
-	if originalLength <= 14 and shortSparsePower2LooksLegacyBitmap(r, originalLength) then
-		return decodeSparsePower2Bitmap(r, originalLength)
+-- Restores compact or bitmap SparsePower2 frames.
+function INTERNAL.Buffer.decompressSparsePower2(r: Reader, originalLength: number): buffer
+	-- Short buffers use bitmap form when there are more than seven non-zero entries.
+	if originalLength <= 14 and INTERNAL.Buffer.shortSparsePower2UsesBitmapForm(r, originalLength) then
+		return INTERNAL.Buffer.decodeSparsePower2Bitmap(r, originalLength)
 	end
 
 	local result = buffer.create(originalLength)
@@ -3362,11 +3334,11 @@ local function decompressSparsePower2(r: Reader, originalLength: number): buffer
 		return result
 	end
 
-	return decodeSparsePower2Bitmap(r, originalLength)
+	return INTERNAL.Buffer.decodeSparsePower2Bitmap(r, originalLength)
 end
 
 -- Restores low-nibble or high-nibble packed buffer bytes.
-local function decompressNibbleBuffer(r: Reader, originalLength: number, high: boolean): buffer
+function INTERNAL.Buffer.decompressNibbleBuffer(r: Reader, originalLength: number, high: boolean): buffer
 	local packedBytes = math.ceil(originalLength / 2)
 	if r.Position + packedBytes ~= r.Length then fail("nibble buffer length mismatch", 2) end
 	local result = buffer.create(originalLength)
@@ -3394,7 +3366,7 @@ local function decompressNibbleBuffer(r: Reader, originalLength: number, high: b
 end
 
 -- Reconstructs the omitted contiguous zero run in a ZeroRun frame.
-local function decompressZeroRunBuffer(data: buffer): buffer
+function INTERNAL.Buffer.decompressZeroRunBuffer(data: buffer): buffer
 	if buffer.len(data) < 2 or buffer.readu8(data, 0) ~= FMT.COMPACT_BUFFER_ZERO_RUN_MAGIC then
 		fail("invalid zero-run buffer frame", 2)
 	end
@@ -3438,7 +3410,7 @@ function Compression.DecompressBuffer(data: buffer): buffer
 	if buffer.len(data) == 0 then return buffer.create(0) end
 	local first = buffer.readu8(data, 0)
 	if first == FMT.COMPACT_BUFFER_ZERO_RUN_MAGIC then
-		return decompressZeroRunBuffer(data)
+		return INTERNAL.Buffer.decompressZeroRunBuffer(data)
 	end
 	if not hasCompressionBufferMagic(data) then
 		local raw = buffer.create(buffer.len(data))
@@ -3454,7 +3426,7 @@ function Compression.DecompressBuffer(data: buffer): buffer
 	if buffer.len(data) < 2 then fail("truncated compressed buffer", 2) end
 
 	local r = newReader(data)
-	local mode, originalLength, isV2 = readBufferHeader(r)
+	local mode, originalLength = INTERNAL.Buffer.readBufferHeader(r)
 
 	if mode == BUF.RAW then
 		if r.Position + originalLength ~= r.Length then fail("raw buffer length mismatch", 2) end
@@ -3471,19 +3443,18 @@ function Compression.DecompressBuffer(data: buffer): buffer
 		if originalLength > 0 then buffer.fill(result, 0, byte, originalLength) end
 		return result
 	elseif mode == BUF.LZ then
-		return decompressLZBufferBody(r, originalLength)
+		return INTERNAL.Buffer.decompressLZBufferBody(r, originalLength)
 	end
 
-	if not isV2 then fail("legacy buffer cannot use v2 mode", 2) end
 
 	if mode == BUF.SPARSE_ZERO then
-		return decompressSparseZero(r, originalLength)
+		return INTERNAL.Buffer.decompressSparseZero(r, originalLength)
 	elseif mode == BUF.SPARSE_POWER2 then
-		return decompressSparsePower2(r, originalLength)
+		return INTERNAL.Buffer.decompressSparsePower2(r, originalLength)
 	elseif mode == BUF.NIBBLE_LOW then
-		return decompressNibbleBuffer(r, originalLength, false)
+		return INTERNAL.Buffer.decompressNibbleBuffer(r, originalLength, false)
 	elseif mode == BUF.NIBBLE_HIGH then
-		return decompressNibbleBuffer(r, originalLength, true)
+		return INTERNAL.Buffer.decompressNibbleBuffer(r, originalLength, true)
 	end
 
 	fail("invalid compressed buffer mode", 2)
@@ -3525,67 +3496,500 @@ function Compression.BufferMode(data: buffer): string
 	return BUF.ModeBase(data)
 end
 
--- Reports the buffer frame generation used by a packed buffer.
-function Compression.BufferFrameVersion(data: buffer): number?
-	if typeof(data) ~= "buffer" then return nil end
-	if isHuffmanFrame(data) then return 4 end
-	if buffer.len(data) == 0 then return 0 end
-	local first = buffer.readu8(data, 0)
-	if first == FMT.COMPACT_BUFFER_ZERO_RUN_MAGIC then return 5 end
-	if not hasCompressionBufferMagic(data) then return 0 end
-	if first == FMT.COMPACT_BUFFER_RAW_MAGIC then return 3 end
-	if buffer.len(data) < 2 then return nil end
-	return buffer.readu8(data, 1) >= BUF.V2_FLAG and 2 or 1
-end
-
--- Compresses an original buffer once and returns size, mode, savings, and frame statistics.
-function Compression.BufferStats(value: buffer, options: Options?): {[string]: any}
-	if typeof(value) ~= "buffer" then fail("BufferStats expects buffer", 2) end
-	local data = Compression.CompressBuffer(value, options)
-	local rawBytes = buffer.len(value)
-	local bytes = buffer.len(data)
-	local delta = rawBytes - bytes
-	local saved = math.max(0, delta)
-	local expanded = math.max(0, -delta)
-	return {
-		Mode = Compression.BufferMode(data),
-		FrameVersion = Compression.BufferFrameVersion(data),
-		Bytes = bytes,
-		Bits = bytes * 8,
-		UsefulBits = bytes * 8,
-		PhysicalBits = bytes * 8,
-		SavedBits = saved * 8,
-		ExpandedBits = expanded * 8,
-		BitSavingsPercent = rawBytes > 0 and math.max(0, delta / rawBytes * 100) or 0,
-		RawBytes = rawBytes,
-		SavedBytes = saved,
-		ExpandedBytes = expanded,
-		ByteDelta = delta,
-		SavingsPercent = rawBytes > 0 and math.max(0, delta / rawBytes * 100) or 0,
-		ExpansionPercent = rawBytes > 0 and math.max(0, -delta / rawBytes * 100) or 0,
-		Ratio = rawBytes > 0 and bytes / rawBytes or 1,
-		IsSmaller = bytes < rawBytes,
-		Data = data,
+do
+	local BUFFER_TYPE_BYTES: {[string]: number} = {
+		i8 = 1,
+		u8 = 1,
+		i16 = 2,
+		u16 = 2,
+		i32 = 4,
+		u32 = 4,
+		f32 = 4,
+		f64 = 8,
 	}
-end
 
--- Prints a formatted BufferStats report for an original uncompressed buffer.
-function Compression.PrintBufferStats(value: buffer, options: Options?): {[string]: any}
-	local stats = Compression.BufferStats(value, options)
-	print("========== Compression v" .. Compression.VERSION .. " Buffer Stats ==========")
-	print("Mode:", stats.Mode, "| Frame:", "v" .. tostring(stats.FrameVersion or "?"))
-	print("Raw:", Compression.FormatBytes(stats.RawBytes))
-	print("Encoded:", Compression.FormatBytes(stats.Bytes))
-	if stats.ExpandedBytes > 0 then
-		print("Expanded:", Compression.FormatBytes(stats.ExpandedBytes))
-		print(string.format("Expansion: %.2f%%", stats.ExpansionPercent))
-	else
-		print("Saved:", Compression.FormatBytes(stats.SavedBytes))
-		print(string.format("Savings: %.2f%%", stats.SavingsPercent))
+	local function normalizeBufferTypeName(name: string): string
+		local lower = string.lower(name)
+		if lower == "int8" then return "i8" end
+		if lower == "uint8" then return "u8" end
+		if lower == "int16" then return "i16" end
+		if lower == "uint16" then return "u16" end
+		if lower == "int32" then return "i32" end
+		if lower == "uint32" then return "u32" end
+		if lower == "float32" then return "f32" end
+		if lower == "float64" or lower == "double" then return "f64" end
+		return lower
 	end
-	print(string.format("Ratio: %.4fx", stats.Ratio))
-	print("======================================================")
-	return stats
+
+	local function addBufferBreakdownEntry(entries: {any}, typeName: string, bytes: number, count: number?)
+		if bytes <= 0 then return end
+		local canonical = normalizeBufferTypeName(typeName)
+		for _, entry in ipairs(entries) do
+			if entry.Type == canonical then
+				entry.Bytes += bytes
+				if count ~= nil then entry.Count = (entry.Count or 0) + count end
+				return
+			end
+		end
+		entries[#entries + 1] = {
+			Type = canonical,
+			Bytes = bytes,
+			Count = count,
+		}
+	end
+
+	local function normalizedBufferLayout(value: buffer, layout: BufferLayout?): ({any}, number)
+		local rawBytes = buffer.len(value)
+		local entries: {any} = {}
+		if layout == nil then
+			if rawBytes > 0 then addBufferBreakdownEntry(entries, "raw/unknown", rawBytes, nil) end
+			return entries, rawBytes
+		end
+
+		local usesOffsets = false
+		for _, item in ipairs(layout) do
+			if typeof(item) == "table" and item.Offset ~= nil then
+				usesOffsets = true
+				break
+			end
+		end
+
+		if usesOffsets then
+			local cursor = 0
+			local described = 0
+
+			for index, item in ipairs(layout) do
+				if typeof(item) ~= "table" or typeof(item.Type) ~= "string" or item.Type == "" then
+					fail("BufferLayout entry #" .. tostring(index) .. " requires Type", 3)
+				end
+
+				local canonical = normalizeBufferTypeName(item.Type)
+				local width = BUFFER_TYPE_BYTES[canonical]
+				local count = item.Count
+				local bytes = item.Bytes
+				local offset = item.Offset
+
+				if offset == nil then
+					offset = cursor
+				elseif typeof(offset) ~= "number" or offset < 0 or offset % 1 ~= 0 then
+					fail("BufferLayout Offset must be a non-negative integer", 3)
+				end
+
+				if count ~= nil then
+					if typeof(count) ~= "number" or count < 0 or count % 1 ~= 0 then
+						fail("BufferLayout Count must be a non-negative integer", 3)
+					end
+				end
+
+				-- Offset + a fixed-width type with no explicit Bytes/Count means one value.
+				if bytes == nil then
+					if width ~= nil and count ~= nil then
+						bytes = width * count
+					elseif width ~= nil then
+						count = 1
+						bytes = width
+					else
+						fail("BufferLayout entry requires Bytes, or Count for a fixed-width type", 3)
+					end
+				end
+
+				if typeof(bytes) ~= "number" or bytes < 0 or bytes % 1 ~= 0 then
+					fail("BufferLayout Bytes must be a non-negative integer", 3)
+				end
+
+				if width ~= nil then
+					if count ~= nil and bytes ~= width * count then
+						fail(canonical .. " uses " .. tostring(width) .. " byte(s) per value", 3)
+					end
+					if count == nil and bytes % width == 0 then count = bytes / width end
+				end
+
+				if offset < cursor then
+					fail("BufferLayout entries overlap or are not in ascending Offset order", 3)
+				end
+
+				if offset > rawBytes or offset + bytes > rawBytes then
+					fail("BufferLayout entry exceeds the source buffer length", 3)
+				end
+
+				local gap = offset - cursor
+				if gap > 0 then
+					entries[#entries + 1] = {
+						Type = "padding",
+						Bytes = gap,
+						Count = nil,
+					}
+					described += gap
+				end
+
+				if bytes > 0 then
+					entries[#entries + 1] = {
+						Type = canonical,
+						Bytes = bytes,
+						Count = count,
+					}
+					described += bytes
+				end
+
+				cursor = offset + bytes
+			end
+
+			if cursor < rawBytes then
+				local trailing = rawBytes - cursor
+				entries[#entries + 1] = {
+					Type = "padding",
+					Bytes = trailing,
+					Count = nil,
+				}
+				described += trailing
+			end
+
+			return entries, described
+		end
+
+		local used = 0
+		for index, item in ipairs(layout) do
+			if typeof(item) ~= "table" or typeof(item.Type) ~= "string" or item.Type == "" then
+				fail("BufferLayout entry #" .. tostring(index) .. " requires Type", 3)
+			end
+			local canonical = normalizeBufferTypeName(item.Type)
+			local width = BUFFER_TYPE_BYTES[canonical]
+			local count = item.Count
+			local bytes = item.Bytes
+			if count ~= nil then
+				if typeof(count) ~= "number" or count < 0 or count % 1 ~= 0 then
+					fail("BufferLayout Count must be a non-negative integer", 3)
+				end
+			end
+			if bytes == nil then
+				if width == nil or count == nil then
+					fail("BufferLayout entry requires Bytes, or Count for a fixed-width type", 3)
+				end
+				bytes = width * count
+			end
+			if typeof(bytes) ~= "number" or bytes < 0 or bytes % 1 ~= 0 then
+				fail("BufferLayout Bytes must be a non-negative integer", 3)
+			end
+			if width ~= nil then
+				if count ~= nil and bytes ~= width * count then
+					fail(canonical .. " uses " .. tostring(width) .. " byte(s) per value", 3)
+				end
+				if count == nil and bytes % width == 0 then count = bytes / width end
+			end
+			used += bytes
+			if used > rawBytes then
+				fail("BufferLayout describes more bytes than the source buffer contains", 3)
+			end
+			addBufferBreakdownEntry(entries, canonical, bytes, count)
+		end
+
+		if used < rawBytes then
+			addBufferBreakdownEntry(entries, "unclassified", rawBytes - used, nil)
+		end
+		return entries, used
+	end
+
+	local function bufferHeaderAndPayload(data: buffer, source: buffer?): {[string]: any}
+		local total = buffer.len(data)
+		if total == 0 then
+			return {HeaderBytes = 0, PayloadBytes = 0, PaddingBits = 0}
+		end
+
+		local first = buffer.readu8(data, 0)
+		if first == FMT.COMPACT_BUFFER_RAW_MAGIC then
+			return {HeaderBytes = 1, PayloadBytes = math.max(0, total - 1), PaddingBits = 0}
+		end
+		if first == FMT.COMPACT_BUFFER_ZERO_RUN_MAGIC then
+			if total < 2 then return {HeaderBytes = total, PayloadBytes = 0, PaddingBits = 0} end
+			local r = newReader(data)
+			readByte(r)
+			local control = readByte(r)
+			if control == 0xFF then
+				readVarUInt(r)
+				readVarUInt(r)
+			end
+			return {HeaderBytes = r.Position, PayloadBytes = total - r.Position, PaddingBits = 0}
+		end
+		if first ~= FMT.COMPACT_BUFFER_MAGIC then
+			return {HeaderBytes = 0, PayloadBytes = total, PaddingBits = 0}
+		end
+
+		local r = newReader(data)
+		local mode, originalLength = INTERNAL.Buffer.readBufferHeader(r)
+		local paddingBits = 0
+		if source ~= nil and buffer.len(source) == originalLength then
+			local analysis = INTERNAL.Buffer.analyzeBuffer(source)
+			if mode == BUF.NIBBLE_LOW or mode == BUF.NIBBLE_HIGH then
+				paddingBits = originalLength % 2 == 1 and 4 or 0
+			elseif mode == BUF.SPARSE_ZERO then
+				paddingBits = math.ceil(originalLength / 8) * 8 - originalLength
+			elseif mode == BUF.SPARSE_POWER2 then
+				if originalLength <= 14 and analysis.NonZeroCount <= 7 then
+					local payloadBits = (total - r.Position) * 8
+					paddingBits = math.max(0, payloadBits - analysis.NonZeroCount * 7)
+				else
+					local bitmapPadding = math.ceil(originalLength / 8) * 8 - originalLength
+					local exponentPadding = math.ceil(analysis.NonZeroCount * 3 / 8) * 8 - analysis.NonZeroCount * 3
+					paddingBits = bitmapPadding + exponentPadding
+				end
+			end
+		end
+		return {
+			HeaderBytes = r.Position,
+			PayloadBytes = total - r.Position,
+			PaddingBits = paddingBits,
+			Mode = mode,
+		}
+	end
+
+	local function huffmanFrameBreakdown(data: buffer): {[string]: any}
+		local total = buffer.len(data)
+		if not isHuffmanFrame(data) then return bufferHeaderAndPayload(data, nil) end
+		local r = newReader(data)
+		readByte(r)
+		readByte(r)
+		readByte(r)
+		readByte(r)
+		local originalLength = readVarUInt(r)
+		local symbolCount = readVarUInt(r)
+		if symbolCount == 0 then
+			return {HeaderBytes = r.Position, PayloadBytes = 0, PaddingBits = 0, OriginalBytes = originalLength}
+		end
+		if symbolCount == 1 then
+			readByte(r)
+			return {HeaderBytes = r.Position, PayloadBytes = 0, PaddingBits = 0, OriginalBytes = originalLength}
+		end
+		for _ = 1, symbolCount do
+			readByte(r)
+			readByte(r)
+		end
+		local bitLength = readVarUInt(r)
+		local payloadBytes = math.ceil(bitLength / 8)
+		return {
+			HeaderBytes = r.Position,
+			PayloadBytes = math.min(payloadBytes, math.max(0, total - r.Position)),
+			PaddingBits = math.max(0, payloadBytes * 8 - bitLength),
+			OriginalBytes = originalLength,
+		}
+	end
+
+	local function byteCountText(bytes: number): string
+		if bytes == 1 then return "1 byte" end
+		return tostring(bytes) .. " bytes"
+	end
+
+	local function paddingText(bits: number): string
+		return byteCountText(bits / 8) .. " (" .. tostring(bits) .. " bits)"
+	end
+
+	local BufferStageMethods = {}
+	BufferStageMethods.__index = BufferStageMethods
+
+	local function stageTrack(self: any, typeName: string, bytes: number, count: number?)
+		addBufferBreakdownEntry(self._Layout, typeName, bytes, count)
+	end
+
+	local function stageWriteNumber(self: any, typeName: string, size: number, writeFunction: any, value: number): any
+		if typeof(value) ~= "number" then fail(typeName .. " value must be a number", 3) end
+		local w: Writer = self._Writer
+		ensureCapacity(w, size)
+		writeFunction(w.Buffer, w.Position, value)
+		w.Position += size
+		w.UsedBits += size * 8
+		stageTrack(self, typeName, size, 1)
+		return self
+	end
+
+	function BufferStageMethods:WriteI8(value: number): any
+		return stageWriteNumber(self, "i8", 1, buffer.writei8, value)
+	end
+
+	function BufferStageMethods:WriteU8(value: number): any
+		return stageWriteNumber(self, "u8", 1, buffer.writeu8, value)
+	end
+
+	function BufferStageMethods:WriteI16(value: number): any
+		return stageWriteNumber(self, "i16", 2, buffer.writei16, value)
+	end
+
+	function BufferStageMethods:WriteU16(value: number): any
+		return stageWriteNumber(self, "u16", 2, buffer.writeu16, value)
+	end
+
+	function BufferStageMethods:WriteI32(value: number): any
+		return stageWriteNumber(self, "i32", 4, buffer.writei32, value)
+	end
+
+	function BufferStageMethods:WriteU32(value: number): any
+		return stageWriteNumber(self, "u32", 4, buffer.writeu32, value)
+	end
+
+	function BufferStageMethods:WriteF32(value: number): any
+		return stageWriteNumber(self, "f32", 4, buffer.writef32, value)
+	end
+
+	function BufferStageMethods:WriteF64(value: number): any
+		return stageWriteNumber(self, "f64", 8, buffer.writef64, value)
+	end
+
+	function BufferStageMethods:WriteString(value: string): any
+		if typeof(value) ~= "string" then fail("WriteString expects string", 3) end
+		local w: Writer = self._Writer
+		local length = #value
+		ensureCapacity(w, length)
+		if length > 0 then buffer.writestring(w.Buffer, w.Position, value) end
+		w.Position += length
+		w.UsedBits += length * 8
+		stageTrack(self, "string", length, 1)
+		return self
+	end
+
+	function BufferStageMethods:WriteBuffer(value: buffer, label: string?): any
+		if typeof(value) ~= "buffer" then fail("WriteBuffer expects buffer", 3) end
+		local w: Writer = self._Writer
+		local length = buffer.len(value)
+		ensureCapacity(w, length)
+		if length > 0 then buffer.copy(w.Buffer, w.Position, value, 0, length) end
+		w.Position += length
+		w.UsedBits += length * 8
+		stageTrack(self, label or "buffer", length, 1)
+		return self
+	end
+
+	function BufferStageMethods:Pad(bytes: number, value: number?): any
+		if typeof(bytes) ~= "number" or bytes < 0 or bytes % 1 ~= 0 then
+			fail("Pad bytes must be a non-negative integer", 3)
+		end
+		local fillValue = value or 0
+		if typeof(fillValue) ~= "number" or fillValue < 0 or fillValue > 255 or fillValue % 1 ~= 0 then
+			fail("Pad value must be an integer from 0 to 255", 3)
+		end
+		local w: Writer = self._Writer
+		ensureCapacity(w, bytes)
+		if bytes > 0 then buffer.fill(w.Buffer, w.Position, fillValue, bytes) end
+		w.Position += bytes
+		w.UsedBits += bytes * 8
+		stageTrack(self, "padding", bytes, bytes)
+		return self
+	end
+
+	function BufferStageMethods:Bytes(): number
+		return self._Writer.Position
+	end
+
+	function BufferStageMethods:ToBuffer(): buffer
+		return finish(self._Writer)
+	end
+
+	function BufferStageMethods:Layout(): BufferLayout
+		local result: BufferLayout = table.create(#self._Layout)
+		for i, item in ipairs(self._Layout) do
+			result[i] = {Type = item.Type, Bytes = item.Bytes, Count = item.Count}
+		end
+		return result
+	end
+
+	function BufferStageMethods:Stats(options: Options?): {[string]: any}
+		return Compression.BufferStats(self:ToBuffer(), options, self:Layout())
+	end
+
+	function BufferStageMethods:PrintStats(options: Options?): {[string]: any}
+		return Compression.PrintBufferStats(self:ToBuffer(), options, self:Layout())
+	end
+
+	-- Creates a typed buffer writer that remembers exactly which writes consumed the source bytes.
+	function Compression.BufferStage(capacity: number?): BufferStageObject
+		local initial = capacity or DEFAULT_CAPACITY
+		if typeof(initial) ~= "number" or initial < 0 or initial % 1 ~= 0 then
+			fail("BufferStage capacity must be a non-negative integer", 2)
+		end
+		return setmetatable({
+			_Writer = newWriter(math.max(1, initial)),
+			_Layout = {},
+		}, BufferStageMethods) :: any
+	end
+
+	-- Compresses an original buffer once and returns size, mode, savings, codec allocation, and optional typed source layout.
+	function Compression.BufferStats(value: buffer, options: Options?, layout: BufferLayout?): {[string]: any}
+		if typeof(value) ~= "buffer" then fail("BufferStats expects buffer", 2) end
+		local baseData = INTERNAL.Buffer.compressBufferBase(value, options)
+		local data, entropyApplied = maybeHuffman(baseData, options)
+		local rawBytes = buffer.len(value)
+		local bytes = buffer.len(data)
+		local delta = rawBytes - bytes
+		local saved = math.max(0, delta)
+		local expanded = math.max(0, -delta)
+		local beforeBreakdown, describedBytes = normalizedBufferLayout(value, layout)
+		local baseBreakdown = bufferHeaderAndPayload(baseData, value)
+		local encodedBreakdown = if entropyApplied then huffmanFrameBreakdown(data) else baseBreakdown
+
+		return {
+			Mode = Compression.BufferMode(data),
+			Bytes = bytes,
+			Bits = bytes * 8,
+			UsefulBits = bytes * 8 - (encodedBreakdown.PaddingBits or 0),
+			PhysicalBits = bytes * 8,
+			PaddingBits = encodedBreakdown.PaddingBits or 0,
+			SavedBits = saved * 8,
+			ExpandedBits = expanded * 8,
+			BitSavingsPercent = rawBytes > 0 and math.max(0, delta / rawBytes * 100) or 0,
+			RawBytes = rawBytes,
+			BeforeBytes = rawBytes,
+			BeforeBreakdown = beforeBreakdown,
+			DescribedBytes = describedBytes,
+			UnclassifiedBytes = math.max(0, rawBytes - describedBytes),
+			BaseBytes = buffer.len(baseData),
+			BaseHeaderBytes = baseBreakdown.HeaderBytes or 0,
+			BasePayloadBytes = baseBreakdown.PayloadBytes or 0,
+			BasePaddingBits = baseBreakdown.PaddingBits or 0,
+			EncodedHeaderBytes = encodedBreakdown.HeaderBytes or 0,
+			EncodedPayloadBytes = encodedBreakdown.PayloadBytes or 0,
+			EncodedPaddingBits = encodedBreakdown.PaddingBits or 0,
+			EntropyApplied = entropyApplied,
+			SavedBytes = saved,
+			ExpandedBytes = expanded,
+			ByteDelta = delta,
+			SavingsPercent = rawBytes > 0 and math.max(0, delta / rawBytes * 100) or 0,
+			ExpansionPercent = rawBytes > 0 and math.max(0, -delta / rawBytes * 100) or 0,
+			Ratio = rawBytes > 0 and bytes / rawBytes or 1,
+			IsSmaller = bytes < rawBytes,
+			Data = data,
+		}
+	end
+
+	-- Prints source-type allocation, encoded frame allocation, and the existing buffer compression totals.
+	function Compression.PrintBufferStats(value: buffer, options: Options?, layout: BufferLayout?): {[string]: any}
+		local stats = Compression.BufferStats(value, options, layout)
+		print("========== Compression v" .. Compression.VERSION .. " Buffer Stats ==========")
+		print("Before Bytes:", stats.BeforeBytes)
+		for _, entry in ipairs(stats.BeforeBreakdown) do
+			local countText = entry.Count ~= nil and (" (" .. tostring(entry.Count) .. " value" .. (entry.Count == 1 and "" or "s") .. ")") or ""
+			print("  " .. entry.Type .. ":", byteCountText(entry.Bytes) .. countText)
+		end
+		print("Mode:", stats.Mode)
+		print("Raw:", Compression.FormatBytes(stats.RawBytes))
+		print("Encoded:", Compression.FormatBytes(stats.Bytes))
+		print("Encoded Breakdown:")
+		print("  Header:", byteCountText(stats.EncodedHeaderBytes))
+		print("  Payload:", byteCountText(stats.EncodedPayloadBytes))
+		print("  Padding:", paddingText(stats.EncodedPaddingBits))
+		if stats.EntropyApplied then
+			print("Before Huffman:", Compression.FormatBytes(stats.BaseBytes))
+			print("  Base Header:", byteCountText(stats.BaseHeaderBytes))
+			print("  Base Payload:", byteCountText(stats.BasePayloadBytes))
+			print("  Base Padding:", paddingText(stats.BasePaddingBits))
+		end
+		if stats.ExpandedBytes > 0 then
+			print("Expanded:", Compression.FormatBytes(stats.ExpandedBytes))
+			print(string.format("Expansion: %.2f%%", stats.ExpansionPercent))
+		else
+			print("Saved:", Compression.FormatBytes(stats.SavedBytes))
+			print(string.format("Savings: %.2f%%", stats.SavingsPercent))
+		end
+		print(string.format("Ratio: %.4fx", stats.Ratio))
+		print("======================================================")
+		return stats
+	end
 end
 
 -- Attempts to decompress a buffer and returns success, result, and error text instead of throwing.
@@ -3624,14 +4028,14 @@ function Compression.DecompressBufferSmart(data: buffer, compressed: boolean): b
 end
 
 -- Handles quantize.
-local function quantize(value: number, minimum: number, maximum: number, bits: number): number
+function INTERNAL.SchemaCore.quantize(value: number, minimum: number, maximum: number, bits: number): number
 	local levels = 2 ^ bits - 1
 	local alpha = math.clamp((value - minimum) / (maximum - minimum), 0, 1)
 	return math.floor(alpha * levels + 0.5)
 end
 
 -- Handles dequantize.
-local function dequantize(value: number, minimum: number, maximum: number, bits: number): number
+function INTERNAL.SchemaCore.dequantize(value: number, minimum: number, maximum: number, bits: number): number
 	return minimum + (value / (2 ^ bits - 1)) * (maximum - minimum)
 end
 
@@ -3641,7 +4045,7 @@ local writeDateTimePayload: (Writer, any) -> ()
 local readDateTimePayload: (Reader) -> any
 
 -- Handles validate.
-local function validate(descriptor: Descriptor, value: any, path: string)
+function INTERNAL.SchemaCore.validate(descriptor: Descriptor, value: any, path: string)
 	if value == nil then
 		if descriptor.Optional or descriptor.Default ~= nil then return end
 		fail(path .. " is required", 3)
@@ -3666,15 +4070,15 @@ local function validate(descriptor: Descriptor, value: any, path: string)
 	elseif kind == "DateTime" and actual ~= "DateTime" then fail(path .. " expected DateTime", 3)
 	elseif kind == "Array" then
 		if actual ~= "table" or not isArray(value) then fail(path .. " expected array", 3) end
-		for i, item in ipairs(value) do validate(descriptor.Item :: Descriptor, item, path .. "[" .. tostring(i) .. "]") end
+		for i, item in ipairs(value) do INTERNAL.SchemaCore.validate(descriptor.Item :: Descriptor, item, path .. "[" .. tostring(i) .. "]") end
 	elseif kind == "Object" then
 		if actual ~= "table" then fail(path .. " expected table", 3) end
-		for name, child in pairs(descriptor.Fields :: {[string]: Descriptor}) do validate(child, value[name], path .. "." .. name) end
+		for name, child in pairs(descriptor.Fields :: {[string]: Descriptor}) do INTERNAL.SchemaCore.validate(child, value[name], path .. "." .. name) end
 	end
 end
 
 -- Handles descriptor uses bit stream.
-local function descriptorUsesBitStream(kind: string): boolean
+function INTERNAL.SchemaCore.descriptorUsesBitStream(kind: string): boolean
 	-- Objects can continue an existing bit stream because their children
 	-- perform their own alignment when necessary. This preserves bit packing
 	-- for nested Bool/optional fields instead of forcing a padding byte.
@@ -3691,10 +4095,10 @@ local function descriptorUsesBitStream(kind: string): boolean
 end
 
 -- Handles write descriptor.
-local function writeDescriptor(w: Writer, descriptor: Descriptor, value: any)
+function INTERNAL.SchemaCore.writeDescriptor(w: Writer, descriptor: Descriptor, value: any)
 	local kind = descriptor.Kind
 	local o = descriptor.Options
-	if not descriptorUsesBitStream(kind) then flushBits(w) end
+	if not INTERNAL.SchemaCore.descriptorUsesBitStream(kind) then flushBits(w) end
 	if kind == "Bool" then writeBits(w, value and 1 or 0, 1)
 	elseif kind == "UInt" then INTERNAL.writeAdaptiveUIntBits(w, value)
 	elseif kind == "Int" then INTERNAL.writeAdaptiveIntBits(w, value)
@@ -3751,11 +4155,11 @@ local function writeDescriptor(w: Writer, descriptor: Descriptor, value: any)
 		writeVarUInt(w, value.Number)
 	elseif kind == "DateTime" then
 		writeDateTimePayload(w, value)
-	elseif kind == "Quantized" then writeBits(w, quantize(value, o.Minimum, o.Maximum, o.Bits), o.Bits)
+	elseif kind == "Quantized" then writeBits(w, INTERNAL.SchemaCore.quantize(value, o.Minimum, o.Maximum, o.Bits), o.Bits)
 	elseif kind == "QuantizedVector3" then
-		writeBits(w, quantize(value.X, o.Minimum.X, o.Maximum.X, o.Bits), o.Bits)
-		writeBits(w, quantize(value.Y, o.Minimum.Y, o.Maximum.Y, o.Bits), o.Bits)
-		writeBits(w, quantize(value.Z, o.Minimum.Z, o.Maximum.Z, o.Bits), o.Bits)
+		writeBits(w, INTERNAL.SchemaCore.quantize(value.X, o.Minimum.X, o.Maximum.X, o.Bits), o.Bits)
+		writeBits(w, INTERNAL.SchemaCore.quantize(value.Y, o.Minimum.Y, o.Maximum.Y, o.Bits), o.Bits)
+		writeBits(w, INTERNAL.SchemaCore.quantize(value.Z, o.Minimum.Z, o.Maximum.Z, o.Bits), o.Bits)
 	elseif kind == "Array" then
 		INTERNAL.writeAdaptiveUIntBits(w, #value)
 		local itemDescriptor = descriptor.Item :: Descriptor
@@ -3763,9 +4167,9 @@ local function writeDescriptor(w: Writer, descriptor: Descriptor, value: any)
 			if itemDescriptor.Default ~= nil then
 				local defaulted = FMT.DeepEqual(item, itemDescriptor.Default)
 				writeBits(w, defaulted and 0 or 1, 1)
-				if not defaulted then writeDescriptor(w, itemDescriptor, item) end
+				if not defaulted then INTERNAL.SchemaCore.writeDescriptor(w, itemDescriptor, item) end
 			else
-				writeDescriptor(w, itemDescriptor, item)
+				INTERNAL.SchemaCore.writeDescriptor(w, itemDescriptor, item)
 			end
 		end
 	elseif kind == "Object" then
@@ -3785,88 +4189,44 @@ local function writeDescriptor(w: Writer, descriptor: Descriptor, value: any)
 				if child.Default ~= nil then
 					local defaulted = FMT.DeepEqual(childValue, child.Default)
 					writeBits(w, defaulted and 0 or 1, 1)
-					if not defaulted then writeDescriptor(w, child, childValue) end
+					if not defaulted then INTERNAL.SchemaCore.writeDescriptor(w, child, childValue) end
 				else
-					writeDescriptor(w, child, childValue)
+					INTERNAL.SchemaCore.writeDescriptor(w, child, childValue)
 				end
 			end
 		end
 	end
 end
 
--- Handles read descriptor.
-local function readDescriptor(r: Reader, descriptor: Descriptor, binaryVersion: number?): any
+-- Reads a descriptor using the current bit-first schema representation.
+function INTERNAL.SchemaCore.readDescriptor(r: Reader, descriptor: Descriptor): any
 	local kind = descriptor.Kind
 	local o = descriptor.Options
-	if not descriptorUsesBitStream(kind) then alignReader(r) end
+	if not INTERNAL.SchemaCore.descriptorUsesBitStream(kind) then alignReader(r) end
 	if kind == "Bool" then return readBits(r, 1) == 1
-	elseif kind == "UInt" then
-		if binaryVersion ~= nil and binaryVersion >= 28 then return INTERNAL.readAdaptiveUIntBits(r) end
-		return readVarUInt(r)
-	elseif kind == "Int" then
-		if binaryVersion ~= nil and binaryVersion >= 28 then return INTERNAL.readAdaptiveIntBits(r) end
-		return readVarInt(r)
+	elseif kind == "UInt" then return INTERNAL.readAdaptiveUIntBits(r)
+	elseif kind == "Int" then return INTERNAL.readAdaptiveIntBits(r)
 	elseif kind == "Float" then return readF64(r)
-	elseif kind == "String" then
-		if binaryVersion ~= nil and binaryVersion >= 29 then return INTERNAL.readStringBits(r) end
-		return readStringRaw(r)
+	elseif kind == "String" then return INTERNAL.readStringBits(r)
 	elseif kind == "CompressedString" then
-		if binaryVersion ~= nil and binaryVersion >= 29 then
-			local length = INTERNAL.readAdaptiveUIntBits(r)
-			if length > MAX_DECODE_STRING_BYTES then fail("compressed string exceeds decode limit", 2) end
-			return Compression.DecompressString(INTERNAL.readBufferBits(r, length))
-		end
-		local length = readVarUInt(r)
-		alignReader(r)
-		if r.Position + length > r.Length then fail("truncated compressed string", 2) end
-		local slice = buffer.create(length)
-		buffer.copy(slice, 0, r.Buffer, r.Position, length)
-		r.Position += length
-		return Compression.DecompressString(slice)
+		local length = INTERNAL.readAdaptiveUIntBits(r)
+		if length > MAX_DECODE_STRING_BYTES then fail("compressed string exceeds decode limit", 2) end
+		return Compression.DecompressString(INTERNAL.readBufferBits(r, length))
 	elseif kind == "Buffer" then
-		if binaryVersion ~= nil and binaryVersion >= 29 then
-			local length = INTERNAL.readAdaptiveUIntBits(r)
-			if length > MAX_DECODE_BUFFER_BYTES then fail("compressed buffer exceeds decode limit", 2) end
-			return Compression.DecompressBuffer(INTERNAL.readBufferBits(r, length))
-		end
-		local length = readVarUInt(r)
-		alignReader(r)
-		if r.Position + length > r.Length then fail("truncated compressed buffer", 2) end
-		local slice = buffer.create(length)
-		buffer.copy(slice, 0, r.Buffer, r.Position, length)
-		r.Position += length
-		return Compression.DecompressBuffer(slice)
+		local length = INTERNAL.readAdaptiveUIntBits(r)
+		if length > MAX_DECODE_BUFFER_BYTES then fail("compressed buffer exceeds decode limit", 2) end
+		return Compression.DecompressBuffer(INTERNAL.readBufferBits(r, length))
 	elseif kind == "Vector2" then return Vector2.new(readF64(r), readF64(r))
 	elseif kind == "Vector3" then return Vector3.new(readF64(r), readF64(r), readF64(r))
 	elseif kind == "Color3" then
 		alignReader(r)
-		if binaryVersion ~= nil and binaryVersion <= 21 then
-			return Color3.fromRGB(
-				readByte(r),
-				readByte(r),
-				readByte(r)
-			)
-		end
-
 		local mode = readByte(r)
 		if mode == 0 then
-			return Color3.fromRGB(
-				readByte(r),
-				readByte(r),
-				readByte(r)
-			)
+			return Color3.fromRGB(readByte(r), readByte(r), readByte(r))
 		elseif mode == 1 then
-			return Color3.new(
-				readF32(r),
-				readF32(r),
-				readF32(r)
-			)
+			return Color3.new(readF32(r), readF32(r), readF32(r))
 		elseif mode == 2 then
-			return Color3.new(
-				readF64(r),
-				readF64(r),
-				readF64(r)
-			)
+			return Color3.new(readF64(r), readF64(r), readF64(r))
 		end
 		fail("invalid schema Color3 mode", 2)
 	elseif kind == "CFrame" then
@@ -3874,75 +4234,37 @@ local function readDescriptor(r: Reader, descriptor: Descriptor, binaryVersion: 
 		for i = 1, 12 do components[i] = readF64(r) end
 		return CFrame.new(table.unpack(components))
 	elseif kind == "UDim" then
-		return UDim.new(
-			readNumberPayload(r),
-			readVarInt(r)
-		)
+		return UDim.new(readNumberPayload(r), readVarInt(r))
 	elseif kind == "UDim2" then
-		return UDim2.new(
-			readNumberPayload(r),
-			readVarInt(r),
-			readNumberPayload(r),
-			readVarInt(r)
-		)
+		return UDim2.new(readNumberPayload(r), readVarInt(r), readNumberPayload(r), readVarInt(r))
 	elseif kind == "Rect" then
-		return Rect.new(
-			readNumberPayload(r),
-			readNumberPayload(r),
-			readNumberPayload(r),
-			readNumberPayload(r)
-		)
+		return Rect.new(readNumberPayload(r), readNumberPayload(r), readNumberPayload(r), readNumberPayload(r))
 	elseif kind == "NumberRange" then
-		return NumberRange.new(
-			readNumberPayload(r),
-			readNumberPayload(r)
-		)
-	elseif kind == "BrickColor" then
-		return BrickColor.new(
-			readVarUInt(r)
-		)
-	elseif kind == "DateTime" then
-		return readDateTimePayload(r)
-	elseif kind == "Quantized" then return dequantize(readBits(r, o.Bits), o.Minimum, o.Maximum, o.Bits)
+		return NumberRange.new(readNumberPayload(r), readNumberPayload(r))
+	elseif kind == "BrickColor" then return BrickColor.new(readVarUInt(r))
+	elseif kind == "DateTime" then return readDateTimePayload(r)
+	elseif kind == "Quantized" then return INTERNAL.SchemaCore.dequantize(readBits(r, o.Bits), o.Minimum, o.Maximum, o.Bits)
 	elseif kind == "QuantizedVector3" then
 		return Vector3.new(
-			dequantize(readBits(r, o.Bits), o.Minimum.X, o.Maximum.X, o.Bits),
-			dequantize(readBits(r, o.Bits), o.Minimum.Y, o.Maximum.Y, o.Bits),
-			dequantize(readBits(r, o.Bits), o.Minimum.Z, o.Maximum.Z, o.Bits)
+			INTERNAL.SchemaCore.dequantize(readBits(r, o.Bits), o.Minimum.X, o.Maximum.X, o.Bits),
+			INTERNAL.SchemaCore.dequantize(readBits(r, o.Bits), o.Minimum.Y, o.Maximum.Y, o.Bits),
+			INTERNAL.SchemaCore.dequantize(readBits(r, o.Bits), o.Minimum.Z, o.Maximum.Z, o.Bits)
 		)
 	elseif kind == "Array" then
-		local count = if binaryVersion ~= nil and binaryVersion >= 29 then INTERNAL.readAdaptiveUIntBits(r) else readVarUInt(r)
-		if count < 0 or count % 1 ~= 0 then
-			fail("invalid schema array count", 2)
-		end
+		local count = INTERNAL.readAdaptiveUIntBits(r)
+		if count < 0 or count % 1 ~= 0 then fail("invalid schema array count", 2) end
 		local remaining = r.Length - r.Position
-		local hardLimit = math.max(
-			16,
-			remaining * 8 + 16
-		)
-		if count > MAX_DECODE_CONTAINER_ITEMS then
-			fail(
-				"schema array count exceeds decode limit",
-				2
-			)
-		end
-		if count > hardLimit then
-			fail(
-				"schema array count exceeds payload bounds",
-				2
-			)
-		end
+		local hardLimit = math.max(16, remaining * 8 + 16)
+		if count > MAX_DECODE_CONTAINER_ITEMS then fail("schema array count exceeds decode limit", 2) end
+		if count > hardLimit then fail("schema array count exceeds payload bounds", 2) end
 		local result = table.create(count)
 		local itemDescriptor = descriptor.Item :: Descriptor
 		for i = 1, count do
-			if binaryVersion ~= nil and binaryVersion >= 29 and itemDescriptor.Default ~= nil then
-				if readBits(r, 1) == 0 then
-					result[i] = FMT.CloneDefault(itemDescriptor.Default)
-				else
-					result[i] = readDescriptor(r, itemDescriptor, binaryVersion)
-				end
+			if itemDescriptor.Default ~= nil then
+				if readBits(r, 1) == 0 then result[i] = FMT.CloneDefault(itemDescriptor.Default)
+				else result[i] = INTERNAL.SchemaCore.readDescriptor(r, itemDescriptor) end
 			else
-				result[i] = readDescriptor(r, itemDescriptor, binaryVersion)
+				result[i] = INTERNAL.SchemaCore.readDescriptor(r, itemDescriptor)
 			end
 		end
 		return result
@@ -3956,11 +4278,11 @@ local function readDescriptor(r: Reader, descriptor: Descriptor, binaryVersion: 
 			local present = true
 			if child.Optional then present = readBits(r, 1) == 1 end
 			if present then
-				if binaryVersion ~= nil and binaryVersion >= 29 and child.Default ~= nil then
+				if child.Default ~= nil then
 					if readBits(r, 1) == 0 then result[name] = FMT.CloneDefault(child.Default)
-					else result[name] = readDescriptor(r, child, binaryVersion) end
+					else result[name] = INTERNAL.SchemaCore.readDescriptor(r, child) end
 				else
-					result[name] = readDescriptor(r, child, binaryVersion)
+					result[name] = INTERNAL.SchemaCore.readDescriptor(r, child)
 				end
 			end
 		end
@@ -3971,7 +4293,7 @@ local function readDescriptor(r: Reader, descriptor: Descriptor, binaryVersion: 
 end
 
 -- Handles write header.
-local function writeHeader(w: Writer, mode: number, schemaVersion: number?)
+function INTERNAL.SchemaCore.writeHeader(w: Writer, mode: number, schemaVersion: number?)
 	writeByte(w, FMT.MAGIC_A)
 	writeByte(w, FMT.MAGIC_B)
 	writeByte(w, FMT.VERSION)
@@ -3979,18 +4301,15 @@ local function writeHeader(w: Writer, mode: number, schemaVersion: number?)
 	writeVarUInt(w, schemaVersion or 1)
 end
 
--- Handles read header.
-local function readHeader(r: Reader, expectedMode: number): (number, number)
+-- Reads the current binary header.
+function INTERNAL.SchemaCore.readHeader(r: Reader, expectedMode: number): number
 	if readByte(r) ~= FMT.MAGIC_A or readByte(r) ~= FMT.MAGIC_B then fail("invalid binary header", 2) end
-	local binaryVersion = readByte(r)
-	if binaryVersion ~= FMT.VERSION and binaryVersion ~= 28 and binaryVersion ~= 27 and binaryVersion ~= 26 and binaryVersion ~= 25 and binaryVersion ~= 24 and binaryVersion ~= 23 and binaryVersion ~= 22 and binaryVersion ~= 21 and binaryVersion ~= 20 and binaryVersion ~= 19 and binaryVersion ~= 18 and binaryVersion ~= 17 and binaryVersion ~= 16 and binaryVersion ~= 15 and binaryVersion ~= 14 and binaryVersion ~= 13 and binaryVersion ~= 12 and binaryVersion ~= 11 and binaryVersion ~= 10 and binaryVersion ~= 9 and binaryVersion ~= 8 and binaryVersion ~= 7 and binaryVersion ~= 6 then fail("unsupported binary version", 2) end
-	r.LegacyVarUInt = binaryVersion == 6
+	if readByte(r) ~= FMT.VERSION then fail("unsupported binary version", 2) end
 	if readByte(r) ~= expectedMode then fail("unexpected binary mode", 2) end
-	return readVarUInt(r), binaryVersion
+	return readVarUInt(r)
 end
 
--- v2.9 schema frames remove the generic CP/version/mode bytes. The marker implies
--- binary v29 + mode, and the schema version continues directly in the bit stream.
+-- Schema frames use a compact mode marker followed by the schema version in the bit stream.
 FMT.WriteSchemaHeader = function(w: Writer, mode: number, schemaVersion: number?)
 	if mode == MODE.SCHEMA then writeByte(w, FMT.SCHEMA_V29_MAGIC)
 	elseif mode == MODE.DELTA then writeByte(w, FMT.DELTA_V29_MAGIC)
@@ -3998,19 +4317,15 @@ FMT.WriteSchemaHeader = function(w: Writer, mode: number, schemaVersion: number?
 	INTERNAL.writeAdaptiveUIntBits(w, (schemaVersion or 1) - 1)
 end
 
-FMT.ReadSchemaHeader = function(r: Reader, expectedMode: number): (number, number)
+FMT.ReadSchemaHeader = function(r: Reader, expectedMode: number): number
 	if r.Position >= r.Length then fail("unexpected end of schema payload", 3) end
-	local first = buffer.readu8(r.Buffer, r.Position)
 	local expectedMagic = expectedMode == MODE.SCHEMA and FMT.SCHEMA_V29_MAGIC or FMT.DELTA_V29_MAGIC
-	if first == expectedMagic then
-		r.Position += 1
-		return INTERNAL.readAdaptiveUIntBits(r) + 1, 29
-	end
-	return readHeader(r, expectedMode)
+	if readByte(r) ~= expectedMagic then fail("unsupported schema frame", 3) end
+	return INTERNAL.readAdaptiveUIntBits(r) + 1
 end
 
 -- Handles packet from buffer.
-local function packetFromBuffer(
+function INTERNAL.SchemaCore.packetFromBuffer(
 	data: buffer,
 	options: Options?,
 	schemaVersion: number?,
@@ -4150,7 +4465,7 @@ local function packetFromBuffer(
 end
 
 -- Handles packet from entropy.
-local function packetFromEntropy(
+function INTERNAL.SchemaCore.packetFromEntropy(
 	data: buffer,
 	options: Options?,
 	schemaVersion: number?,
@@ -4166,13 +4481,13 @@ local function packetFromEntropy(
 	local encoded, usedHuffman = maybeHuffman(data, options)
 	local packet
 	if usedHuffman then
-		packet = packetFromBuffer(encoded, options, schemaVersion, rawBits, buffer.len(encoded) * 8, 0)
+		packet = INTERNAL.SchemaCore.packetFromBuffer(encoded, options, schemaVersion, rawBits, buffer.len(encoded) * 8, 0)
 		packet.Entropy = "Huffman"
 		packet.EntropyBytesBefore = entropySourceBytes
 		packet.EntropyBytesAfter = buffer.len(encoded)
 		packet.EntropySavedBytes = math.max(0, entropySourceBytes - buffer.len(encoded))
 	else
-		packet = packetFromBuffer(data, options, schemaVersion, rawBits, usefulBits, paddingBits)
+		packet = INTERNAL.SchemaCore.packetFromBuffer(data, options, schemaVersion, rawBits, usefulBits, paddingBits)
 		packet.Entropy = "None"
 		packet.EntropyBytesBefore = buffer.len(data)
 		packet.EntropyBytesAfter = buffer.len(data)
@@ -4182,7 +4497,7 @@ local function packetFromEntropy(
 end
 
 -- Handles mark boolean packet.
-local function markBooleanPacket(packet: Packet): Packet
+function INTERNAL.SchemaCore.markBooleanPacket(packet: Packet): Packet
 	local rawBits = 8
 	local usefulBits = 1
 	local physicalBits = packet.Bytes * 8
@@ -4206,7 +4521,7 @@ local function markBooleanPacket(packet: Packet): Packet
 end
 
 -- Handles unwrap packet.
-local function unwrapPacket(packet: Packet | buffer, options: Options?): (buffer, number?)
+function INTERNAL.SchemaCore.unwrapPacket(packet: Packet | buffer, options: Options?): (buffer, number?)
 	if typeof(packet) == "buffer" then
 		local decoded = entropyDecodeIfNeeded(packet)
 		return decoded, nil
@@ -4221,7 +4536,7 @@ local function unwrapPacket(packet: Packet | buffer, options: Options?): (buffer
 end
 
 -- Handles raw value bits.
-local function rawValueBits(value: any): number
+function INTERNAL.SchemaCore.rawValueBits(value: any): number
 	local kind = typeof(value)
 	if kind == "boolean" then return 8
 	elseif kind == "number" then return 64
@@ -4239,7 +4554,7 @@ local function rawValueBits(value: any): number
 	elseif kind == "buffer" then return buffer.len(value) * 8
 	elseif kind == "table" then
 		local bits = 0
-		for key, child in pairs(value) do bits += rawValueBits(key); bits += rawValueBits(child) end
+		for key, child in pairs(value) do bits += INTERNAL.SchemaCore.rawValueBits(key); bits += INTERNAL.SchemaCore.rawValueBits(child) end
 		return bits
 	end
 	return 0
@@ -4254,7 +4569,7 @@ FMT.CloneBuffer = function(value: buffer): buffer
 end
 
 -- Handles raw auto byte count and codec.
-local function rawAutoByteCountAndCodec(value: any): (number?, string?)
+function INTERNAL.SchemaCore.rawAutoByteCountAndCodec(value: any): (number?, string?)
 	local kind = typeof(value)
 	if kind == "nil" then return 0, "PassthroughNil" end
 	if kind == "number" then return 8, "PassthroughNumber" end
@@ -4277,7 +4592,7 @@ local function rawAutoByteCountAndCodec(value: any): (number?, string?)
 end
 
 -- Handles raw auto data.
-local function rawAutoData(value: any): (buffer?, string?)
+function INTERNAL.SchemaCore.rawAutoData(value: any): (buffer?, string?)
 	local kind = typeof(value)
 
 	if kind == "nil" then
@@ -4360,7 +4675,7 @@ local function rawAutoData(value: any): (buffer?, string?)
 end
 
 -- Handles decode passthrough packet.
-local function decodePassthroughPacket(packet: Packet): (boolean, any)
+function INTERNAL.SchemaCore.decodePassthroughPacket(packet: Packet): (boolean, any)
 	if packet.Passthrough ~= true then return false, nil end
 	local codec = packet.Codec
 	local data = packet.Data
@@ -4448,7 +4763,7 @@ function Compression.Schema(definition: {[string]: Descriptor}, version: number?
 	for name, descriptor in pairs(definition) do
 		if typeof(name) ~= "string" then fail("schema field names must be strings", 2) end
 		if typeof(descriptor) ~= "table" or typeof(descriptor.Kind) ~= "string" then fail("invalid descriptor for field " .. name, 2) end
-		if descriptor.Default ~= nil then validate(descriptor, descriptor.Default, name .. ".Default") end
+		if descriptor.Default ~= nil then INTERNAL.SchemaCore.validate(descriptor, descriptor.Default, name .. ".Default") end
 		fields[#fields + 1] = {Name = name, Descriptor = descriptor}
 	end
 	table.sort(fields, function(a, b) return a.Name < b.Name end)
@@ -4477,22 +4792,22 @@ function Schema:Encode(value: {[string]: any}, options: Options?): Packet
 		if descriptor.Optional then writeBits(w, present and 1 or 0, 1)
 		elseif not present then fail("missing required field " .. field.Name, 2) end
 		if present then
-			validate(descriptor, fieldValue, field.Name)
+			INTERNAL.SchemaCore.validate(descriptor, fieldValue, field.Name)
 			if descriptor.Default ~= nil then
 				local defaulted = FMT.DeepEqual(fieldValue, descriptor.Default)
 				writeBits(w, defaulted and 0 or 1, 1)
-				if not defaulted then writeDescriptor(w, descriptor, fieldValue) end
+				if not defaulted then INTERNAL.SchemaCore.writeDescriptor(w, descriptor, fieldValue) end
 			else
-				writeDescriptor(w, descriptor, fieldValue)
+				INTERNAL.SchemaCore.writeDescriptor(w, descriptor, fieldValue)
 			end
 		end
 	end
 	local data = finish(w)
-	return packetFromEntropy(
+	return INTERNAL.SchemaCore.packetFromEntropy(
 		data,
 		options,
 		self.Version,
-		rawValueBits(value),
+		INTERNAL.SchemaCore.rawValueBits(value),
 		w.UsedBits,
 		w.PaddingBits
 	)
@@ -4500,9 +4815,9 @@ end
 
 -- Handles schema.
 function Schema:Decode(packet: Packet | buffer, options: Options?): {[string]: any}
-	local data, packetVersion = unwrapPacket(packet, options)
+	local data, packetVersion = INTERNAL.SchemaCore.unwrapPacket(packet, options)
 	local r = newReader(data)
-	local encodedVersion, binaryVersion = FMT.ReadSchemaHeader(r, MODE.SCHEMA)
+	local encodedVersion = FMT.ReadSchemaHeader(r, MODE.SCHEMA)
 	if packetVersion ~= nil and packetVersion ~= encodedVersion then fail("packet/schema version mismatch", 2) end
 	if encodedVersion ~= self.Version then fail("schema version mismatch", 2) end
 	local result = {}
@@ -4511,11 +4826,11 @@ function Schema:Decode(packet: Packet | buffer, options: Options?): {[string]: a
 		local present = true
 		if descriptor.Optional then present = readBits(r, 1) == 1 end
 		if present then
-			if binaryVersion >= 29 and descriptor.Default ~= nil then
+			if descriptor.Default ~= nil then
 				if readBits(r, 1) == 0 then result[field.Name] = FMT.CloneDefault(descriptor.Default)
-				else result[field.Name] = readDescriptor(r, descriptor, binaryVersion) end
+				else result[field.Name] = INTERNAL.SchemaCore.readDescriptor(r, descriptor) end
 			else
-				result[field.Name] = readDescriptor(r, descriptor, binaryVersion)
+				result[field.Name] = INTERNAL.SchemaCore.readDescriptor(r, descriptor)
 			end
 		end
 	end
@@ -4549,7 +4864,7 @@ function Schema:EncodeDelta(previous: {[string]: any}, current: {[string]: any},
 				)
 			end
 		else
-			validate(
+			INTERNAL.SchemaCore.validate(
 				descriptor,
 				value,
 				field.Name
@@ -4589,9 +4904,9 @@ function Schema:EncodeDelta(previous: {[string]: any}, current: {[string]: any},
 				if descriptor.Default ~= nil then
 					local defaulted = FMT.DeepEqual(value, descriptor.Default)
 					writeBits(w, defaulted and 0 or 1, 1)
-					if not defaulted then writeDescriptor(w, descriptor, value) end
+					if not defaulted then INTERNAL.SchemaCore.writeDescriptor(w, descriptor, value) end
 				else
-					writeDescriptor(w, descriptor, value)
+					INTERNAL.SchemaCore.writeDescriptor(w, descriptor, value)
 				end
 			end
 		end
@@ -4600,11 +4915,11 @@ function Schema:EncodeDelta(previous: {[string]: any}, current: {[string]: any},
 	local data =
 		finish(w)
 
-	return packetFromEntropy(
+	return INTERNAL.SchemaCore.packetFromEntropy(
 		data,
 		options,
 		self.Version,
-		rawValueBits(current),
+		INTERNAL.SchemaCore.rawValueBits(current),
 		w.UsedBits,
 		w.PaddingBits
 	)
@@ -4620,16 +4935,12 @@ function Schema:DecodeDelta(previous: {[string]: any}, packet: Packet | buffer, 
 	end
 
 	local data, packetVersion =
-		unwrapPacket(
+		INTERNAL.SchemaCore.unwrapPacket(
 			packet,
 			options
 		)
 	local r = newReader(data)
-	local version, binaryVersion =
-		FMT.ReadSchemaHeader(
-			r,
-			MODE.DELTA
-		)
+	local version = FMT.ReadSchemaHeader(r, MODE.DELTA)
 
 	if packetVersion ~= nil
 		and packetVersion ~= version then
@@ -4665,11 +4976,11 @@ function Schema:DecodeDelta(previous: {[string]: any}, packet: Packet | buffer, 
 			local present = readBits(r, 1) == 1
 
 			if present then
-				if binaryVersion >= 29 and descriptor.Default ~= nil then
+				if descriptor.Default ~= nil then
 					if readBits(r, 1) == 0 then result[field.Name] = FMT.CloneDefault(descriptor.Default)
-					else result[field.Name] = readDescriptor(r, descriptor, binaryVersion) end
+					else result[field.Name] = INTERNAL.SchemaCore.readDescriptor(r, descriptor) end
 				else
-					result[field.Name] = readDescriptor(r, descriptor, binaryVersion)
+					result[field.Name] = INTERNAL.SchemaCore.readDescriptor(r, descriptor)
 				end
 			else
 				if not descriptor.Optional and descriptor.Default == nil then
@@ -4709,7 +5020,7 @@ function Schema:DecodeDelta(previous: {[string]: any}, packet: Packet | buffer, 
 				)
 			end
 		else
-			validate(
+			INTERNAL.SchemaCore.validate(
 				field.Descriptor,
 				value,
 				field.Name
@@ -4750,18 +5061,18 @@ function Schema:AnalyzeBits(value: {[string]: any}): BitLayout
 		if descriptor.Optional then writeBits(w, present and 1 or 0, 1)
 		elseif not present then fail("missing required field " .. field.Name, 2) end
 		if present then
-			validate(descriptor, fieldValue, field.Name)
+			INTERNAL.SchemaCore.validate(descriptor, fieldValue, field.Name)
 			if descriptor.Default ~= nil then
 				defaulted = FMT.DeepEqual(fieldValue, descriptor.Default)
 				writeBits(w, defaulted and 0 or 1, 1)
-				if defaulted then defaultFields += 1 else writeDescriptor(w, descriptor, fieldValue) end
+				if defaulted then defaultFields += 1 else INTERNAL.SchemaCore.writeDescriptor(w, descriptor, fieldValue) end
 			else
-				writeDescriptor(w, descriptor, fieldValue)
+				INTERNAL.SchemaCore.writeDescriptor(w, descriptor, fieldValue)
 			end
 		end
 		local useful = w.UsedBits - usedBefore
 		local padding = w.PaddingBits - paddingBefore
-		local raw = present and rawValueBits(fieldValue) or 0
+		local raw = present and INTERNAL.SchemaCore.rawValueBits(fieldValue) or 0
 		if defaulted then elidedRawBits += raw end
 		local physical = useful + padding
 		local delta = raw - physical
@@ -4816,7 +5127,7 @@ function Schema:PrintBitLayout(value: {[string]: any}): BitLayout
 end
 
 -- Handles write compact string.
-local function writeCompactString(w: Writer, value: string, options: Options?, dictionary: DictionaryState)
+function INTERNAL.CompactAtom.writeCompactString(w: Writer, value: string, options: Options?, dictionary: DictionaryState)
 	local id = dictionary.Encode[value]
 	if id then
 		writeVarUInt(w, id * 2 + 1)
@@ -4832,7 +5143,7 @@ local function writeCompactString(w: Writer, value: string, options: Options?, d
 end
 
 -- Handles read compact string.
-local function readCompactString(r: Reader, dictionary: DictionaryState): string
+function INTERNAL.CompactAtom.readCompactString(r: Reader, dictionary: DictionaryState): string
 	local token = readVarUInt(r)
 	if token % 2 == 1 then
 		local id = (token - 1) / 2
@@ -4849,7 +5160,7 @@ local function readCompactString(r: Reader, dictionary: DictionaryState): string
 end
 
 -- Handles sorted map keys.
-local function sortedMapKeys(value: {[any]: any}): {any}
+function INTERNAL.CompactAtom.sortedMapKeys(value: {[any]: any}): {any}
 	local keys = {}
 	for key in pairs(value) do
 		local keyType = typeof(key)
@@ -4867,7 +5178,7 @@ local function sortedMapKeys(value: {[any]: any}): {any}
 end
 
 -- Handles classify array.
-local function classifyArray(value: {any}): string
+function INTERNAL.CompactAtom.classifyArray(value: {any}): string
 	local count = #value
 	if count == 0 then return "Mixed" end
 	local firstType = typeof(value[1])
@@ -4909,7 +5220,7 @@ local function classifyArray(value: {any}): string
 end
 
 -- Handles count scalar runs.
-local function countScalarRuns(value: {any}): number
+function INTERNAL.CompactAtom.countScalarRuns(value: {any}): number
 	if #value == 0 then return 0 end
 	local firstType = typeof(value[1])
 	if firstType ~= "boolean" and firstType ~= "number" and firstType ~= "string" then return #value end
@@ -4925,7 +5236,7 @@ local function countScalarRuns(value: {any}): number
 end
 
 -- Handles can use uint delta.
-local function canUseUIntDelta(value: {any}): boolean
+function INTERNAL.CompactAtom.canUseUIntDelta(value: {any}): boolean
 	if #value < 3 then return false end
 	local normalBytes = varUIntByteLength(value[1])
 	local deltaBytes = normalBytes
@@ -4939,7 +5250,7 @@ local function canUseUIntDelta(value: {any}): boolean
 end
 
 -- Handles can use int delta.
-local function canUseIntDelta(value: {any}): boolean
+function INTERNAL.CompactAtom.canUseIntDelta(value: {any}): boolean
 	if #value < 3 then return false end
 	local normalBytes = varIntByteLength(value[1])
 	local deltaBytes = normalBytes
@@ -4953,7 +5264,7 @@ local function canUseIntDelta(value: {any}): boolean
 end
 
 -- Handles power10 exponent.
-local function power10Exponent(value: number): number?
+function INTERNAL.CompactAtom.power10Exponent(value: number): number?
 	if value == 0 or value ~= value or value == math.huge or value == -math.huge then return nil end
 	local absolute = math.abs(value)
 	local exponent = math.floor(math.log10(absolute) + 0.5)
@@ -4963,7 +5274,7 @@ local function power10Exponent(value: number): number?
 end
 
 -- Handles decimal candidate.
-local function decimalCandidate(value: number): (number?, number?)
+function INTERNAL.CompactAtom.decimalCandidate(value: number): (number?, number?)
 	if value ~= value or value == math.huge or value == -math.huge then return nil, nil end
 	local bestInteger: number? = nil
 	local bestScale: number? = nil
@@ -4996,7 +5307,7 @@ writeNumberPayload = function(w: Writer, value: number)
 	elseif value == -1 then
 		writeByte(w, TAG.NEG_ONE)
 	else
-		local exponent = power10Exponent(value)
+		local exponent = INTERNAL.CompactAtom.power10Exponent(value)
 		if exponent ~= nil then
 			writeByte(w, TAG.POWER10)
 			local sign = value < 0 and 1 or 0
@@ -5008,7 +5319,7 @@ writeNumberPayload = function(w: Writer, value: number)
 			writeByte(w, TAG.INT)
 			writeVarInt(w, value)
 		else
-			local decimalInteger, decimalScale = decimalCandidate(value)
+			local decimalInteger, decimalScale = INTERNAL.CompactAtom.decimalCandidate(value)
 			local decimalBytes = if decimalInteger ~= nil and decimalScale ~= nil then 2 + varIntByteLength(decimalInteger) else math.huge
 			local float32Bytes = exactFloat32(value) and 5 or math.huge
 
@@ -5077,7 +5388,7 @@ readDateTimePayload = function(r: Reader): any
 end
 
 -- Handles write atom number.
-local function writeAtomNumber(w: Writer, value: number)
+function INTERNAL.CompactAtom.writeAtomNumber(w: Writer, value: number)
 	if value == 0 then
 		writeByte(w, ATOM.ZERO)
 	elseif value == 1 then
@@ -5085,7 +5396,7 @@ local function writeAtomNumber(w: Writer, value: number)
 	elseif value == -1 then
 		writeByte(w, ATOM.NEG_ONE)
 	else
-		local exponent = power10Exponent(value)
+		local exponent = INTERNAL.CompactAtom.power10Exponent(value)
 		if exponent ~= nil then
 			writeByte(w, ATOM.POWER10)
 			local sign = value < 0 and 1 or 0
@@ -5097,7 +5408,7 @@ local function writeAtomNumber(w: Writer, value: number)
 			writeByte(w, ATOM.INT)
 			writeVarInt(w, value)
 		else
-			local decimalInteger, decimalScale = decimalCandidate(value)
+			local decimalInteger, decimalScale = INTERNAL.CompactAtom.decimalCandidate(value)
 			local decimalBytes = if decimalInteger ~= nil and decimalScale ~= nil then 2 + varIntByteLength(decimalInteger) else math.huge
 			local float32Bytes = exactFloat32(value) and 5 or math.huge
 
@@ -5121,7 +5432,7 @@ local function writeAtomNumber(w: Writer, value: number)
 end
 
 -- Handles encode compact atom.
-local function encodeCompactAtom(value: any, options: Options?): buffer?
+function INTERNAL.CompactAtom.encodeCompactAtom(value: any, options: Options?): buffer?
 	local kind = typeof(value)
 	local w = newWriter(32)
 
@@ -5130,7 +5441,7 @@ local function encodeCompactAtom(value: any, options: Options?): buffer?
 	elseif kind == "boolean" then
 		writeByte(w, value and ATOM.TRUE or ATOM.FALSE)
 	elseif kind == "number" then
-		writeAtomNumber(w, value)
+		INTERNAL.CompactAtom.writeAtomNumber(w, value)
 	elseif kind == "string" then
 		writeByte(w, ATOM.STRING)
 		local packed = Compression.CompressString(value, options)
@@ -5150,7 +5461,7 @@ local function encodeCompactAtom(value: any, options: Options?): buffer?
 			writeByte(f, ATOM.VECTOR2_F32)
 			writeF32(f, value.X)
 			writeF32(f, value.Y)
-			return chooseSmaller(normal, finish(f))
+			return INTERNAL.String.chooseSmaller(normal, finish(f))
 		end
 
 		return normal
@@ -5169,7 +5480,7 @@ local function encodeCompactAtom(value: any, options: Options?): buffer?
 			writeF32(f, value.X)
 			writeF32(f, value.Y)
 			writeF32(f, value.Z)
-			return chooseSmaller(normal, finish(f))
+			return INTERNAL.String.chooseSmaller(normal, finish(f))
 		end
 
 		return normal
@@ -5212,7 +5523,7 @@ local function encodeCompactAtom(value: any, options: Options?): buffer?
 			local f = newWriter(49)
 			writeByte(f, ATOM.CFRAME_F32)
 			for i = 1, 12 do writeF32(f, components[i]) end
-			return chooseSmaller(normal, finish(f))
+			return INTERNAL.String.chooseSmaller(normal, finish(f))
 		end
 
 		return normal
@@ -5250,15 +5561,15 @@ local function encodeCompactAtom(value: any, options: Options?): buffer?
 end
 
 -- Handles is compact atom tag.
-local function isCompactAtomTag(tag: number): boolean
+function INTERNAL.CompactAtom.isCompactAtomTag(tag: number): boolean
 	return tag >= ATOM.NIL and tag <= ATOM.DATETIME
 end
 
 -- Handles decode compact atom.
-local function decodeCompactAtom(data: buffer): (boolean, any)
+function INTERNAL.CompactAtom.decodeCompactAtom(data: buffer): (boolean, any)
 	if buffer.len(data) < 1 then return false, nil end
 	local first = buffer.readu8(data, 0)
-	if not isCompactAtomTag(first) then return false, nil end
+	if not INTERNAL.CompactAtom.isCompactAtomTag(first) then return false, nil end
 
 	local r = newReader(data)
 	local tag = readByte(r)
@@ -5819,8 +6130,8 @@ end
 -- Handles compact write array.
 function INTERNAL.compactWriteArray(w: Writer, value: {any}, options: Options?)
 	local count = #value
-	local arrayKind = (not options or options.HomogeneousArrays ~= false) and classifyArray(value) or "Mixed"
-	local runCount = (not options or options.RunLengthArrays ~= false) and countScalarRuns(value) or count
+	local arrayKind = (not options or options.HomogeneousArrays ~= false) and INTERNAL.CompactAtom.classifyArray(value) or "Mixed"
+	local runCount = (not options or options.RunLengthArrays ~= false) and INTERNAL.CompactAtom.countScalarRuns(value) or count
 	local useRLE = count >= 4 and arrayKind ~= "Bool" and runCount > 0 and runCount <= math.floor(count / 3)
 
 	if useRLE then
@@ -5890,7 +6201,7 @@ end
 
 -- Handles compact write map.
 function INTERNAL.compactWriteMap(w: Writer, value: {[any]: any}, options: Options?)
-	local keys = sortedMapKeys(value)
+	local keys = INTERNAL.CompactAtom.sortedMapKeys(value)
 	local allStringKeys = not options or options.CompactMapKeys ~= false
 
 	if allStringKeys then
@@ -5952,7 +6263,7 @@ compactWriteValue = function(w: Writer, value: any, options: Options?)
 		if isSafeUInt(value) and value <= 127 then
 			writeByte(w, CT.INLINE_UINT_BASE + value)
 		else
-			local exponent = power10Exponent(value)
+			local exponent = INTERNAL.CompactAtom.power10Exponent(value)
 			if exponent ~= nil then
 				writeByte(w, CT.VALUE_POWER10)
 				writeVarUInt(w, zigzagEncode(exponent) * 2 + (value < 0 and 1 or 0))
@@ -5963,7 +6274,7 @@ compactWriteValue = function(w: Writer, value: any, options: Options?)
 				writeByte(w, CT.VALUE_INT)
 				writeVarInt(w, value)
 			else
-				local decimalInteger, decimalScale = decimalCandidate(value)
+				local decimalInteger, decimalScale = INTERNAL.CompactAtom.decimalCandidate(value)
 				local decimalBytes = if decimalInteger ~= nil and decimalScale ~= nil then 2 + varIntByteLength(decimalInteger) else math.huge
 				local float32Bytes = exactFloat32(value) and 5 or math.huge
 
@@ -6699,8 +7010,8 @@ function INTERNAL.dynamicWrite(w: Writer, value: any, options: Options?, diction
 			local count = #value
 			local tableCompression = not options or options.TableCompression ~= false
 			local homogeneous = tableCompression and (not options or options.HomogeneousArrays ~= false)
-			local arrayKind = homogeneous and classifyArray(value) or "Mixed"
-			local runCount = tableCompression and (not options or options.RunLengthArrays ~= false) and countScalarRuns(value) or count
+			local arrayKind = homogeneous and INTERNAL.CompactAtom.classifyArray(value) or "Mixed"
+			local runCount = tableCompression and (not options or options.RunLengthArrays ~= false) and INTERNAL.CompactAtom.countScalarRuns(value) or count
 			if count >= 4 and runCount <= math.floor(count / 3) and arrayKind ~= "Bool" then
 				writeByte(w, TAG.ARRAY_RLE)
 				writeVarUInt(w, count)
@@ -6800,7 +7111,7 @@ function INTERNAL.dynamicWrite(w: Writer, value: any, options: Options?, diction
 			elseif arrayKind == "String" then
 				writeByte(w, TAG.ARRAY_STRING)
 				writeVarUInt(w, count)
-				for i = 1, count do writeCompactString(w, value[i], options, dictionary) end
+				for i = 1, count do INTERNAL.CompactAtom.writeCompactString(w, value[i], options, dictionary) end
 			elseif arrayKind == "Vector2" then
 				local useF32 = true
 				for i = 1, count do
@@ -6929,7 +7240,7 @@ function INTERNAL.dynamicWrite(w: Writer, value: any, options: Options?, diction
 				for _, item in ipairs(value) do INTERNAL.dynamicWrite(w, item, options, dictionary) end
 			end
 		else
-			local keys = sortedMapKeys(value)
+			local keys = INTERNAL.CompactAtom.sortedMapKeys(value)
 			local allStringKeys = not options or options.CompactMapKeys ~= false
 			if allStringKeys then
 				for _, key in ipairs(keys) do
@@ -6940,7 +7251,7 @@ function INTERNAL.dynamicWrite(w: Writer, value: any, options: Options?, diction
 				writeByte(w, TAG.MAP_STRING)
 				writeVarUInt(w, #keys)
 				for _, key in ipairs(keys) do
-					writeCompactString(w, key, options, dictionary)
+					INTERNAL.CompactAtom.writeCompactString(w, key, options, dictionary)
 					INTERNAL.dynamicWrite(w, value[key], options, dictionary)
 				end
 			else
@@ -7130,7 +7441,7 @@ function INTERNAL.dynamicRead(r: Reader, dictionary: DictionaryState): any
 		local count = readVarUInt(r)
 		INTERNAL.validateContainerCount(r, count, "dynamic string array")
 		local result = table.create(count)
-		for i = 1, count do result[i] = readCompactString(r, dictionary) end
+		for i = 1, count do result[i] = INTERNAL.CompactAtom.readCompactString(r, dictionary) end
 		return result
 	elseif tag == TAG.ARRAY_VECTOR2_F32
 		or tag == TAG.ARRAY_VECTOR2_F64 then
@@ -7292,7 +7603,7 @@ function INTERNAL.dynamicRead(r: Reader, dictionary: DictionaryState): any
 		local seenKeys: {[string]: boolean} = {}
 
 		for _ = 1, count do
-			local key = readCompactString(
+			local key = INTERNAL.CompactAtom.readCompactString(
 				r,
 				dictionary
 			)
@@ -7365,8 +7676,8 @@ function INTERNAL.encodeDynamicValuePacket(
 	end
 
 	local w = newWriter()
-	local dictionary = makeDictionary(value, options)
-	writeHeader(w, MODE.DYNAMIC, schemaVersion)
+	local dictionary = INTERNAL.String.makeDictionary(value, options)
+	INTERNAL.SchemaCore.writeHeader(w, MODE.DYNAMIC, schemaVersion)
 	writeVarUInt(w, #dictionary.Decode)
 	for i = 1, #dictionary.Decode do
 		INTERNAL.writeCompressedStringBlob(w, dictionary.Decode[i], options)
@@ -7374,11 +7685,11 @@ function INTERNAL.encodeDynamicValuePacket(
 	INTERNAL.dynamicWrite(w, value, options, dictionary)
 
 	local data = finish(w)
-	return packetFromEntropy(
+	return INTERNAL.SchemaCore.packetFromEntropy(
 		data,
 		options,
 		schemaVersion,
-		rawBits or rawValueBits(value),
+		rawBits or INTERNAL.SchemaCore.rawValueBits(value),
 		w.UsedBits,
 		w.PaddingBits
 	)
@@ -7390,12 +7701,12 @@ function Compression.Encode(value: any, options: Options?): Packet
 	local kind = typeof(value)
 
 	if kind == "buffer" then
-		local compactBuffer = compressBufferBase(value, options)
+		local compactBuffer = INTERNAL.Buffer.compressBufferBase(value, options)
 		if not hasCompressionBufferMagic(compactBuffer) then
-			compactBuffer = bufferRawPacket(value)
+			compactBuffer = INTERNAL.Buffer.bufferRawPacket(value)
 		end
 		local baseMode = BUF.ModeBase(compactBuffer)
-		local packet = packetFromEntropy(compactBuffer, options, schemaVersion, buffer.len(value) * 8)
+		local packet = INTERNAL.SchemaCore.packetFromEntropy(compactBuffer, options, schemaVersion, buffer.len(value) * 8)
 		packet.Codec = "Buffer/"
 			.. (packet.Entropy == "Huffman" and "Huffman/" or "")
 			.. baseMode
@@ -7415,22 +7726,22 @@ function Compression.Encode(value: any, options: Options?): Packet
 				options
 			)
 
-		return packetFromEntropy(
+		return INTERNAL.SchemaCore.packetFromEntropy(
 			compactTable,
 			options,
 			schemaVersion,
-			rawValueBits(value),
+			INTERNAL.SchemaCore.rawValueBits(value),
 			usefulBits,
 			paddingBits
 		)
 	end
 
-	local atom = encodeCompactAtom(value, options)
+	local atom = INTERNAL.CompactAtom.encodeCompactAtom(value, options)
 	if atom ~= nil then
 		if kind == "boolean" then
-			return markBooleanPacket(packetFromBuffer(atom, options, schemaVersion, rawValueBits(value)))
+			return INTERNAL.SchemaCore.markBooleanPacket(INTERNAL.SchemaCore.packetFromBuffer(atom, options, schemaVersion, INTERNAL.SchemaCore.rawValueBits(value)))
 		end
-		local packet = packetFromEntropy(atom, options, schemaVersion, rawValueBits(value))
+		local packet = INTERNAL.SchemaCore.packetFromEntropy(atom, options, schemaVersion, INTERNAL.SchemaCore.rawValueBits(value))
 		if kind == "string" then
 			packet.Codec = packet.Entropy == "Huffman" and "CompactString+Huffman" or "CompactString"
 		end
@@ -7453,11 +7764,11 @@ function Compression.Decode(packet: Packet | buffer, options: Options?): any
 		if passthroughPacket.Hash ~= nil and (not options or options.VerifyHash ~= false) then
 			if hashBuffer(passthroughPacket.Data) ~= passthroughPacket.Hash then fail("hash verification failed", 2) end
 		end
-		local handled, passthroughValue = decodePassthroughPacket(passthroughPacket)
+		local handled, passthroughValue = INTERNAL.SchemaCore.decodePassthroughPacket(passthroughPacket)
 		if handled then return passthroughValue end
 	end
 
-	local data = unwrapPacket(packet, options)
+	local data = INTERNAL.SchemaCore.unwrapPacket(packet, options)
 	if hasCompressionBufferMagic(data) then
 		return Compression.DecompressBuffer(data)
 	end
@@ -7469,27 +7780,24 @@ function Compression.Decode(packet: Packet | buffer, options: Options?): any
 		end
 	end
 
-	local atomHandled, atomValue = decodeCompactAtom(data)
+	local atomHandled, atomValue = INTERNAL.CompactAtom.decodeCompactAtom(data)
 	if atomHandled then return atomValue end
 
 	local r = newReader(data)
 	if r.Length >= 2 and buffer.readu8(data, 0) == FMT.COMPACT_NUMBER_MAGIC then
 		readByte(r)
 		local compactVersion = readByte(r)
-		if compactVersion ~= FMT.VERSION and compactVersion ~= 27 and compactVersion ~= 26 and compactVersion ~= 25 and compactVersion ~= 24 and compactVersion ~= 23 and compactVersion ~= 22 and compactVersion ~= 21 and compactVersion ~= 20 and compactVersion ~= 19 and compactVersion ~= 18 and compactVersion ~= 17 and compactVersion ~= 16 and compactVersion ~= 15 and compactVersion ~= 14 and compactVersion ~= 13 and compactVersion ~= 12 and compactVersion ~= 11 and compactVersion ~= 10 and compactVersion ~= 9 and compactVersion ~= 8 and compactVersion ~= 7 then fail("unsupported compact number version", 2) end
+		if compactVersion ~= FMT.VERSION then fail("unsupported compact number version", 2) end
 		local value = readNumberPayload(r)
 		if r.Position ~= r.Length then fail("trailing bytes in compact number payload", 2) end
 		return value
 	end
-	local _, binaryVersion = readHeader(r, MODE.DYNAMIC)
+	INTERNAL.SchemaCore.readHeader(r, MODE.DYNAMIC)
 	local dictionary: DictionaryState = {Encode = {}, Decode = {}}
 	local count = readVarUInt(r)
 	INTERNAL.validateContainerCount(r, count, "string dictionary")
 	for i = 1, count do
-		local value =
-			binaryVersion >= 8
-			and INTERNAL.readCompressedStringBlob(r)
-			or readStringRaw(r)
+		local value = INTERNAL.readCompressedStringBlob(r)
 
 		if dictionary.Encode[value] ~= nil then
 			fail(
@@ -7528,11 +7836,11 @@ function Compression.Optional(descriptor: Descriptor): Descriptor
 	return copy
 end
 
--- Attaches a schema default. v2.9 writes one default-state bit and omits the payload when equal.
+-- Attaches a schema default; equal values use one state bit and omit the payload.
 function Compression.Default(descriptor: Descriptor, defaultValue: any): Descriptor
 	if typeof(descriptor) ~= "table" or typeof(descriptor.Kind) ~= "string" then fail("Default expects Descriptor", 2) end
 	if defaultValue == nil then fail("Default value cannot be nil; use Optional instead", 2) end
-	validate(descriptor, defaultValue, "Default")
+	INTERNAL.SchemaCore.validate(descriptor, defaultValue, "Default")
 	local copy = table.clone(descriptor)
 	copy.Default = FMT.CloneDefault(defaultValue)
 	return copy
@@ -7563,7 +7871,7 @@ function Compression.Int(defaultValue: number?): Descriptor
 	return descriptor
 end
 
--- Reports the logical bit cost of the v2.9 bit-first integer code.
+-- Reports the logical bit cost of the current bit-first integer code.
 function Compression.UIntBitLength(value: number): number
 	if not isSafeUInt(value) then fail("UIntBitLength expects safe unsigned integer", 2) end
 	return INTERNAL.adaptiveUIntBitLength(value)
@@ -7860,7 +8168,7 @@ function Compression.SchemaFromTemplate(template: {[string]: any}, version: numb
 end
 
 
--- v3.0 indexed layouts -------------------------------------------------------
+-- Indexed layouts ------------------------------------------------------------
 -- A reusable indexed layout removes string field names from each payload.
 -- Example: {Coins = 0, Rebirths = 5} becomes {0, 5} internally, while Decode
 -- restores the original named table. The layout itself is compiled once from a
@@ -8088,22 +8396,6 @@ function Compression.IndexedLayout(template: {[string]: any}, version: number?):
 	}, IndexedLayout) :: any
 end
 
--- Short alias for users who want the compact API name.
-Compression.Indexed = Compression.IndexedLayout
-
--- One-shot inspection helper. Reuse the returned layout for actual repeated
--- compression so the key map is not rebuilt every packet.
-function Compression.ToIndexedTable(value: {[string]: any}): ({any}, IndexedLayoutObject)
-	if typeof(value) ~= "table" or isArray(value) then fail("ToIndexedTable expects a string-keyed table", 2) end
-	local layout = Compression.IndexedLayout(value)
-	return layout:ToIndexed(value), layout
-end
-
-function Compression.FromIndexedTable(value: {any}, layout: IndexedLayoutObject): {[string]: any}
-	if typeof(layout) ~= "table" or typeof((layout :: any).FromIndexed) ~= "function" then fail("FromIndexedTable expects IndexedLayout", 2) end
-	return layout:FromIndexed(value)
-end
-
 -- Handles string mode.
 function Compression.StringMode(data: buffer): string
 	if typeof(data) ~= "buffer" then return "Invalid" end
@@ -8116,7 +8408,7 @@ function Compression.StringMode(data: buffer): string
 	if dataLength == 0 then return "RawPassthrough" end
 	local mode = buffer.readu8(data, 0)
 	if dataLength == 1 and mode <= STR.RAW_V3 then return "InlineLiteral" end
-	if mode == STR.LZ_V1 then
+	if mode == STR.TINY_FILL then
 		if dataLength == 2 then return "TinyFill" end
 		if dataLength == 3 and buffer.readu8(data, 2) > 0 then return "TinyFill" end
 	end
@@ -8124,15 +8416,15 @@ function Compression.StringMode(data: buffer): string
 	if mode == STR.RAW and dataLength >= 4 and buffer.readu8(data, 1) == 0 then return "ZeroFill-Compact" end
 	if mode == STR.RAW and dataLength >= 6 then
 		local originalLength = buffer.readu8(data, 1)
-		local compactBytes = estimatedCompactLowASCII5Bytes(originalLength)
+		local compactBytes = INTERNAL.String.estimatedCompactLowASCII5Bytes(originalLength)
 		if compactBytes ~= nil and dataLength == compactBytes then return "LowASCII5-Compact" end
 	end
 	if mode == STR.LZ_V2 and dataLength >= 4 and buffer.readu8(data, 1) == 0 then return "LZ-Fill-Compact" end
 	if mode > STR.RAW_V3 then return "RawPassthrough" end
 	if mode == STR.RAW then return "Raw" end
-	if mode == STR.LZ_V1 then return "LZ-v1" end
+	if mode == STR.TINY_FILL then return "Invalid" end
 	if mode == STR.NUMERIC4 then
-		local _, structuredMode = tryDecodeStructuredNumeric4(data)
+		local _, structuredMode = INTERNAL.String.tryDecodeStructuredNumeric4(data)
 		if structuredMode ~= nil then return structuredMode end
 		return "Numeric4"
 	end
@@ -8177,7 +8469,7 @@ local function stringPaddingBits(data: buffer): number
 
 	if mode == STR.RAW and length >= 6 then
 		local originalLength = buffer.readu8(data, 1)
-		local compactBytes = estimatedCompactLowASCII5Bytes(originalLength)
+		local compactBytes = INTERNAL.String.estimatedCompactLowASCII5Bytes(originalLength)
 		if compactBytes ~= nil and length == compactBytes then
 			return math.max(0, length * 8 - (16 + originalLength * 5))
 		end
@@ -8281,14 +8573,13 @@ function Compression.CompressStringSmart(value: string, options: Options?): (buf
 	local best = packed
 	local bestBytes = buffer.len(packed)
 
-	-- The Smart API already carries a compressed boolean, so structured decimal
-	-- strings can use the denser BufferUtil-v1.3-style header without a legacy-safe
-	-- self-describing wrapper. Explicit non-structured strategies remain respected.
+	-- The Smart API carries a compressed boolean, so structured decimal strings
+	-- can use the denser out-of-band header. Explicit strategies remain respected.
 	local strategy: StringStrategy = options and options.StringStrategy or "Auto"
 	if not options or options.CompressStrings ~= false then
 		if strategy == "Auto" or strategy == "PrefixUInt" or strategy == "UInt" then
 			local wantedKind = if strategy == "Auto" then nil else strategy
-			local structured = smartStructuredPacket(value, wantedKind)
+			local structured = INTERNAL.String.smartStructuredPacket(value, wantedKind)
 			if structured ~= nil and buffer.len(structured) < bestBytes then
 				best = structured
 				bestBytes = buffer.len(structured)
@@ -8306,7 +8597,7 @@ end
 function Compression.DecompressStringSmart(data: buffer, compressed: boolean): string
 	if typeof(data) ~= "buffer" then fail("DecompressStringSmart expects buffer", 2) end
 	if compressed then
-		local structured = tryDecodeSmartStructured(data)
+		local structured = INTERNAL.String.tryDecodeSmartStructured(data)
 		if structured ~= nil then return structured end
 		return Compression.DecompressString(data)
 	end
@@ -8392,7 +8683,7 @@ end
 -- Handles adaptive table packet.
 function INTERNAL.adaptiveTablePacket(value: {[any]: any}, options: Options?): Packet
 	INTERNAL.assertNoCycles(value, {}, {})
-	local rawBits = rawValueBits(value)
+	local rawBits = INTERNAL.SchemaCore.rawValueBits(value)
 
 	if options and options.TableStrategy == "Dynamic" then
 		return INTERNAL.dynamicTablePacket(value, options, rawBits, true)
@@ -8410,7 +8701,7 @@ function INTERNAL.adaptiveTablePacket(value: {[any]: any}, options: Options?): P
 			)
 
 		if compactOK then
-			local packet = packetFromEntropy(
+			local packet = INTERNAL.SchemaCore.packetFromEntropy(
 				compactData,
 				options,
 				options and options.SchemaVersion or 1,
@@ -8452,7 +8743,7 @@ function INTERNAL.adaptiveTablePacket(value: {[any]: any}, options: Options?): P
 		return dynamicPacket
 	end
 
-	local compactPacket = packetFromEntropy(
+	local compactPacket = INTERNAL.SchemaCore.packetFromEntropy(
 		compactData,
 		options,
 		options and options.SchemaVersion or 1,
@@ -8469,37 +8760,26 @@ function INTERNAL.adaptiveTablePacket(value: {[any]: any}, options: Options?): P
 	return compactPacket
 end
 
--- Handles compress.
-function Compression.Compress(value: any, options: Options?): Packet
-	if typeof(value) == "table"
-		and (not options or options.TableCompression ~= false) then
-		return INTERNAL.adaptiveTablePacket(value, options)
+-- Automatically selects the best current representation for a value.
+function Compression.Auto(value: any, options: Options?): Packet
+	local packet: Packet
+	if typeof(value) == "table" and (not options or options.TableCompression ~= false) then
+		packet = INTERNAL.adaptiveTablePacket(value, options)
+	else
+		packet = Compression.Encode(value, options)
 	end
 
-	return Compression.Encode(value, options)
-end
-
--- Handles decompress.
-function Compression.Decompress(packet: Packet | buffer, options: Options?): any
-	return Compression.Decode(packet, options)
-end
-
--- Handles auto.
-function Compression.Auto(value: any, options: Options?): Packet
-	local packet = Compression.Compress(value, options)
 	local kind = typeof(value)
 	packet.ValueType = kind
 	packet.Codec = INTERNAL.autoCodecFor(value, packet, options)
-	if kind == "boolean" then
-		markBooleanPacket(packet)
-	end
+	if kind == "boolean" then INTERNAL.SchemaCore.markBooleanPacket(packet) end
 
 	if not options or options.AllowExpansion ~= true then
-		local rawBytes, rawCodec = rawAutoByteCountAndCodec(value)
+		local rawBytes, rawCodec = INTERNAL.SchemaCore.rawAutoByteCountAndCodec(value)
 		if rawBytes ~= nil and rawCodec ~= nil and rawBytes <= packet.Bytes then
-			local rawData = rawAutoData(value)
+			local rawData = INTERNAL.SchemaCore.rawAutoData(value)
 			if rawData ~= nil then
-				local rawPacket = packetFromBuffer(rawData, options, options and options.SchemaVersion or 1, rawValueBits(value))
+				local rawPacket = INTERNAL.SchemaCore.packetFromBuffer(rawData, options, options and options.SchemaVersion or 1, INTERNAL.SchemaCore.rawValueBits(value))
 				rawPacket.ValueType = kind
 				rawPacket.Codec = rawCodec
 				rawPacket.Passthrough = true
@@ -8509,11 +8789,6 @@ function Compression.Auto(value: any, options: Options?): Packet
 	end
 
 	return packet
-end
-
--- Handles auto decompress.
-function Compression.AutoDecompress(packet: Packet | buffer, options: Options?): any
-	return Compression.Decompress(packet, options)
 end
 
 -- Safely attempts to auto without throwing.
@@ -8529,9 +8804,9 @@ function Compression.CanAuto(value: any, options: Options?): boolean
 	return ok
 end
 
--- Safely attempts to auto decompress without throwing.
-function Compression.TryAutoDecompress(packet: Packet | buffer, options: Options?): (boolean, any, string?)
-	local ok, result = pcall(Compression.AutoDecompress, packet, options)
+-- Safely attempts to decode without throwing.
+function Compression.TryDecode(packet: Packet | buffer, options: Options?): (boolean, any, string?)
+	local ok, result = pcall(Compression.Decode, packet, options)
 	if ok then return true, result, nil end
 	return false, nil, tostring(result)
 end
@@ -8618,14 +8893,9 @@ end
 function Compression.DecompressNumber(data: buffer): number
 	if typeof(data) ~= "buffer" then fail("DecompressNumber expects buffer", 2) end
 	data = entropyDecodeIfNeeded(data)
-	-- One-byte values 14/15/16 are the legacy 0/1/-1 packets. All canonical
-	-- v2.9 bit-first small-integer bytes intentionally avoid those values.
+	-- Current standalone numbers use the bit-first small-integer representation.
 	if buffer.len(data) == 1 then
 		local first = buffer.readu8(data, 0)
-		if first == TAG.ZERO then return 0 end
-		if first == TAG.ONE then return 1 end
-		if first == TAG.NEG_ONE then return -1 end
-
 		local code: number? = nil
 		if first == 0 then
 			code = 0
@@ -8834,7 +9104,7 @@ end
 
 -- Handles top level dynamic tag.
 MODE.TopLevelDynamicTag = function(packet: Packet | buffer, options: Options?): number?
-	local data = unwrapPacket(packet, options)
+	local data = INTERNAL.SchemaCore.unwrapPacket(packet, options)
 	if buffer.len(data) < 1 then return nil end
 	local first = buffer.readu8(data, 0)
 	if first == FMT.COMPACT_NUMBER_MAGIC
@@ -8845,11 +9115,9 @@ MODE.TopLevelDynamicTag = function(packet: Packet | buffer, options: Options?): 
 	end
 	local r = newReader(data)
 	local ok, tag = pcall(function()
-		local _, binaryVersion = readHeader(r, MODE.DYNAMIC)
+		INTERNAL.SchemaCore.readHeader(r, MODE.DYNAMIC)
 		local count = readVarUInt(r)
-		for _ = 1, count do
-			if binaryVersion >= 8 then INTERNAL.readCompressedStringBlob(r) else readStringRaw(r) end
-		end
+		for _ = 1, count do INTERNAL.readCompressedStringBlob(r) end
 		alignReader(r)
 		return readByte(r)
 	end)
@@ -8881,7 +9149,7 @@ end
 
 -- Decompresses table.
 function Compression.DecompressTable(packet: Packet | buffer, options: Options?): {[any]: any}
-	local data = unwrapPacket(packet, options)
+	local data = INTERNAL.SchemaCore.unwrapPacket(packet, options)
 	local value
 	if buffer.len(data) >= 1
 		and (
@@ -8921,7 +9189,7 @@ end
 
 -- Checks whether compact table.
 function Compression.IsCompactTable(packet: Packet | buffer, options: Options?): boolean
-	local data = unwrapPacket(packet, options)
+	local data = INTERNAL.SchemaCore.unwrapPacket(packet, options)
 	if buffer.len(data) < 1 then return false end
 	local first = buffer.readu8(data, 0)
 	return first == FMT.COMPACT_TABLE_MAGIC
@@ -8930,7 +9198,7 @@ end
 
 -- Handles table mode.
 function Compression.TableMode(packet: Packet | buffer, options: Options?): string
-	local data = unwrapPacket(packet, options)
+	local data = INTERNAL.SchemaCore.unwrapPacket(packet, options)
 	local compactMode = CT.TableModeFromData(data)
 	if compactMode ~= nil then return compactMode end
 	local tag = MODE.TopLevelDynamicTag(
@@ -8943,7 +9211,7 @@ end
 
 -- Handles table bytes.
 function Compression.TableBytes(packet: Packet | buffer, options: Options?): number
-	local data = unwrapPacket(packet, options)
+	local data = INTERNAL.SchemaCore.unwrapPacket(packet, options)
 	return buffer.len(data)
 end
 
@@ -8990,7 +9258,7 @@ function Compression.TableStats(value: {[any]: any}, options: Options?): {[strin
 		)
 
 	local rawBits =
-		rawValueBits(value)
+		INTERNAL.SchemaCore.rawValueBits(value)
 	local rawBytes =
 		math.ceil(rawBits / 8)
 
@@ -9308,7 +9576,7 @@ end
 
 -- Estimates raw bytes.
 function Compression.EstimateRawBytes(value: any): number
-	return math.ceil(rawValueBits(value) / 8)
+	return math.ceil(INTERNAL.SchemaCore.rawValueBits(value) / 8)
 end
 
 -- Formats bytes.
@@ -9418,38 +9686,6 @@ function Compression.Analyze(value: any, options: Options?): {[string]: any}
 	return stats
 end
 
--- Handles pack.
-function Compression.Pack(value: any, options: Options?): Packet
-	return Compression.Auto(
-		value,
-		options
-	)
-end
-
--- Handles unpack.
-function Compression.Unpack(packet: Packet | buffer, options: Options?): any
-	return Compression.AutoDecompress(
-		packet,
-		options
-	)
-end
-
--- Safely attempts to pack without throwing.
-function Compression.TryPack(value: any, options: Options?): (boolean, Packet?, string?)
-	return Compression.TryAuto(
-		value,
-		options
-	)
-end
-
--- Safely attempts to unpack without throwing.
-function Compression.TryUnpack(packet: Packet | buffer, options: Options?): (boolean, any, string?)
-	return Compression.TryAutoDecompress(
-		packet,
-		options
-	)
-end
-
 -- Handles size.
 function Compression.Size(value: any, options: Options?): (number, number)
 	local packet = Compression.Auto(
@@ -9470,11 +9706,6 @@ function Compression.Codec(value: any, options: Options?): string
 
 	return packet.Codec
 		or "Unknown"
-end
-
--- Handles version.
-function Compression.Version(): string
-	return Compression.VERSION
 end
 
 return Compression
