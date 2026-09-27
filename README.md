@@ -1,4810 +1,2959 @@
---- README_old.md
-+++ README.md
-@@ -1,674 +1,285 @@
--# DataStore
--
--![Version](https://img.shields.io/badge/version-v4.1.1-4c8bf5)
-+# NexusDataStore
-+
-+![Version](https://img.shields.io/badge/version-v7.0.2-4c8bf5)
- ![Language](https://img.shields.io/badge/language-Luau-00A2FF)
- ![Platform](https://img.shields.io/badge/platform-Roblox-111111)
- ![Runtime](https://img.shields.io/badge/runtime-server--only-orange)
--![Storage Format](https://img.shields.io/badge/storage%20format-v12-2ea44f)
--![Session Format](https://img.shields.io/badge/session%20format-v5-2ea44f)
--![Compression](https://img.shields.io/badge/compression-v3.1.0-6f42c1)
--
--**DataStore v4.1.1** is a server-side Roblox persistence module built around a small permanent-storage contract:
--
--> **The permanent Roblox DataStore value is the player's `Data = PlayersData` encoded as a Compression v3.1.0 `IndexedLayout` / `IndexedSchema` buffer.**
--
--The current build adds strict Luau typing, historical schema routing, automatic reconciliation, compact Base85 UserId keys, MemoryStore session locking, dirty-only autosaves, and the new **Sparse Defaults** schema path.
--
--Sparse Defaults is especially useful for simulator-style templates with hundreds of fields whose default values are `0`, `false`, `1`, `""`, or other known defaults.
--
--> Current DataStore release: **v4.1.1**  
--> Storage format: **12**  
--> Session format: **5**  
--> Compression release: **v3.1.0**  
--> Compression build: **Sparse Defaults + SchemaPacketVersion**
--
-----
--
--# Contents
--
--- [What Changed](#what-changed)
--- [Storage Contract](#storage-contract)
--- [Sparse Defaults](#sparse-defaults)
--- [400-Key Stress Test](#400-key-stress-test)
--- [Requirements](#requirements)
-+![Record Format](https://img.shields.io/badge/record%20format-700-2ea44f)
-+![Compression](https://img.shields.io/badge/compression-v2.3.x%20%7C%20codec%20230-6f42c1)
-+
-+**NexusDataStore v7.0.2** is a typed, session-aware Roblox persistence layer built for reliable player data, compact storage, controlled mutations, migrations, snapshots, observability, and integrated OrderedDataStore synchronization.
-+
-+The current build is tied directly to a `PlayersData` ModuleScript:
-+
-+```lua
-+local PlayersData = require(script.PlayersData)
-+
-+export type Data = PlayersData.Data
-+```
-+
-+That type flows through the public API:
-+
-+```text
-+PlayersData.Data
-+      |
-+      v
-+ Store<Data>
-+      |
-+      v
-+Session<Data>
-+      |
-+      v
-+profile.Data
-+```
-+
-+This means `profile.Data.Coins`, `profile.Data.Inventory`, and every other declared field can be understood by Luau instead of collapsing to `any`.
-+
-+> **Current release:** NexusDataStore `7.0.2`  
-+> **Record format:** `700`  
-+> **Compression series:** `2.3.x`  
-+> **Compression codec:** `230`  
-+> **Recommended Compression build:** `2.3.2`
-+
-+---
-+
-+## Contents
-+
-+- [Core Features](#core-features)
- - [Project Structure](#project-structure)
--- [PlayersData](#playersdata)
-+- [PlayersData and Strict Typing](#playersdata-and-strict-typing)
- - [Quick Start](#quick-start)
--- [Strict Luau Types](#strict-luau-types)
- - [Loading Players](#loading-players)
--- [Reading and Updating Data](#reading-and-updating-data)
-+- [Working With Profile Data](#working-with-profile-data)
-+- [Nested Paths](#nested-paths)
- - [Atomic Mutations](#atomic-mutations)
--- [Dirty Tracking](#dirty-tracking)
--- [Saving](#saving)
--- [Autosave](#autosave)
--- [Session Locking](#session-locking)
--- [Lock Modes](#lock-modes)
--- [Updating PlayersData](#updating-playersdata)
--- [DataTemplateHistory](#datatemplatehistory)
--- [Schema Version Routing](#schema-version-routing)
--- [Reconciliation](#reconciliation)
--- [Persistent Validation](#persistent-validation)
--- [Compact Player Keys](#compact-player-keys)
--- [Diagnostics](#diagnostics)
--- [Read-Only Inspection](#read-only-inspection)
--- [Signals](#signals)
-+- [Snapshots and Rollback](#snapshots-and-rollback)
-+- [Watching Data](#watching-data)
-+- [Saving and Releasing](#saving-and-releasing)
-+- [Autosave and Session Ownership](#autosave-and-session-ownership)
-+- [Schema Validation](#schema-validation)
-+- [Schema Migrations](#schema-migrations)
-+- [Compression](#compression)
-+  - [Supported Compression Types](#supported-compression-types)
-+  - [Compression Quick Start](#compression-quick-start)
-+  - [Compression Examples for Every Supported Type](#compression-examples-for-every-supported-type)
-+  - [Compression Reports](#compression-reports)
-+  - [Compression Options](#compression-options)
-+  - [DataStore Compression Transport](#datastore-compression-transport)
-+  - [Corruption Protection](#corruption-protection)
-+- [OrderedDataStore](#ordereddatastore)
-+  - [Leaderboard Configuration](#leaderboard-configuration)
-+  - [Set Max and Min Modes](#set-max-and-min-modes)
-+  - [Manual Ordered Writes](#manual-ordered-writes)
-+  - [Incrementing](#incrementing)
-+  - [Reading Leaderboards](#reading-leaderboards)
-+  - [Getting a Player Rank](#getting-a-player-rank)
-+  - [Automatic Session Sync](#automatic-session-sync)
-+  - [Projected Ordered Values](#projected-ordered-values)
-+  - [Custom Ordered Keys](#custom-ordered-keys)
-+- [Events](#events)
-+- [Health and Metrics](#health-and-metrics)
- - [Configuration Reference](#configuration-reference)
--- [Store API](#store-api)
--- [Profile API](#profile-api)
--- [Static API](#static-api)
-+- [API Reference](#api-reference)
-+- [Production Patterns](#production-patterns)
- - [Testing](#testing)
--- [Production Safety](#production-safety)
- - [FAQ](#faq)
--- [Release Summary](#release-summary)
--
-----
--
--# What Changed
--
--## v4.1.1
--
--v4.1.1 focuses on making schema upgrades safe.
--
--Older `IndexedSchema` saves are no longer blindly decoded using the newest template.
--
--The load flow is now conceptually:
-+
-+---
-+
-+# Core Features
-+
-+NexusDataStore provides:
-+
-+- typed `PlayersData.Data` integration;
-+- `Store<Data>` and `Session<Data>` inference;
-+- `profile.Data` autocomplete in strict Luau;
-+- `UpdateAsync`-based persistence;
-+- server/session ownership locks;
-+- revision conflict protection;
-+- retry-stable commits;
-+- DataStore budget awareness;
-+- bounded load/save deadlines;
-+- autosave and lock heartbeats;
-+- direct-change detection;
-+- template reconciliation;
-+- optional runtime schema validation;
-+- schema migrations;
-+- snapshots and restore;
-+- path-based mutation helpers;
-+- mutation watchers;
-+- compression with checksum validation;
-+- automatic compressed/raw persistence selection;
-+- buffer/Base64 compression transports;
-+- built-in OrderedDataStore support;
-+- leaderboard synchronization;
-+- cross-server events through `MessagingService`;
-+- health and metrics reporting.
-+
-+---
-+
-+# Project Structure
-+
-+The simplest supported layout is:
- 
- ```text
--stored player buffer
--        |
--        v
--Compression.SchemaPacketVersion()
--        |
--        v
--schema version
--        |
--        v
--DataTemplate version = schema version - 1
--        |
--        +--> current version
--        |
--        `--> DataTemplateHistory[oldVersion]
--                    |
--                    v
--               decode old data
--                    |
--                    v
--                 reconcile
--                    |
--                    v
--            mark profile dirty
--                    |
--                    v
--            save using newest schema
--```
--
--This prevents errors such as:
--
--```text
--Compression: unexpected end of payload
--Compression: schema version mismatch
--```
--
--when a game expands an older template.
--
--## Sparse Defaults
--
--Compression v3.1.0 now has an additional internal schema frame that stores only fields that differ from their defaults.
--
--The old bitmap schema remains readable.
--
--The encoder compares the normal bitmap representation with the sparse representation and keeps the smaller physical payload.
--
--## Strict type surface
--
--The DataStore is tied directly to the exported type of `PlayersData`:
--
--```lua
--local Data = require(script.Parent.PlayersData)
--
--export type DataTable = Data.Data
--export type DataKey = keyof<DataTable>
--export type DataValue = index<DataTable, DataKey>
--```
--
--That keeps the profile's persistent shape synchronized with the actual `PlayersData` module.
--
-----
--
--# Storage Contract
--
--Given:
--
--```lua
-+ServerScriptService
-+└── Data
-+    ├── NexusDataStore            ModuleScript
-+    │   ├── PlayersData           ModuleScript
-+    │   └── Compression           ModuleScript
-+    │
-+    └── DataBootstrap             Script
-+```
-+
-+`PlayersData` must be a child of `NexusDataStore` in the current build because the module loads it with:
-+
-+```lua
-+local PlayersData = require(script.PlayersData)
-+```
-+
-+`Compression` can also be supplied explicitly with `CompressionModule`, but keeping it as a child of `NexusDataStore` is the cleanest default.
-+
-+---
-+
-+# PlayersData and Strict Typing
-+
-+Create `PlayersData` under `NexusDataStore`:
-+
-+```lua
-+--!strict
-+
- local PlayersData = {
-     Coins = 0,
-     Rebirths = 0,
-     Gems = 0,
--    Level = 1,
--    MusicEnabled = true,
-+
-+    Settings = {
-+        Music = true,
-+        SFX = true,
-+    },
-+
-+    Inventory = {} :: {string},
- }
--```
--
--and:
--
--```lua
--local Store = DataStore.new({
--    Name = "ClickStore5",
--
--    DataTemplate = {
--        Version = 2,
--        Data = PlayersData,
--    },
-+
-+export type Data = typeof(PlayersData)
-+
-+return PlayersData
-+```
-+
-+NexusDataStore imports that exported type:
-+
-+```lua
-+export type Data = PlayersData.Data
-+```
-+
-+The public aliases include:
-+
-+```lua
-+export type Profile = Session<Data>
-+export type PlayerProfile = Session<Data>
-+export type PlayerStore = Store<Data>
-+export type PlayerStoreConfig = StoreConfig<Data>
-+export type PlayerSnapshot = Snapshot<Data>
-+```
-+
-+You can also reuse the exported aliases from another strict server module:
-+
-+```lua
-+local NexusDataStore = require(path.To.NexusDataStore)
-+
-+type Data = NexusDataStore.Data
-+type Profile = NexusDataStore.Profile
-+type PlayerStore = NexusDataStore.PlayerStore
-+```
-+
-+So a loaded profile resolves to the real player-data shape:
-+
-+```lua
-+local profile, err = Store:OpenPlayerAsync(player)
-+
-+if not profile then
-+    warn(err)
-+    return
-+end
-+
-+profile.Data.Coins += 100
-+profile.Data.Rebirths += 1
-+profile.Data.Settings.Music = false
-+```
-+
-+With `--!strict`, Luau can reject invalid assignments:
-+
-+```lua
-+profile.Data.Coins = "100"
-+-- Type error: string is not a number
-+```
-+
-+and invalid fields:
-+
-+```lua
-+print(profile.Data.Coinss)
-+-- Type error: field 'Coinss' does not exist
-+```
-+
-+---
-+
-+# Quick Start
-+
-+```lua
-+--!strict
-+
-+local ServerScriptService = game:GetService("ServerScriptService")
-+
-+local DataFolder = ServerScriptService.Data
-+local NexusDataStore = require(DataFolder.NexusDataStore)
-+
-+local Store = NexusDataStore.new({
-+    Name = "PlayerData",
-+
-+    Template = require(DataFolder.NexusDataStore.PlayersData),
-+
-+    Compression = true,
-+    CompressionTransport = "auto",
-+
-+    AutoSave = true,
-+    AutoSaveInterval = 30,
-+
-+    BudgetAware = true,
-+    Reconcile = true,
-+    EnforceTemplateTypes = true,
-+    ValidateOnWrite = true,
-+    DetectDirectChanges = true,
- })
- ```
- 
--the permanent value is conceptually:
-+The minimum configuration is:
-+
-+```lua
-+local Store = NexusDataStore.new({
-+    Name = "PlayerData",
-+    Template = require(script.Parent.NexusDataStore.PlayersData),
-+})
-+```
-+
-+Important defaults include:
- 
- ```text
--DataStoreService
--`-- ClickStore5
--    `-- <Base85 UserId key>
--        `-- <Compression IndexedSchema buffer>
--```
--
--The permanent player value is **not**:
--
--```lua
--{
--    Data = PlayersData,
--    SessionId = "...",
--    Dirty = false,
--    Revision = 12,
--    LastSaveClock = 100.5,
--    StorageInfo = {},
--}
--```
--
--Only the encoded player data buffer is written.
--
-----
--
--# What Is Not Stored in the Permanent Player Value
--
--These values are runtime state or diagnostics:
--
--```text
--SessionId
--Released
--Dirty
--Revision
--LastSavedRevision
--LastSaveClock
--StoredBytes
--RawBytes
--SavedBytes
--SavingsPercent
--UsefulBits
--PhysicalBits
--PaddingBits
--RuntimeStats
--Signal listeners
--Compression configuration
--DataStore configuration
--```
--
--Session ownership is stored separately in `MemoryStoreService`.
--
-----
--
--# Sparse Defaults
--
--The normal default-eliding schema already avoids writing full numeric values for fields equal to their defaults.
--
--However, the old format still writes a state bit for every field.
--
--For example, with 100 defaulted fields:
--
--```text
--schema header
--0
--0
--0
--0
--0
--...
--100 default-state bits
--```
--
--Those bits eventually become physical zero bytes.
--
--That is why an all-default profile could look like:
--
--```text
--[
--    209,
--    5,
--    0,
--    0,
--    0,
--    0,
--    0,
--    0,
--    0,
--    0,
--    0,
--    0,
--    0,
--    0,
--    0
--]
--```
--
--The zeros are not 12 separate saved numeric values.
--
--They are mostly packed default-state bits.
--
--## New sparse representation
--
--For schemas where every root field has a default and is not optional, Compression can instead write:
--
--```text
--SparseSchemaMagic
--SchemaVersion
--ChangedFieldCount
--
--for each changed field:
--    FieldIndexDelta
--    EncodedValue
--```
--
--If no fields differ from defaults:
--
--```text
--SparseSchemaMagic
--SchemaVersion
--ChangedFieldCount = 0
--```
--
--No per-field default bitmap is needed.
--
--## Automatic selection
--
--The encoder still creates the normal bitmap candidate.
--
--It also creates a sparse candidate when the schema is eligible.
--
--Then:
--
--```text
--bitmap candidate
--        |
--        +--> compare physical bytes
--        |
--sparse candidate
--        |
--        v
--smallest payload wins
--```
--
--If sparse would be worse, the old representation is used instead.
--
--This means Sparse Defaults is an optimization, not a requirement for every schema.
--
--## Backward compatibility
--
--Existing `0xD1` schema frames still decode through the original bitmap decoder.
--
--The sparse frame uses a separate marker.
--
--Old DataStore saves therefore do not need to be deleted just because Sparse Defaults was added.
--
-----
--
--# 100-Key Example
--
--Assume 100 root fields and every field equals its template default.
--
--The old bitmap path needs roughly:
--
--```text
--8 bits   schema marker
--~5 bits  schema version
--100 bits default states
------------------------
--~113 useful bits
--```
--
--That occupies about:
--
--```text
--15 physical bytes
--```
--
--The sparse all-default representation for schema version 3 needs roughly:
--
--```text
--8 bits   sparse marker
--5 bits   schema version
--1 bit    changed count = 0
--------------------------
--14 useful bits
--```
--
--That fits in:
--
--```text
--2 physical bytes
--```
--
--The exact bytes are an implementation detail.
--
--The important part is that the payload no longer grows by one default bit per field when nothing changed.
--
-----
--
--# 400-Key Stress Test
--
--The release includes a 400-key test template.
--
--Example shape:
--
--```lua
--local PlayersData400 = {
--    Stat001 = 0,
--    Stat002 = 0,
--    Stat003 = 0,
--    -- ...
--    Stat399 = 0,
--    Stat400 = 0,
--}
--```
--
--The test covers:
--
--```text
--0 / 400 changed
--1 / 400 changed
--10 / 400 changed
--100 / 400 changed
--400 / 400 changed
--```
--
--It also verifies encode/decode round trips and benchmarks repeated encoding and decoding.
--
--## All 400 fields at default
--
--The old bitmap representation requires approximately:
--
--```text
--8 + 5 + 400 = 413 useful bits
--```
--
--or about:
--
--```text
--52 physical bytes
--```
--
--The sparse representation still only needs the sparse header, schema version, and changed count.
--
--For schema version 3 with zero changed fields, the bit layout fits in:
--
--```text
--2 physical bytes
--```
--
--So increasing a flat template from 100 default keys to 400 default keys does **not** automatically increase an all-default sparse payload from 2 bytes to 50+ bytes.
--
--## Changed fields still cost bytes
--
--Sparse Defaults does not make changed values free.
--
--For example:
--
--```lua
--data.Stat001 = 123456
--data.Stat220 = 42
--```
--
--must store:
--
--```text
--changed count
--field positions
--123456
--42
--```
--
--The savings come from not paying for hundreds of fields that still equal their defaults.
--
--## Dense data
--
--When many or all fields differ from defaults, the regular bitmap representation may become smaller.
--
--The encoder compares both representations and chooses the smaller one.
--
-----
--
--# Requirements
--
--DataStore v4.1.1 is server-only.
--
--Use it from a `Script` or server ModuleScript.
--
--Do not require it directly from a `LocalScript`.
--
--Required structure:
--
--```text
--DataStore
--`-- Compression
--```
--
--The current DataStore is designed for:
--
--```text
--Compression v3.1.0
--```
--
--The Sparse Defaults build also exposes:
--
--```lua
--Compression.SchemaPacketVersion(packet)
--```
--
--which the DataStore uses to route old payloads to the correct historical template.
--
-----
--
--# Project Structure
--
--Recommended:
--
--```text
--ServerScriptService
--`-- Data
--    |-- DataStore
--    |   `-- Compression
--    |
--    |-- PlayersData
--    |-- PlayersDataV1
--    `-- Loader
--```
--
--`PlayersDataV1` is only needed while old version-1 `IndexedSchema` saves still exist and must be migrated.
--
--For more versions:
--
--```text
--PlayersData
--PlayersDataV1
--PlayersDataV2
--PlayersDataV3
--```
--
--You do not need to save those historical templates inside each player entry.
--
--They only exist in server code so the old positional schema can be reconstructed.
--
-----
--
--# PlayersData
--
--Example:
--
--```lua
----!strict
--
--local PlayersData = {
--    Coins = 0,
--    Rebirths = 0,
--    Gems = 0,
--    Diamonds = 0,
--
--    Level = 1,
--    XP = 0,
--
--    AutoClickUnlocked = false,
--    MusicEnabled = true,
--
--    SelectedPet = "",
--}
--
--export type Data = typeof(PlayersData)
--
--return PlayersData
--```
--
--The exported `Data` type is consumed by DataStore.
--
-----
--
--# Quick Start
--
--```lua
----!strict
--
--local DataStore = require(script.DataStore)
--local PlayersData = require(script.PlayersData)
--
--local Store = DataStore.new({
--    Name = "ClickStore5",
--
--    DataTemplate = {
--        Version = 1,
--        Data = PlayersData,
--    },
--})
--```
--
--The defaults already enable:
--
--```text
--Reconcile
--AutoSave
--SaveOnlyDirty
--SaveOnRelease
--SessionLocking
--BudgetAware
--Compression
--Entropy coding
--```
--
--A more explicit setup:
--
--```lua
--local Store = DataStore.new({
--    Name = "ClickStore5",
--
--    DataTemplate = {
--        Version = 1,
--        Data = PlayersData,
--    },
--
--    Reconcile = true,
--
--    AutoSave = true,
--    AutoSaveInterval = 60,
--    SaveOnlyDirty = true,
--    SaveOnRelease = true,
--
--    SessionLocking = true,
--    SessionLockTimeout = 180,
--    SessionRefreshInterval = 60,
--
--    RetryAttempts = 5,
--    RetryDelay = 0.75,
--    MaxRetryDelay = 8,
--
--    BudgetAware = true,
--    BudgetWaitTimeout = 10,
--
--    CompressionTableStrategy = "Auto",
--    CompressionCompressStrings = true,
--    CompressionStringStrategy = "Auto",
--    CompressionUseStringDictionary = true,
--
--    CompressionHomogeneousArrays = true,
--    CompressionDeltaArrays = true,
--    CompressionRunLengthArrays = true,
--
--    CompressionCompactMapKeys = true,
--    CompressionTableKeyMapping = true,
--
--    CompressionEntropyCoding = true,
--    CompressionEntropyStrategy = "Auto",
--    CompressionAllowExpansion = false,
--
--    CompressionBufferStrategy = "Auto",
--})
--```
--
-----
--
--# Strict Luau Types
--
--The profile exposes:
--
--```lua
--profile.Data
--```
--
--as the exact exported `PlayersData` type.
--
--For:
--
--```lua
--local PlayersData = {
--    Coins = 0,
--    MusicEnabled = true,
--}
--```
--
--Luau knows:
--
--```lua
--profile.Data.Coins
--```
--
--is a number and:
--
--```lua
--profile.Data.MusicEnabled
--```
--
--is a boolean.
--
--A typo such as:
--
--```lua
--profile.Data.Coinss
--```
--
--can be caught by strict type checking.
--
--The public key API is based on:
--
--```lua
--keyof<DataTable>
--```
--
--so top-level keys must come from the declared `PlayersData` shape.
-+Scope                  = "Global"
-+SchemaVersion          = 1
-+Reconcile              = true
-+EnforceTemplateTypes   = true
-+ValidateOnWrite        = true
-+DetectDirectChanges    = true
-+Compression            = true
-+CompressionTransport   = "auto"
-+AutoSave               = true
-+AutoSaveInterval       = 30
-+LockTimeout            = 120
-+RetryAttempts          = 6
-+BudgetAware            = true
-+LoadTimeout            = 30
-+SaveTimeout            = 30
-+```
- 
- ---
- 
-@@ -677,1306 +288,2672 @@
- ```lua
- local Players = game:GetService("Players")
- 
--local function playerAdded(player: Player)
--    local profile, loadError = Store:OpenPlayerAsync(player)
--
--    if profile == nil then
--        warn("[DataStore] Failed to load", player.Name, loadError)
--        player:Kick("Your data could not be loaded.")
-+local function onPlayerAdded(player: Player)
-+    local profile, err = Store:OpenPlayerAsync(player)
-+
-+    if not profile then
-+        warn("[NexusDataStore] Load failed:", player, err)
-+        player:Kick("Your data could not be loaded. Please rejoin.")
-         return
-     end
- 
--    print("Loaded:", player.Name)
-+    print("Loaded", player.Name)
-     print("Coins:", profile.Data.Coins)
- end
- 
--Players.PlayerAdded:Connect(playerAdded)
-+Players.PlayerAdded:Connect(onPlayerAdded)
- 
- for _, player in Players:GetPlayers() do
--    task.spawn(playerAdded, player)
--end
--```
--
--Always stop initialization after a failed load.
--
--Do not silently replace a failed profile with blank data.
--
-----
--
--# Reading and Updating Data
--
--## Direct read
--
--```lua
--print(profile.Data.Coins)
--print(profile.Data.Rebirths)
--```
-+    task.spawn(onPlayerAdded, player)
-+end
-+```
-+
-+Do not continue player initialization after a failed load.
-+
-+A failed or corrupt stored record should not silently be replaced with blank progression.
-+
-+---
-+
-+# Working With Profile Data
-+
-+## Direct typed access
-+
-+```lua
-+profile.Data.Coins += 10
-+```
-+
-+Direct edits are supported when `DetectDirectChanges = true`. The store detects that the live table changed before persistence.
-+
-+For explicit mutation tracking, prefer the mutation API.
- 
- ## Get
- 
- ```lua
--local value = profile:Get("Coins")
-+local coins = profile:Get("Coins")
-+```
-+
-+## GetOr
-+
-+```lua
-+local value = profile:GetOr("Coins", 0)
-+```
-+
-+## Has
-+
-+```lua
-+if profile:Has("Settings") then
-+    print("Settings exist")
-+end
- ```
- 
- ## Set
- 
- ```lua
--profile:Set("Coins", 100)
--```
--
--`Set()` validates the profile and marks it dirty.
-+local ok, err = profile:Set("Coins", 500)
-+
-+if not ok then
-+    warn(err)
-+end
-+```
- 
- ## Increment
- 
- ```lua
-+local ok, newCoins = profile:Increment("Coins", 25)
-+
-+if ok then
-+    print("Coins:", newCoins)
-+end
-+```
-+
-+Default increment:
-+
-+```lua
- profile:Increment("Coins")
--profile:Increment("Coins", 25)
--```
--
--## Update
--
--```lua
--profile:Update("Coins", function(value)
--    return value + 100
-+```
-+
-+## IncrementClamped
-+
-+```lua
-+local ok, stamina = profile:IncrementClamped(
-+    "Stamina",
-+    -10,
-+    0,
-+    100
-+)
-+```
-+
-+## Toggle
-+
-+```lua
-+profile:Toggle({"Settings", "Music"})
-+```
-+
-+## Append
-+
-+```lua
-+profile:Append("Inventory", "WoodenSword")
-+```
-+
-+## RemoveAt
-+
-+```lua
-+profile:RemoveAt("Inventory", 1)
-+```
-+
-+## Award
-+
-+`Award()` accepts a non-negative finite amount:
-+
-+```lua
-+local ok, coins = profile:Award("Coins", 100)
-+```
-+
-+## Spend
-+
-+`Spend()` refuses the mutation when the balance is too low:
-+
-+```lua
-+local ok, balanceOrError = profile:Spend("Coins", 250)
-+
-+if not ok then
-+    warn(balanceOrError)
-+end
-+```
-+
-+## UpdatePath
-+
-+```lua
-+profile:UpdatePath("Coins", function(oldCoins)
-+    return (oldCoins or 0) * 2
- end)
- ```
- 
--## Get a copy
--
--```lua
--local copy = profile:GetDataCopy()
--```
--
--Changing the returned copy does not directly mutate the active profile.
--
--## Overwrite
--
--```lua
--profile:Overwrite({
--    Coins = 100,
--    Rebirths = 2,
--    Gems = 0,
--    Diamonds = 0,
--    Level = 1,
--    XP = 0,
--    AutoClickUnlocked = false,
--    MusicEnabled = true,
--    SelectedPet = "",
-+## Patch
-+
-+Apply multiple path writes as one validated draft:
-+
-+```lua
-+local ok, err = profile:Patch({
-+    {
-+        Path = "Coins",
-+        Value = 1000,
-+    },
-+    {
-+        Path = "Rebirths",
-+        Value = 10,
-+    },
-+    {
-+        Path = {"Settings", "Music"},
-+        Value = false,
-+    },
- })
--```
--
--The replacement must remain compatible with the declared template.
-+
-+if not ok then
-+    warn(err)
-+end
-+```
-+
-+---
-+
-+# Nested Paths
-+
-+A path can be:
-+
-+```lua
-+"Coins"
-+```
-+
-+a numeric array index:
-+
-+```lua
-+1
-+```
-+
-+or a path array:
-+
-+```lua
-+{"Settings", "Music"}
-+```
-+
-+Example:
-+
-+```lua
-+local music = profile:Get({"Settings", "Music"})
-+
-+profile:Set({"Settings", "Music"}, false)
-+```
-+
-+For arrays:
-+
-+```lua
-+local firstItem = profile:Get({"Inventory", 1})
-+```
-+
-+Path arrays must be non-empty.
-+
-+Numeric path keys must be positive safe integers.
- 
- ---
- 
- # Atomic Mutations
- 
--Use `Profile:Mutate()` for a transaction that changes several fields.
--
--```lua
--profile:Mutate(function(data)
-+Use `Mutate()` when several fields must change together:
-+
-+```lua
-+if profile.Data.Coins < 1000 then
-+    warn("NOT_ENOUGH_COINS")
-+    return
-+end
-+
-+local ok, result = profile:Mutate(function(data, session)
-     data.Coins -= 1000
-     data.Rebirths += 1
-+
-+    return "REBIRTH_COMPLETE"
- end)
--```
--
--The operation is transactional at the profile-table level:
-+
-+if not ok then
-+    warn(result)
-+else
-+    print(result)
-+end
-+```
-+
-+The callback receives:
-+
-+```lua
-+data: PlayersData.Data
-+session: Session<PlayersData.Data>
-+```
-+
-+The mutation flow is conceptually:
- 
- ```text
--copy old data
--    |
--    v
--run callback
--    |
--    v
--validate
--    |
--    +--> success -> commit + dirty
--    |
--    `--> failure -> restore backup
-+clone profile.Data
-+       |
-+       v
-+run callback on draft
-+       |
-+       v
-+validate draft
-+       |
-+   +---+---+
-+   |       |
-+ valid   invalid
-+   |       |
-+   v       v
-+commit    reject
- ```
- 
- This is useful for:
- 
-+- purchases;
- - rebirths;
- - prestige resets;
- - crafting;
--- purchases;
- - reward claims;
--- multi-stat upgrades.
--
-----
--
--# Dirty Tracking
--
--```lua
--print(profile:IsDirty())
--```
--
--Mutating APIs mark the profile dirty.
--
--With:
--
--```lua
--SaveOnlyDirty = true
--```
--
--unchanged profiles are skipped by autosave.
--
--Runtime diagnostics do not make a profile dirty.
--
--Historical schema migration does mark a migrated profile dirty so it can be rewritten using the newest schema.
--
-----
--
--# Saving
-+- multi-stat upgrades;
-+- inventory transactions.
-+
-+---
-+
-+# Snapshots and Rollback
-+
-+Create a snapshot:
-+
-+```lua
-+local snapshot = profile:Snapshot("before-rebirth")
-+```
-+
-+The returned object is typed as:
-+
-+```lua
-+Snapshot<Data>
-+```
-+
-+Restore it:
-+
-+```lua
-+local ok, err = profile:Restore(snapshot)
-+
-+if not ok then
-+    warn(err)
-+end
-+```
-+
-+Inspect differences from the last successfully persisted state:
-+
-+```lua
-+local changes = profile:DiffFromPersisted()
-+
-+for _, change in changes do
-+    print(change.Path, change.Before, change.After)
-+end
-+```
-+
-+The number of retained runtime snapshots is controlled by:
-+
-+```lua
-+MaxSnapshots = 10
-+```
-+
-+Snapshots are runtime objects. They are not a second permanent DataStore history system.
-+
-+---
-+
-+# Watching Data
-+
-+Watch a specific path:
-+
-+```lua
-+local connection = profile:Watch("Coins", function(newValue, oldValue, session, path)
-+    print("Coins:", oldValue, "->", newValue)
-+end)
-+```
-+
-+Watch every controlled mutation:
-+
-+```lua
-+local connection = profile:Watch(nil, function(newValue, oldValue, session, path)
-+    print("Changed path:", path)
-+end)
-+```
-+
-+Disconnect:
-+
-+```lua
-+connection:Disconnect()
-+```
-+
-+---
-+
-+# Saving and Releasing
- 
- ## Manual save
- 
- ```lua
--local success, saveError = profile:SaveAsync()
--
--if not success then
--    warn(saveError)
--end
--```
--
--## Store-level save
--
--```lua
--local success, saveError = Store:SavePlayerAsync(player)
--```
--
--## Flush
--
--```lua
--local success, failures = Store:FlushAsync()
--
--print(success, failures)
--```
--
--## Get current encoded buffer
--
--```lua
--local bufferValue = profile:GetBuffer()
--
--print(buffer.len(bufferValue))
--```
--
-----
--
--# Autosave
-+local ok, err = profile:SaveAsync()
-+
-+if not ok then
-+    warn("Save failed:", err)
-+end
-+```
-+
-+Optional priority:
-+
-+```lua
-+profile:SaveAsync("normal")
-+profile:SaveAsync("high")
-+profile:SaveAsync("critical")
-+```
-+
-+When omitted, the current implementation uses `"high"`.
-+
-+`"normal"` saves can return:
-+
-+```text
-+DEFERRED
-+```
-+
-+when `MinimumSaveInterval` has not elapsed. `"high"` and `"critical"` bypass that normal-save spacing check.
-+
-+The current priority type is:
-+
-+```lua
-+"normal" | "high" | "critical"
-+```
-+
-+## Release
-+
-+```lua
-+local ok, err = profile:ReleaseAsync()
-+
-+if not ok then
-+    warn("Release failed:", err)
-+end
-+```
-+
-+A release performs the final ownership-safe commit and removes the active session when successful.
-+
-+## Flush the store
-+
-+```lua
-+local ok, err = Store:FlushAsync(20)
-+
-+if not ok then
-+    warn(err)
-+end
-+```
-+
-+## Release every active session
-+
-+```lua
-+local results = Store:ReleaseAllAsync()
-+
-+for key, result in pairs(results) do
-+    print(key, result.Success, result.Error)
-+end
-+```
-+
-+## Close
-+
-+```lua
-+local ok, err = Store:CloseAsync(25)
-+
-+if not ok then
-+    warn(err)
-+end
-+```
-+
-+---
-+
-+# Autosave and Session Ownership
-+
-+NexusDataStore uses a lock inside the stored record.
-+
-+A stored record contains metadata conceptually similar to:
-+
-+```lua
-+{
-+    Format = 700,
-+    SchemaVersion = 1,
-+    Revision = 12,
-+    CreatedAt = 0,
-+    UpdatedAt = 0,
-+
-+    Data = {
-+        -- PlayersData
-+    },
-+
-+    Lock = {
-+        JobId = "...",
-+        SessionId = "...",
-+        HeartbeatAt = 0,
-+        ExpiresAt = 0,
-+    },
-+
-+    LastCommitId = "...",
-+}
-+```
-+
-+The lock is renewed independently through heartbeat commits.
- 
- Defaults:
- 
--```lua
--AutoSave = true
--AutoSaveInterval = 60
--SaveOnlyDirty = true
--```
--
--The autosave loop spreads work across loaded profiles.
--
--It does not intentionally save every active profile at the same instant.
--
-----
--
--# Save on Release
--
--Default:
--
--```lua
--SaveOnRelease = true
--```
--
--When a profile is released, dirty persistent data is saved before the session lock is released.
--
--The module installs its own `Players.PlayerRemoving` handler.
--
--It also installs its own `BindToClose` handler.
--
--Application code normally should not create duplicate release handlers for the same Store.
--
-----
--
--# Session Locking
--
--Session ownership is separate from permanent player progression.
--
--The current session payload is approximately:
-+```text
-+LockTimeout       = 120 seconds
-+HeartbeatInterval = floor(LockTimeout / 3), capped to <= LockTimeout / 2
-+AutoSaveInterval  = 30 seconds
-+```
-+
-+The store also protects against stale overwrites with a revision check.
-+
-+If the stored revision no longer matches the active session revision, the commit fails with:
-+
-+```text
-+REVISION_CONFLICT
-+```
-+
-+The session is not allowed to blindly overwrite the newer record.
-+
-+---
-+
-+# Schema Validation
-+
-+Template-type enforcement is enabled by default:
-+
-+```lua
-+EnforceTemplateTypes = true
-+```
-+
-+For:
-+
-+```lua
-+local PlayersData = {
-+    Coins = 0,
-+    Name = "",
-+    Settings = {
-+        Music = true,
-+    },
-+}
-+```
-+
-+the store rejects incompatible shapes such as:
- 
- ```lua
- {
--    Id = <16-byte GUID buffer>,
--    Released = false,
-+    Coins = "not a number",
-+    Name = 123,
- }
- ```
- 
--It is stored in `MemoryStoreService`.
--
--Default settings:
--
--```lua
--SessionLocking = true
--SessionLockTimeout = 180
--SessionRefreshInterval = 60
--LoadTimeout = 30
--LockRetryInterval = 1
--MemoryLockRetryAttempts = 4
--```
--
--The session heartbeat runs independently from permanent DataStore autosaves.
--
--An unchanged profile can skip permanent writes while still refreshing its MemoryStore lock.
--
-----
--
--# Lock Modes
--
--`OpenPlayerAsync()` supports:
--
--```lua
--type LockMode = "Wait" | "Cancel" | "Steal"
--```
--
--## Wait
--
--Default:
--
--```lua
--local profile, err = Store:OpenPlayerAsync(player)
--```
--
--or:
--
--```lua
--local profile, err = Store:OpenPlayerAsync(player, {
--    Locked = "Wait",
-+You can also provide an explicit schema:
-+
-+```lua
-+local Store = NexusDataStore.new({
-+    Name = "PlayerData",
-+    Template = PlayersData,
-+
-+    Schema = {
-+        Coins = {
-+            Type = "number",
-+            Required = true,
-+            Min = 0,
-+        },
-+
-+        Rebirths = {
-+            Type = "integer",
-+            Required = true,
-+            Min = 0,
-+        },
-+
-+        Inventory = {
-+            Type = "array",
-+            ArrayOf = {
-+                Type = "string",
-+            },
-+        },
-+
-+        Settings = {
-+            Type = "table",
-+            Children = {
-+                Music = {
-+                    Type = "boolean",
-+                    Required = true,
-+                },
-+            },
-+            AllowUnknown = false,
-+        },
-+    },
- })
- ```
- 
--## Cancel
--
--```lua
--local profile, err = Store:OpenPlayerAsync(player, {
--    Locked = "Cancel",
--})
--```
--
--If another session owns the profile, loading stops.
--
--## Steal
--
--```lua
--local profile, err = Store:OpenPlayerAsync(player, {
--    Locked = "Steal",
--})
--```
--
--Use `"Steal"` only when replacing another server's ownership is intentional.
--
-----
--
--# Updating PlayersData
--
--If the persistent schema changes, increase `DataTemplate.Version`.
--
--Old:
-+Supported schema type names are:
-+
-+```text
-+any
-+boolean
-+number
-+integer
-+string
-+table
-+array
-+```
-+
-+A custom validator can return `true`, `false`, or an error string:
-+
-+```lua
-+Schema = {
-+    Coins = {
-+        Type = "number",
-+
-+        Validate = function(value, path)
-+            if value % 1 ~= 0 then
-+                return path .. " must be a whole number"
-+            end
-+
-+            return true
-+        end,
-+    },
-+}
-+```
-+
-+---
-+
-+# Schema Migrations
-+
-+Increase `SchemaVersion` when your persistent layout needs a migration.
-+
-+Example old data:
- 
- ```lua
- local PlayersDataV1 = {
-     Coins = 0,
--    Rebirths = 0,
- }
- ```
- 
--New:
-+New data:
- 
- ```lua
- local PlayersData = {
-     Coins = 0,
--    Rebirths = 0,
--
-     Gems = 0,
--    Diamonds = 0,
--    Level = 1,
- }
- ```
- 
--Update:
--
--```lua
--DataTemplate = {
--    Version = 2,
--    Data = PlayersData,
-+Configure:
-+
-+```lua
-+local Store = NexusDataStore.new({
-+    Name = "PlayerData",
-+    Template = PlayersData,
-+
-+    SchemaVersion = 2,
-+
-+    Migrations = {
-+        [2] = function(data, context)
-+            data.Gems = data.Gems or 0
-+
-+            print(
-+                "Migrating",
-+                context.Key,
-+                context.FromVersion,
-+                "->",
-+                context.ToVersion
-+            )
-+
-+            return data
-+        end,
-+    },
-+})
-+```
-+
-+Migration entries are keyed by the **target version**.
-+
-+For a profile moving from version `1` to version `2`, the function is:
-+
-+```lua
-+Migrations[2]
-+```
-+
-+For multiple upgrades:
-+
-+```lua
-+Migrations = {
-+    [2] = function(data)
-+        data.Gems = data.Gems or 0
-+        return data
-+    end,
-+
-+    [3] = function(data)
-+        data.Rebirths = data.Rebirths or 0
-+        return data
-+    end,
- }
- ```
- 
--Then provide the old template:
--
--```lua
--DataTemplateHistory = {
--    [1] = PlayersDataV1,
-+NexusDataStore applies every missing migration in order.
-+
-+---
-+
-+# Compression
-+
-+NexusDataStore v7.0.2 is compatible with the **Compression v2.3.x** series using codec:
-+
-+```text
-+230
-+```
-+
-+The recommended module build is:
-+
-+```text
-+Compression v2.3.2
-+```
-+
-+The packet format has a fixed 11-byte header containing the codec identity, flags, and checksum metadata.
-+
-+The direct compression API is:
-+
-+```lua
-+Compression.CompressTablePacket(value, options?)
-+Compression.DecompressTable(buffer, options?)
-+Compression.Measure(value, options?)
-+Compression.TableMode(value, options?)
-+Compression.Version()
-+```
-+
-+---
-+
-+## Supported Compression Types
-+
-+Compression v2.3.2 directly supports these Luau value types:
-+
-+| Luau value | Supported | Encoding behavior |
-+|---|---:|---|
-+| `nil` | Yes | dedicated tag |
-+| `boolean` | Yes | dedicated `true` / `false` tags |
-+| safe integer `number` | Yes | signed variable-length integer |
-+| non-integer finite `number` | Yes | `f64` |
-+| `string` | Yes | raw string or dictionary reference |
-+| dense array `table` | Yes | array tag + count + values |
-+| map `table` | Yes | map tag + count + key/value pairs |
-+| nested tables | Yes | recursive |
-+| circular tables | No | rejected |
-+| `NaN` / `math.huge` | No | rejected |
-+| `buffer` | No | rejected by Compression v2.3.2 |
-+| `Vector2` | No | rejected |
-+| `Vector3` | No | rejected |
-+| `CFrame` | No | rejected |
-+| `Color3` | No | rejected |
-+| `Instance` | No | rejected |
-+| functions / threads | No | rejected |
-+
-+The DataStore persistence validator is intentionally narrower than the standalone codec:
-+
-+- the root player data must be a table;
-+- arrays must be dense;
-+- dictionary keys must be strings;
-+- mixed/sparse tables are rejected;
-+- circular references are rejected;
-+- non-finite numbers are rejected;
-+- Roblox datatypes such as `Vector3`, `CFrame`, and `buffer` are not persistent values in this v7.0.2 codec path.
-+
-+---
-+
-+## Compression Quick Start
-+
-+```lua
-+local Compression = require(script.Parent.Compression)
-+
-+local value = {
-+    Coins = 150000,
-+    Rebirths = 25,
-+    Title = "Legendary",
- }
--```
--
--Do **not** keep using the same DataTemplate version after changing an IndexedSchema layout.
--
-----
--
--# DataTemplateHistory
--
--`IndexedSchema` intentionally does not transmit root field names and descriptors with every player save.
--
--That is one reason it is compact.
--
--The tradeoff is that an old layout must be available when decoding an old save.
--
--Example:
--
--```lua
--local PlayersDataV1 = {
--    Coins = 0,
--    Rebirths = 0,
-+
-+local packet, report = Compression.CompressTablePacket(value)
-+
-+print("Raw bytes:", report.RawBytes)
-+print("Encoded bytes:", report.EncodedBytes)
-+print("Saved bytes:", report.SavedBytes)
-+print("Savings:", report.SavingsPercent)
-+print("Dictionary entries:", report.DictionaryEntries)
-+
-+local decoded = Compression.DecompressTable(packet)
-+
-+print(decoded.Coins)
-+print(decoded.Rebirths)
-+print(decoded.Title)
-+```
-+
-+Always test the round trip:
-+
-+```lua
-+assert(decoded.Coins == value.Coins)
-+assert(decoded.Rebirths == value.Rebirths)
-+assert(decoded.Title == value.Title)
-+```
-+
-+---
-+
-+## Compression Examples for Every Supported Type
-+
-+### Nil
-+
-+The direct codec can encode a root `nil`:
-+
-+```lua
-+local packet = Compression.CompressTablePacket(nil)
-+local decoded = Compression.DecompressTable(packet)
-+
-+assert(decoded == nil)
-+```
-+
-+A NexusDataStore player record itself cannot use `nil` as its root data because persistent player data must be a table.
-+
-+### Boolean
-+
-+```lua
-+local packet = Compression.CompressTablePacket(true)
-+local decoded = Compression.DecompressTable(packet)
-+
-+assert(decoded == true)
-+```
-+
-+False:
-+
-+```lua
-+local packet = Compression.CompressTablePacket(false)
-+local decoded = Compression.DecompressTable(packet)
-+
-+assert(decoded == false)
-+```
-+
-+### Small integer
-+
-+Integers use the signed variable-length path when they are within the codec's supported integer range:
-+
-+```lua
-+local packet, report = Compression.CompressTablePacket(30)
-+
-+print(report.EncodedBytes)
-+
-+local decoded = Compression.DecompressTable(packet)
-+
-+assert(decoded == 30)
-+```
-+
-+### Negative integer
-+
-+```lua
-+local packet = Compression.CompressTablePacket(-250)
-+local decoded = Compression.DecompressTable(packet)
-+
-+assert(decoded == -250)
-+```
-+
-+### Large integer
-+
-+```lua
-+local value = 1_000_000_000
-+
-+local packet = Compression.CompressTablePacket(value)
-+local decoded = Compression.DecompressTable(packet)
-+
-+assert(decoded == value)
-+```
-+
-+### Floating-point number
-+
-+Non-integer finite numbers use `f64`:
-+
-+```lua
-+local value = 123.456
-+
-+local packet = Compression.CompressTablePacket(value)
-+local decoded = Compression.DecompressTable(packet)
-+
-+assert(decoded == value)
-+```
-+
-+Invalid numbers are rejected:
-+
-+```lua
-+-- Compression.CompressTablePacket(0 / 0)
-+-- NON_FINITE_NUMBER
-+
-+-- Compression.CompressTablePacket(math.huge)
-+-- NON_FINITE_NUMBER
-+```
-+
-+### String
-+
-+```lua
-+local value = "NexusDataStore"
-+
-+local packet = Compression.CompressTablePacket(value)
-+local decoded = Compression.DecompressTable(packet)
-+
-+assert(decoded == value)
-+```
-+
-+For a single short string, packet framing can be larger than the original value. Compression becomes more useful when strings repeat inside larger structures.
-+
-+### Dense numeric array
-+
-+```lua
-+local value = {1, 30, 3490}
-+
-+local packet, report = Compression.CompressTablePacket(value)
-+local decoded = Compression.DecompressTable(packet)
-+
-+assert(decoded[1] == 1)
-+assert(decoded[2] == 30)
-+assert(decoded[3] == 3490)
-+
-+print("Encoded:", report.EncodedBytes)
-+```
-+
-+### String array
-+
-+```lua
-+local value = {
-+    "Common",
-+    "Common",
-+    "Common",
-+    "Rare",
-+    "Legendary",
- }
- 
--local Store = DataStore.new({
--    Name = "ClickStore5",
--
--    DataTemplate = {
--        Version = 2,
--        Data = PlayersData,
--    },
--
--    DataTemplateHistory = {
--        [1] = PlayersDataV1,
--    },
--})
--```
--
--The historical template is server-side code.
--
--It is not copied into every player's persistent buffer.
--
--## Why it is required
--
--Suppose version 1 saved:
--
--```lua
--{
-+local packet, report = Compression.CompressTablePacket(value)
-+local decoded = Compression.DecompressTable(packet)
-+
-+assert(decoded[5] == "Legendary")
-+
-+print("Dictionary entries:", report.DictionaryEntries)
-+```
-+
-+Repeated strings can be replaced with dictionary references when that is profitable.
-+
-+### String-keyed map
-+
-+```lua
-+local value = {
-     Coins = 5000,
-     Rebirths = 12,
-+    Rank = "Elite",
- }
--```
--
--and version 2 contains 100 fields.
--
--Without the old layout, the decoder knows the saved schema version but does not know which positional fields the old bits represented.
--
--With:
--
--```lua
--DataTemplateHistory[1]
--```
--
--the DataStore can reconstruct the old layout exactly.
--
-----
--
--# Schema Version Routing
--
--DataStore maps its versions to Compression schema versions as:
-+
-+local packet = Compression.CompressTablePacket(value)
-+local decoded = Compression.DecompressTable(packet)
-+
-+assert(decoded.Coins == 5000)
-+assert(decoded.Rebirths == 12)
-+assert(decoded.Rank == "Elite")
-+```
-+
-+### Nested table
-+
-+```lua
-+local value = {
-+    Coins = 5000,
-+
-+    Settings = {
-+        Music = true,
-+        SFX = false,
-+    },
-+
-+    Inventory = {
-+        "Sword",
-+        "Potion",
-+        "Potion",
-+    },
-+}
-+
-+local packet = Compression.CompressTablePacket(value)
-+local decoded = Compression.DecompressTable(packet)
-+
-+assert(decoded.Settings.Music == true)
-+assert(decoded.Inventory[1] == "Sword")
-+```
-+
-+### Repeated map keys and values
-+
-+This is where the string dictionary is useful:
-+
-+```lua
-+local value = {
-+    Inventory = {
-+        {
-+            Id = "CommonRune",
-+            Type = "CommonRune",
-+            Name = "CommonRune",
-+        },
-+        {
-+            Id = "CommonRune",
-+            Type = "CommonRune",
-+            Name = "CommonRune",
-+        },
-+        {
-+            Id = "CommonRune",
-+            Type = "CommonRune",
-+            Name = "CommonRune",
-+        },
-+    },
-+}
-+
-+local packet, report = Compression.CompressTablePacket(value)
-+
-+print("Dictionary entries:", report.DictionaryEntries)
-+print("Dictionary bytes:", report.DictionaryBytes)
-+print("Savings:", report.SavingsPercent)
-+```
-+
-+### Deterministic maps
-+
-+Enable deterministic key ordering when stable packet ordering is important:
-+
-+```lua
-+local options = {
-+    DeterministicMaps = true,
-+}
-+
-+local packetA = Compression.CompressTablePacket({
-+    Coins = 10,
-+    Gems = 20,
-+}, options)
-+
-+local packetB = Compression.CompressTablePacket({
-+    Gems = 20,
-+    Coins = 10,
-+}, options)
-+
-+assert(buffer.tostring(packetA) == buffer.tostring(packetB))
-+```
-+
-+In deterministic mode, map keys must be:
- 
- ```text
--Compression schema version = DataTemplate.Version + 1
--```
--
--Examples:
-+string
-+number
-+boolean
-+```
-+
-+For persistent NexusDataStore dictionaries, use string keys.
-+
-+---
-+
-+## Complete Compression Type Smoke Test
-+
-+This test exercises every value category supported by Compression v2.3.2:
-+
-+```lua
-+local Compression = require(script.Parent.Compression)
-+
-+local cases = {
-+    {
-+        Name = "nil",
-+        Value = nil,
-+    },
-+    {
-+        Name = "false",
-+        Value = false,
-+    },
-+    {
-+        Name = "true",
-+        Value = true,
-+    },
-+    {
-+        Name = "positive integer",
-+        Value = 3490,
-+    },
-+    {
-+        Name = "negative integer",
-+        Value = -3490,
-+    },
-+    {
-+        Name = "float",
-+        Value = 123.456,
-+    },
-+    {
-+        Name = "string",
-+        Value = "NexusDataStore",
-+    },
-+    {
-+        Name = "array",
-+        Value = {1, 30, 3490},
-+    },
-+    {
-+        Name = "map",
-+        Value = {
-+            Coins = 5000,
-+            Rebirths = 12,
-+        },
-+    },
-+    {
-+        Name = "nested",
-+        Value = {
-+            Stats = {
-+                Coins = 5000,
-+            },
-+
-+            Runes = {
-+                "Common",
-+                "Common",
-+                "Legendary",
-+            },
-+        },
-+    },
-+}
-+
-+for _, case in cases do
-+    local packet, report =
-+        Compression.CompressTablePacket(case.Value)
-+
-+    local decoded =
-+        Compression.DecompressTable(packet)
-+
-+    print(
-+        case.Name,
-+        "bytes =", report.EncodedBytes,
-+        "savings =", report.SavingsPercent
-+    )
-+
-+    if case.Value == nil then
-+        assert(decoded == nil)
-+    elseif typeof(case.Value) ~= "table" then
-+        assert(decoded == case.Value)
-+    end
-+end
-+```
-+
-+For table cases, verify the fields that matter to your schema, or use your own deep-equality helper.
-+
-+Do not include unsupported values such as:
-+
-+```lua
-+Vector3.new(1, 2, 3)
-+CFrame.new()
-+buffer.create(8)
-+workspace.Part
-+function() end
-+```
-+
-+Compression v2.3.2 rejects them with `UNSUPPORTED_TYPE:<type>`.
-+
-+---
-+
-+## Compression Reports
-+
-+Measure without manually handling the packet:
-+
-+```lua
-+local report = Compression.Measure({
-+    Coins = 1000000,
-+    Rebirths = 100,
-+    Inventory = {
-+        "Common",
-+        "Common",
-+        "Rare",
-+    },
-+})
-+
-+print("RawBytes:", report.RawBytes)
-+print("RawBits:", report.RawBits)
-+
-+print("EncodedBytes:", report.EncodedBytes)
-+print("EncodedBits:", report.EncodedBits)
-+
-+print("PayloadBytes:", report.PayloadBytes)
-+print("HeaderBytes:", report.HeaderBytes)
-+
-+print("SavedBytes:", report.SavedBytes)
-+print("SavedBits:", report.SavedBits)
-+
-+print("Ratio:", report.Ratio)
-+print("SavingsPercent:", report.SavingsPercent)
-+
-+print("DictionaryEntries:", report.DictionaryEntries)
-+print("DictionaryBytes:", report.DictionaryBytes)
-+
-+print("Codec:", report.Codec)
-+print("EngineVersion:", report.EngineVersion)
-+```
-+
-+The key formulas are:
- 
- ```text
--DataTemplate version 0 -> Compression schema 1
--DataTemplate version 1 -> Compression schema 2
--DataTemplate version 2 -> Compression schema 3
--DataTemplate version 3 -> Compression schema 4
--```
--
--The Compression build exposes:
--
--```lua
--Compression.SchemaPacketVersion(buffer)
--```
--
--The DataStore uses the embedded schema version before performing a full decode.
-+Ratio = EncodedBytes / RawBytes
-+
-+SavingsPercent =
-+    (1 - Ratio) * 100
-+```
-+
-+A negative savings percentage means the compressed packet is larger than the codec's raw-size estimate.
-+
-+That is normal for very small values because the packet has fixed framing overhead.
-+
-+---
-+
-+## Compression Options
-+
-+```lua
-+local options = {
-+    StringDictionary = true,
-+
-+    DictionaryMinLength = 4,
-+    DictionaryMinUses = 2,
-+    DictionaryMaxEntries = 16384,
-+    DictionaryMaxCandidates = 100000,
-+
-+    MaxDepth = 128,
-+    MaxNodes = 2000000,
-+
-+    DeterministicMaps = false,
-+
-+    PreallocateLimit = 4194304,
-+
-+    AllowExpansion = false,
-+}
-+```
-+
-+### `StringDictionary`
-+
-+Default:
-+
-+```lua
-+true
-+```
-+
-+Allows profitable repeated strings to be stored once and referenced by index.
-+
-+### `DictionaryMinLength`
-+
-+Default:
-+
-+```lua
-+4
-+```
-+
-+Strings shorter than this are not dictionary candidates.
-+
-+### `DictionaryMinUses`
-+
-+Default:
-+
-+```lua
-+2
-+```
-+
-+A candidate must occur at least this many times.
-+
-+### `DictionaryMaxEntries`
-+
-+Default:
-+
-+```lua
-+16384
-+```
-+
-+Bounds the final dictionary size.
-+
-+### `DictionaryMaxCandidates`
-+
-+Default:
-+
-+```lua
-+100000
-+```
-+
-+Bounds candidate collection work.
-+
-+### `MaxDepth`
-+
-+Default:
-+
-+```lua
-+128
-+```
-+
-+Rejects excessively deep values.
-+
-+### `MaxNodes`
-+
-+Default:
-+
-+```lua
-+2000000
-+```
-+
-+Bounds encode/decode traversal.
-+
-+### `DeterministicMaps`
-+
-+Default:
-+
-+```lua
-+false
-+```
-+
-+When enabled, supported map keys are sorted before encoding.
-+
-+### `PreallocateLimit`
-+
-+Default:
-+
-+```lua
-+4194304
-+```
-+
-+Caps the writer's initial preallocation estimate.
-+
-+### `AllowExpansion`
-+
-+This option is important to NexusDataStore persistence selection.
-+
-+The direct `Compression.CompressTablePacket()` API still returns a packet.
-+
-+NexusDataStore uses `AllowExpansion = false` to avoid persisting the compressed representation when the final stored representation is not smaller than the raw record.
-+
-+---
-+
-+## DataStore Compression Transport
-+
-+NexusDataStore can persist compression with:
-+
-+```lua
-+CompressionTransport = "auto"
-+```
-+
-+Available modes:
-+
-+```text
-+auto
-+buffer
-+base64
-+```
-+
-+### Auto
-+
-+Recommended:
-+
-+```lua
-+CompressionTransport = "auto"
-+```
-+
-+The store evaluates the actual serialized size of the candidates and keeps the better persistence representation.
-+
-+Conceptually:
-+
-+```text
-+raw record
-+    |
-+    +--> Compression packet
-+             |
-+             +--> buffer envelope
-+             |
-+             `--> Base64 envelope
-+    |
-+    v
-+compare stored sizes
-+    |
-+    v
-+smallest allowed representation
-+```
-+
-+If compression is larger and expansion is disabled, NexusDataStore stores the raw record instead.
-+
-+### Buffer
-+
-+```lua
-+CompressionTransport = "buffer"
-+```
-+
-+Forces the compressed envelope to use a Roblox `buffer` payload.
-+
-+### Base64
-+
-+```lua
-+CompressionTransport = "base64"
-+```
-+
-+Uses a Base64 string payload.
-+
-+This mode exists as a compatibility/fallback transport.
-+
-+---
-+
-+## Compression Through the Store
-+
-+Use the exact options configured on the store:
-+
-+```lua
-+local packet, report = Store:EncodeCompressed({
-+    Coins = 1000,
-+    Rebirths = 10,
-+})
-+
-+if not packet then
-+    warn(report)
-+    return
-+end
-+
-+print("Packet bytes:", buffer.len(packet))
-+print("Savings:", report.SavingsPercent)
-+```
-+
-+Decode:
-+
-+```lua
-+local decoded, err = Store:DecodeCompressed(packet)
-+
-+if not decoded then
-+    warn(err)
-+    return
-+end
-+
-+print(decoded.Coins)
-+```
-+
-+Inspect what persistence would actually choose:
-+
-+```lua
-+local report, err = Store:GetCompressionReport(profile)
-+
-+if not report then
-+    warn(err)
-+    return
-+end
-+
-+print("RawStorageEstimate:", report.RawStorageEstimate)
-+print("StorageBytes:", report.StorageBytes)
-+print("Transport:", report.Transport)
-+print("PersistedCompressed:", report.PersistedCompressed)
-+```
-+
-+This report follows the same persistence selection path used by saves.
-+
-+---
-+
-+## Corruption Protection
-+
-+Compression v2.3.2 validates:
-+
-+- packet magic;
-+- codec version;
-+- packet flags;
-+- Adler-32 payload checksum;
-+- dictionary counts;
-+- duplicate dictionary entries;
-+- node limits;
-+- depth limits;
-+- array counts;
-+- map counts;
-+- duplicate map keys;
-+- finite numbers;
-+- trailing bytes.
-+
-+Examples of decode failures include:
-+
-+```text
-+COMPRESSION_TRUNCATED
-+COMPRESSION_MAGIC_MISMATCH
-+UNSUPPORTED_COMPRESSION_VERSION
-+COMPRESSION_CHECKSUM_MISMATCH
-+INVALID_DICTIONARY_COUNT
-+DUPLICATE_DICTIONARY_ENTRY
-+INVALID_ARRAY_COUNT
-+INVALID_MAP_COUNT
-+DUPLICATE_MAP_KEY
-+COMPRESSION_TRAILING_BYTES
-+```
-+
-+NexusDataStore treats decode failure as a load failure.
-+
-+It does not intentionally replace a corrupt profile with defaults and then overwrite the stored progression.
-+
-+---
-+
-+# OrderedDataStore
-+
-+NexusDataStore has a built-in wrapper around Roblox OrderedDataStore.
-+
-+It can be used independently or synchronized from a profile path.
-+
-+Ordered values are numeric.
-+
-+Each ordered store is configured under:
-+
-+```lua
-+OrderedDataStores = {
-+    Alias = {
-+        -- config
-+    },
-+}
-+```
-+
-+Retrieve it with:
-+
-+```lua
-+local leaderboard, err = Store:GetOrderedStore("Coins")
-+
-+if not leaderboard then
-+    error(err)
-+end
-+```
-+
-+---
-+
-+## Leaderboard Configuration
- 
- Example:
- 
-+```lua
-+local Store = NexusDataStore.new({
-+    Name = "PlayerData",
-+    Template = PlayersData,
-+
-+    OrderedDataStores = {
-+        Coins = {
-+            Name = "CoinsLeaderboard",
-+            Scope = "Global",
-+
-+            Path = "Coins",
-+
-+            Mode = "max",
-+            AutoSync = true,
-+
-+            Integer = true,
-+            ClampMin = 0,
-+        },
-+
-+        Rebirths = {
-+            Name = "RebirthLeaderboard",
-+            Path = "Rebirths",
-+
-+            Mode = "max",
-+            AutoSync = true,
-+
-+            Integer = true,
-+            ClampMin = 0,
-+        },
-+    },
-+})
-+```
-+
-+When `Name` is omitted, the default is:
-+
- ```text
--stored schema version = 2
-+<MainStoreName>_<Alias>
-+```
-+
-+Example:
-+
-+```text
-+PlayerData_Coins
-+```
-+
-+When `Scope` is omitted, the parent store scope is used.
-+
-+---
-+
-+## Set Max and Min Modes
-+
-+Three write modes are available.
-+
-+### Set
-+
-+Always replace the current value:
-+
-+```lua
-+Mode = "set"
-+```
-+
-+Equivalent manual call:
-+
-+```lua
-+ordered:SetAsync(userId, 500)
-+```
-+
-+### Max
-+
-+Only replace when the new value is greater:
-+
-+```lua
-+Mode = "max"
-+```
-+
-+Useful for:
-+
-+- highest score;
-+- best wave;
-+- most rebirths;
-+- fastest progression value where larger is better.
-+
-+```lua
-+ordered:MaxAsync(userId, 500)
-+```
-+
-+If the existing value is `700`, writing `500` becomes a no-op.
-+
-+### Min
-+
-+Only replace when the new value is lower:
-+
-+```lua
-+Mode = "min"
-+```
-+
-+Useful for:
-+
-+- fastest completion time;
-+- fewest moves;
-+- best low-score metric.
-+
-+```lua
-+ordered:MinAsync(userId, 42)
-+```
-+
-+If the existing value is `30`, writing `42` becomes a no-op.
-+
-+---
-+
-+## Manual Ordered Writes
-+
-+### SetAsync
-+
-+```lua
-+local ok, value = ordered:SetAsync(player.UserId, 1000)
-+
-+if not ok then
-+    warn(value)
-+end
-+```
-+
-+### WriteAsync
-+
-+Uses the store's configured mode:
-+
-+```lua
-+local ok, value = ordered:WriteAsync(player.UserId, 1000)
-+```
-+
-+Override the mode for one call:
-+
-+```lua
-+ordered:WriteAsync(player.UserId, 1000, "set")
-+ordered:WriteAsync(player.UserId, 1000, "max")
-+ordered:WriteAsync(player.UserId, 1000, "min")
-+```
-+
-+### UpdateAsync
-+
-+```lua
-+local ok, value, state = ordered:UpdateAsync(
-+    player.UserId,
-+
-+    function(oldValue)
-+        oldValue = oldValue or 0
-+
-+        if oldValue >= 1_000_000 then
-+            return nil
-+        end
-+
-+        return oldValue + 100
-+    end
-+)
-+
-+if not ok then
-+    warn(value)
-+elseif state == "CANCELLED" then
-+    print("No write was needed")
-+else
-+    print("New value:", value)
-+end
-+```
-+
-+The transform must be:
-+
-+- non-yielding;
-+- deterministic enough to be retried;
-+- safe to execute more than once by the underlying `UpdateAsync` process.
-+
-+### RemoveAsync
-+
-+```lua
-+local ok, err = ordered:RemoveAsync(player.UserId)
-+
-+if not ok then
-+    warn(err)
-+end
-+```
-+
-+---
-+
-+## Incrementing
-+
-+Default delta:
-+
-+```lua
-+ordered:IncrementAsync(player.UserId)
-+```
-+
-+Custom delta:
-+
-+```lua
-+ordered:IncrementAsync(player.UserId, 25)
-+```
-+
-+For an integer store without clamping or rounding, NexusDataStore can use Roblox's native OrderedDataStore increment path.
-+
-+When the ordered store uses floating-point values, clamps, or rounding, NexusDataStore routes the increment through `UpdateAsync` so normalization is still applied correctly.
-+
-+---
-+
-+## Reading Leaderboards
-+
-+### Get one value
-+
-+```lua
-+local ok, value = ordered:GetAsync(player.UserId)
-+
-+if ok then
-+    print("Ordered value:", value)
-+else
-+    warn(value)
-+end
-+```
-+
-+### Top entries
-+
-+```lua
-+local ok, entries = ordered:GetTopAsync(10)
-+
-+if not ok then
-+    warn(entries)
-+    return
-+end
-+
-+for _, entry in entries do
-+    print(
-+        "#" .. entry.Rank,
-+        entry.Key,
-+        entry.Value
-+    )
-+end
-+```
-+
-+### Bottom entries
-+
-+```lua
-+local ok, entries = ordered:GetBottomAsync(10)
-+
-+if not ok then
-+    warn(entries)
-+    return
-+end
-+
-+for _, entry in entries do
-+    print(entry.Rank, entry.Key, entry.Value)
-+end
-+```
-+
-+### Filtered top page
-+
-+```lua
-+local ok, entries = ordered:GetTopAsync(
-+    25,
-+    1000,
-+    1_000_000
-+)
-+```
-+
-+The minimum/maximum filters used by the current wrapper must be safe integers.
-+
-+### Raw sorted pages
-+
-+```lua
-+local ok, pages = ordered:GetSortedAsync(
-+    false, -- descending
-+    100
-+)
-+
-+if not ok then
-+    warn(pages)
-+    return
-+end
-+
-+for _, entry in pages:GetCurrentPage() do
-+    print(entry.key, entry.value)
-+end
-+```
-+
-+---
-+
-+## Getting a Player Rank
-+
-+```lua
-+local ok, rankInfo = ordered:GetRankAsync(
-+    player.UserId,
-+    false, -- descending
-+    10     -- maximum pages to scan
-+)
-+
-+if not ok then
-+    warn(rankInfo)
-+    return
-+end
-+
-+print("Rank:", rankInfo.Rank)
-+print("Key:", rankInfo.Key)
-+print("Value:", rankInfo.Value)
-+```
-+
-+`GetRankAsync()` scans pages until:
-+
-+- the key is found;
-+- the OrderedDataStore is exhausted; or
-+- `maxPages` is reached.
-+
-+Possible non-success results include:
-+
-+```text
-+ORDERED_KEY_NOT_FOUND
-+RANK_SCAN_LIMIT
-+```
-+
-+---
-+
-+## Automatic Session Sync
-+
-+Configure:
-+
-+```lua
-+OrderedDataStores = {
-+    Coins = {
-+        Path = "Coins",
-+        Mode = "max",
-+        AutoSync = true,
-+        Integer = true,
-+    },
-+}
-+```
-+
-+`AutoSync = true` requires `Path`.
-+
-+After a successful persistent profile save, NexusDataStore synchronizes configured ordered stores when the saved snapshot is stable.
-+
-+Manual sync:
-+
-+```lua
-+local ok, err = Store:SyncOrderedAsync(profile, "Coins")
-+
-+if not ok then
-+    warn(err)
-+end
-+```
-+
-+Sync every ordered store configured for one profile:
-+
-+```lua
-+Store:SyncOrderedAsync(profile)
-+```
-+
-+Sync an alias across every active profile:
-+
-+```lua
-+Store:SyncAllOrderedAsync("Coins")
-+```
-+
-+Sync every ordered store across every active profile:
-+
-+```lua
-+Store:SyncAllOrderedAsync()
-+```
-+
-+---
-+
-+## Projected Ordered Values
-+
-+`ToNumber` can convert a stored profile value into the numeric value required by OrderedDataStore.
-+
-+Example data:
-+
-+```lua
-+local PlayersData = {
-+    BestRun = {
-+        Round = 0,
-+        Time = 0,
-+    },
-+}
-+```
-+
-+Configuration:
-+
-+```lua
-+OrderedDataStores = {
-+    BestRound = {
-+        Path = {"BestRun"},
-+
-+        Mode = "max",
-+        AutoSync = true,
-+        Integer = true,
-+
-+        ToNumber = function(bestRun, session)
-+            return bestRun.Round
-+        end,
-+    },
-+}
-+```
-+
-+Another example:
-+
-+```lua
-+ToNumber = function(value)
-+    return math.floor(value * 1000)
-+end
-+```
-+
-+This is useful when the profile representation is not already a single numeric value.
-+
-+---
-+
-+## Custom Ordered Keys
-+
-+By default, synchronized ordered stores use:
-+
-+1. `session.UserId`, when available;
-+2. otherwise `session.Key`.
-+
-+Override that behavior:
-+
-+```lua
-+OrderedDataStores = {
-+    Coins = {
-+        Path = "Coins",
-+        AutoSync = true,
-+
-+        KeyFromSession = function(session)
-+            return "Season1_" .. tostring(session.UserId)
-+        end,
-+    },
-+}
-+```
-+
-+Ordered keys must normalize to a string between 1 and 50 bytes.
-+
-+---
-+
-+## Ordered Value Normalization
-+
-+Available options:
-+
-+```lua
-+{
-+    ClampMin = 0,
-+    ClampMax = 1_000_000,
-+
-+    Integer = true,
-+
-+    Round = "nearest",
-+}
-+```
-+
-+Rounding modes:
-+
-+```text
-+nearest
-+floor
-+ceil
-+```
-+
-+Example:
-+
-+```lua
-+OrderedDataStores = {
-+    Rating = {
-+        Path = "Rating",
-+
-+        Mode = "set",
-+        AutoSync = true,
-+
-+        ClampMin = 0,
-+        ClampMax = 5000,
-+
-+        Integer = true,
-+        Round = "nearest",
-+    },
-+}
-+```
-+
-+---
-+
-+# Events
-+
-+Subscribe with:
-+
-+```lua
-+local connection = Store:On("Saved", function(profile, reason, release)
-+    print(
-+        "Saved",
-+        profile.Key,
-+        reason,
-+        release
-+    )
-+end)
-+```
-+
-+One-shot listener:
-+
-+```lua
-+Store:Once("Opened", function(profile)
-+    print("First opened profile:", profile.Key)
-+end)
-+```
-+
-+Events emitted by the current implementation include:
-+
-+```text
-+Opened
-+Saved
-+Released
-+Changed
-+SessionLost
-+CompressionReport
-+OrderedSyncCompleted
-+OrderedSyncFailed
-+DirectChangeInvalid
-+AutoSaveFailed
-+HeartbeatFailed
-+PlayerLoadFailed
-+PlayerReleaseFailed
-+PlayerKeyFailed
-+CrossServerEvent
-+CrossServerError
-+Closed
-+```
-+
-+Example compression diagnostics:
-+
-+```lua
-+Store:On("CompressionReport", function(report)
-+    print(
-+        report.StorageBytes,
-+        report.Transport,
-+        report.PersistedCompressed
-+    )
-+end)
-+```
-+
-+Enable these reports with:
-+
-+```lua
-+CompressionReports = true
-+```
-+
-+---
-+
-+# Health and Metrics
-+
-+## Metrics
-+
-+```lua
-+local metrics = Store:GetMetrics()
-+
-+print("Opened:", metrics.Opened)
-+print("Saved:", metrics.Saved)
-+print("SaveFailed:", metrics.SaveFailed)
-+print("Retries:", metrics.Retries)
-+
-+print("Heartbeats:", metrics.Heartbeats)
-+print("SessionLost:", metrics.SessionLost)
-+
-+print("BytesEncoded:", metrics.BytesEncoded)
-+
-+print("OrderedReads:", metrics.OrderedReads)
-+print("OrderedWrites:", metrics.OrderedWrites)
-+print("OrderedUpdates:", metrics.OrderedUpdates)
-+print("OrderedSyncs:", metrics.OrderedSyncs)
-+print("OrderedSyncFailed:", metrics.OrderedSyncFailed)
-+```
-+
-+## Health
-+
-+```lua
-+local health = Store:GetHealth()
-+
-+print("Version:", health.Version)
-+print("RecordFormat:", health.RecordFormat)
-+print("CompressionVersion:", health.CompressionVersion)
-+
-+print("Closed:", health.Closed)
-+print("Closing:", health.Closing)
-+
-+for requestName, budget in pairs(health.Budgets) do
-+    print(requestName, budget)
-+end
-+```
-+
-+---
-+
-+# Configuration Reference
-+
-+## Store configuration
-+
-+| Option | Default | Description |
-+|---|---:|---|
-+| `Name` | required | Standard DataStore name |
-+| `Scope` | `"Global"` | Standard DataStore scope |
-+| `Template` | required | `PlayersData.Data` template |
-+| `Schema` | `nil` | Optional runtime validation schema |
-+| `SchemaVersion` | `1` | Persistent schema version |
-+| `Migrations` | `{}` | Migration functions keyed by target version |
-+| `Strict` | `false` | Reject unknown template/schema keys |
-+| `Reconcile` | `true` | Fill missing template fields |
-+| `EnforceTemplateTypes` | `true` | Require loaded/written values to match template types |
-+| `ValidateOnWrite` | `true` | Validate controlled mutations before commit |
-+| `DetectDirectChanges` | `true` | Detect direct edits to `profile.Data` |
-+| `Compression` | `true` | Enable persistence compression selection |
-+| `CompressionModule` | auto | Explicit Compression ModuleScript override |
-+| `CompressionOptions` | `{}` | Compression v2.3.x options |
-+| `CompressionReports` | `false` | Emit `CompressionReport` events |
-+| `CompressionTransport` | `"auto"` | `"auto"`, `"buffer"`, or `"base64"` |
-+| `AutoSave` | `true` | Enable periodic saves |
-+| `AutoSaveInterval` | `30` | Seconds between target autosaves |
-+| `LockTimeout` | `120` | Session-lock lifetime |
-+| `HeartbeatInterval` | derived | Session-lock refresh interval |
-+| `RetryAttempts` | `6` | Backend retry attempts |
-+| `RetryBaseDelay` | `0.5` | Initial retry backoff |
-+| `RetryMaxDelay` | `10` | Maximum retry backoff |
-+| `BudgetAware` | `true` | Wait for Roblox request budget |
-+| `BudgetWaitTimeout` | `10` | Maximum budget wait per attempt |
-+| `MinimumSaveInterval` | `3` | Minimum normal-save spacing |
-+| `LoadTimeout` | `30` | Overall load deadline |
-+| `SaveTimeout` | `30` | Overall save deadline |
-+| `MaxDataNodes` | `50000` | Maximum validated data nodes |
-+| `MaxDataBytes` | `3900000` | Maximum estimated raw data size |
-+| `MaxStoredBytes` | `3900000` | Maximum final stored representation |
-+| `MaxDepth` | `64` | Maximum persistent table depth |
-+| `MaxSnapshots` | `10` | Runtime snapshots retained |
-+| `KeyPrefix` | `""` | Prefix added to normal DataStore keys |
-+| `PlayerKey` | `nil` | Custom player key function |
-+| `AutoPlayerLifecycle` | `false` | Automatically open/release players |
-+| `EnableCrossServerEvents` | `false` | Enable MessagingService events |
-+| `CrossServerTopic` | generated | Cross-server MessagingService topic |
-+| `OrderedDataStores` | `{}` | OrderedDataStore definitions |
-+| `Debug` | `false` | Debug logging |
-+
-+## Compression options
-+
-+| Option | Default |
-+|---|---:|
-+| `StringDictionary` | `true` |
-+| `DictionaryMinLength` | `4` |
-+| `DictionaryMinUses` | `2` |
-+| `DictionaryMaxEntries` | `16384` |
-+| `DictionaryMaxCandidates` | `100000` |
-+| `MaxDepth` | `128` |
-+| `MaxNodes` | `2000000` |
-+| `DeterministicMaps` | `false` |
-+| `PreallocateLimit` | `4194304` |
-+| `AllowExpansion` | `false` |
-+
-+## OrderedDataStore configuration
-+
-+| Option | Default | Description |
-+|---|---:|---|
-+| `Name` | `<Store>_<Alias>` | OrderedDataStore name |
-+| `Scope` | parent scope | OrderedDataStore scope |
-+| `Path` | `nil` | Profile path to synchronize |
-+| `Mode` | `"max"` | `"set"`, `"max"`, or `"min"` |
-+| `AutoSync` | `false` | Sync after successful profile saves |
-+| `ToNumber` | `nil` | Convert profile value to a number |
-+| `KeyFromSession` | UserId/key | Custom ordered key |
-+| `ClampMin` | `nil` | Minimum output value |
-+| `ClampMax` | `nil` | Maximum output value |
-+| `Integer` | `false` | Require a safe integer |
-+| `Round` | `nil` | `"nearest"`, `"floor"`, or `"ceil"` |
-+| `RemoveWhenNil` | `false` | Remove ordered entry when synced path is nil |
-+
-+---
-+
-+# API Reference
-+
-+## NexusDataStore
-+
-+```lua
-+NexusDataStore.new(config)
-+```
-+
-+Public metadata:
-+
-+```lua
-+NexusDataStore.Version
-+NexusDataStore.RecordFormat
-+NexusDataStore.RequiredCompressionVersion
-+NexusDataStore.Errors
-+NexusDataStore.OrderedDataStore
-+NexusDataStore.Compression
-+```
-+
-+## Store
-+
-+```lua
-+Store:OpenAsync(key, context?)
-+Store:OpenPlayerAsync(player)
-+
-+Store:PeekAsync(key)
-+
-+Store:GetSession(keyOrPlayer)
-+Store:WaitForSession(keyOrPlayer, timeout?)
-+
-+Store:SaveAsync(session, priority?)
-+Store:ReleaseAsync(session)
-+
-+Store:FlushAsync(timeout?)
-+Store:ReleaseAllAsync()
-+Store:CloseAsync(timeout?)
-+
-+Store:Validate(data)
-+
-+Store:GetTemplate()
-+Store:GetSchema()
-+Store:GetVersion()
-+
-+Store:EncodeCompressed(data)
-+Store:DecodeCompressed(buffer)
-+Store:GetCompressionReport(dataOrSession)
-+
-+Store:GetOrderedStore(alias)
-+Store:SyncOrderedAsync(session, alias?)
-+Store:SyncAllOrderedAsync(alias?)
-+
-+Store:GetMetrics()
-+Store:GetHealth()
-+
-+Store:AttachPlayerLifecycle()
-+Store:BindToClose()
-+
-+Store:On(eventName, callback)
-+Store:Once(eventName, callback)
-+```
-+
-+## Session / Profile
-+
-+```lua
-+profile:IsActive()
-+profile:IsDirty()
-+
-+profile:Get(path)
-+profile:GetOr(path, fallback)
-+profile:Has(path)
-+
-+profile:Set(path, value)
-+profile:Delete(path)
-+
-+profile:Increment(path, amount?)
-+profile:IncrementClamped(path, amount?, min?, max?)
-+
-+profile:Toggle(path)
-+
-+profile:Append(path, value)
-+profile:RemoveAt(path, index)
-+
-+profile:Award(path, amount)
-+profile:Spend(path, amount)
-+
-+profile:UpdatePath(path, callback)
-+profile:Mutate(callback)
-+profile:Patch(changes)
-+
-+profile:Watch(path?, callback)
-+
-+profile:Snapshot(label?)
-+profile:Restore(snapshot)
-+profile:DiffFromPersisted()
-+
-+profile:SaveAsync(priority?)
-+profile:ReleaseAsync()
-+
-+profile:GetStatus()
-+profile:GetStats()
-+```
-+
-+## OrderedStore
-+
-+```lua
-+ordered:GetAsync(key)
-+
-+ordered:SetAsync(key, value)
-+ordered:UpdateAsync(key, transform)
-+
-+ordered:MaxAsync(key, value)
-+ordered:MinAsync(key, value)
-+
-+ordered:IncrementAsync(key, delta?)
-+ordered:RemoveAsync(key)
-+
-+ordered:WriteAsync(key, value, mode?)
-+
-+ordered:GetSortedAsync(ascending?, pageSize?, minimum?, maximum?)
-+ordered:GetPageAsync(ascending?, pageSize?, minimum?, maximum?)
-+
-+ordered:GetTopAsync(limit?, minimum?, maximum?)
-+ordered:GetBottomAsync(limit?, minimum?, maximum?)
-+
-+ordered:GetRankAsync(key, ascending?, maxPages?)
-+
-+ordered:SyncSessionAsync(profile)
-+```
-+
-+## Compression
-+
-+```lua
-+Compression.Version()
-+Compression.TableMode(value, options?)
-+
-+Compression.CompressTablePacket(value, options?)
-+Compression.DecompressTable(packet, options?)
-+
-+Compression.Measure(value, options?)
-+```
-+
-+---
-+
-+# Production Patterns
-+
-+## Use server authority
-+
-+Do not trust a client-supplied balance:
-+
-+```lua
-+RemoteEvent.OnServerEvent:Connect(function(player, requestedCoins)
-+    local profile = Store:GetSession(player)
-+
-+    if not profile then
-+        return
-+    end
-+
-+    profile:Set("Coins", requestedCoins)
-+end)
-+```
-+
-+Prefer server-defined progression:
-+
-+```lua
-+RemoteEvent.OnServerEvent:Connect(function(player)
-+    local profile = Store:GetSession(player)
-+
-+    if not profile then
-+        return
-+    end
-+
-+    profile:Award("Coins", 1)
-+end)
-+```
-+
-+## Keep progression bounded
-+
-+Compression does not remove Roblox platform limits.
-+
-+Put deliberate limits on:
-+
-+- inventory length;
-+- string length;
-+- nested table depth;
-+- generated keys;
-+- leaderboard scan depth;
-+- snapshot count.
-+
-+## Do not overwrite decode failures
-+
-+If:
-+
-+```lua
-+OpenPlayerAsync()
-+```
-+
-+returns a decode or validation error, stop initialization.
-+
-+Do not create a fresh profile and immediately save it over the failed record.
-+
-+## Prefer controlled mutations
-+
-+This:
-+
-+```lua
-+profile:Award("Coins", 100)
-+```
-+
-+gives the store an immediate mutation boundary.
-+
-+Direct writes:
-+
-+```lua
-+profile.Data.Coins += 100
-+```
-+
-+can still be detected when `DetectDirectChanges = true`, but controlled APIs avoid waiting for a scan to discover the edit.
-+
-+## Use max mode for high-score leaderboards
-+
-+```lua
-+Mode = "max"
-+```
-+
-+prevents a lower later value from replacing a player's best score.
-+
-+## Use min mode for completion times
-+
-+```lua
-+Mode = "min"
-+```
-+
-+preserves the player's fastest time when lower is better.
-+
-+---
-+
-+# Testing
-+
-+Before production, test all of the following.
-+
-+## Persistence
-+
-+- first join;
-+- manual save;
-+- leave/rejoin;
-+- server shutdown;
-+- autosave;
-+- release;
-+- direct mutation detection;
-+- controlled mutations;
-+- invalid data rejection;
-+- schema reconciliation;
-+- migrations.
-+
-+## Concurrency
-+
-+- two servers attempting the same profile;
-+- lock expiration;
-+- heartbeat renewal;
-+- revision conflict;
-+- save during mutation;
-+- release during mutation.
-+
-+## Compression
-+
-+Use representative player data, not only tiny values.
-+
-+```lua
-+local test = {
-+    Coins = 10_000_000,
-+    Rebirths = 250,
-+
-+    Inventory = {
-+        "CommonRune",
-+        "CommonRune",
-+        "CommonRune",
-+        "LegendaryRune",
-+    },
-+
-+    Upgrades = {
-+        Click = 100,
-+        Luck = 50,
-+        Speed = 25,
-+    },
-+}
-+
-+local packet, report = Compression.CompressTablePacket(test)
-+local decoded = Compression.DecompressTable(packet)
-+
-+print("Raw:", report.RawBytes)
-+print("Encoded:", report.EncodedBytes)
-+print("Saved:", report.SavedBytes)
-+print("Savings:", report.SavingsPercent)
-+print("Dictionary:", report.DictionaryEntries)
-+
-+assert(decoded.Coins == test.Coins)
-+assert(decoded.Upgrades.Click == test.Upgrades.Click)
-+assert(decoded.Inventory[4] == test.Inventory[4])
-+```
-+
-+Also test:
-+
-+- corrupted checksum;
-+- truncated packets;
-+- repeated strings;
-+- deep tables;
-+- large arrays;
-+- all-default player state;
-+- heavily changed player state;
-+- `CompressionTransport = "auto"`;
-+- buffer transport;
-+- Base64 transport.
-+
-+## OrderedDataStore
-+
-+Test:
-+
-+- `set`;
-+- `max`;
-+- `min`;
-+- positive increment;
-+- negative increment;
-+- clamp min/max;
-+- integer mode;
-+- rounding;
-+- top 10;
-+- bottom 10;
-+- rank lookup;
-+- auto sync after save;
-+- manual sync;
-+- remove on nil;
-+- budget pressure.
-+
-+---
-+
-+# FAQ
-+
-+## Is `profile.Data` really typed?
-+
-+Yes.
-+
-+The current module uses:
-+
-+```lua
-+export type Data = PlayersData.Data
-+```
-+
-+and exposes the player store as:
-+
-+```lua
-+Store<Data>
-+```
-+
-+which returns:
-+
-+```lua
-+Session<Data>
-+```
-+
-+therefore:
-+
-+```lua
-+profile.Data
-+```
-+
-+is `PlayersData.Data`.
-+
-+## Does Compression support every Roblox datatype?
-+
-+No.
-+
-+Compression v2.3.2 supports:
-+
-+```text
-+nil
-+boolean
-+finite number
-+string
-+array table
-+map table
-+nested table
-+```
-+
-+It does not currently encode Roblox datatypes such as `Vector3`, `CFrame`, or `buffer`.
-+
-+## Why can a tiny value become larger?
-+
-+Every packet has framing/checksum overhead.
-+
-+Compression is primarily useful for structured values large enough for compact integers and repeated-string dictionaries to outweigh the fixed header.
-+
-+## Does `AllowExpansion = false` make direct compression return the raw value?
-+
-+No.
-+
-+`Compression.CompressTablePacket()` always returns a compression packet.
-+
-+NexusDataStore uses `AllowExpansion = false` while choosing the final persistence representation, so it can keep the raw record when the compressed envelope would be larger.
-+
-+## What does `CompressionTransport = "auto"` do?
-+
-+It compares the available persisted representations and chooses the smaller allowed representation.
-+
-+That can be:
-+
-+```text
-+raw table
-+compressed buffer envelope
-+compressed Base64 envelope
-+```
-+
-+## Is compression checked for corruption?
-+
-+Yes.
-+
-+The packet contains an Adler-32 checksum and the decoder also validates its header, codec, counts, dictionary references, limits, and trailing bytes.
-+
-+## Are session locks stored in MemoryStore?
-+
-+Not in this v7 architecture.
-+
-+The current record owns a `Lock` structure containing the job/session identity and expiration information.
-+
-+## Does OrderedDataStore store tables?
-+
-+No.
-+
-+Roblox OrderedDataStore values are numeric. `ToNumber` exists to project profile data into a numeric leaderboard value.
-+
-+## What OrderedDataStore mode should I use?
-+
-+Use:
-+
-+```text
-+set -> latest/current value
-+max -> highest/best large value
-+min -> lowest/best small value
-+```
-+
-+## Does AutoSync require a path?
-+
-+Yes.
-+
-+```lua
-+AutoSync = true
-+```
-+
-+requires:
-+
-+```lua
-+Path = ...
-+```
-+
-+## Does OrderedDataStore sync before or after the main save?
-+
-+Automatic ordered synchronization runs after a successful stable persistent profile commit.
-+
-+That keeps the ordered value aligned with successfully persisted profile data.
-+
-+## Should I use direct writes or `profile:Set()`?
-+
-+Both can work.
-+
-+For most gameplay systems, controlled methods such as:
-+
-+```lua
-+Set
-+Increment
-+Award
-+Spend
-+Mutate
-+Patch
-+```
-+
-+are easier to validate and track immediately.
-+
-+---
-+
-+# Release Summary
-+
-+NexusDataStore v7.0.2 uses a deliberately defensive save flow:
-+
-+```text
-+PlayersData.Data
-+      |
-+      v
-+Session<Data>
-+      |
-+      v
-+validate / reconcile / mutate
-+      |
-+      v
-+revision-safe UpdateAsync
-+      |
-+      +--> raw record
-+      |
-+      `--> Compression v2.3.x
-+              |
-+              +--> buffer transport
-+              |
-+              `--> Base64 transport
-+      |
-+      v
-+smallest allowed persistent representation
-+      |
-+      v
-+Roblox DataStore
-+```
-+
-+Ordered data is synchronized separately:
-+
-+```text
-+successful profile save
-         |
-         v
--DataTemplate version = 1
-+LastPersistedSnapshot
-         |
-         v
--DataTemplateHistory[1]
-+configured OrderedDataStore Path
-         |
-         v
--decode old data
--```
--
--This avoids decoding an old bitstream with a newer 100-field layout.
--
-----
--
--# Reconciliation
--
--Default:
--
--```lua
--Reconcile = true
--```
--
--Reconciliation only fills missing fields.
--
--Given the new template:
--
--```lua
--{
--    Coins = 0,
--    Rebirths = 0,
--    Gems = 0,
--}
--```
--
--and old decoded data:
--
--```lua
--{
--    Coins = 5000,
--    Rebirths = 12,
--}
--```
--
--the reconciled profile becomes:
--
--```lua
--{
--    Coins = 5000,
--    Rebirths = 12,
--    Gems = 0,
--}
--```
--
--Existing values are preserved.
--
--Defaults are copied only for missing keys.
--
--When reconciliation changes the loaded profile, the profile is considered migrated/dirty and can be rewritten with the newest schema.
--
-----
--
--# Persistent Validation
--
--The module validates data before saving.
--
--It rejects or limits:
--
--- circular tables;
--- NaN and infinity;
--- unsupported Roblox/Luau values;
--- unsupported table-key types;
--- keyed/numeric table shape conflicts;
--- sparse numeric arrays;
--- excessive table depth;
--- excessive entry counts;
--- keyed fields not declared by the template;
--- fields whose runtime type changed from the template type.
--
--Supported scalar values include:
--
--- booleans;
--- finite numbers;
--- strings;
--- buffers;
--- `Vector2`;
--- `Vector3`;
--- `Color3`;
--- `CFrame`;
--- `UDim`;
--- `UDim2`;
--- `Rect`;
--- `NumberRange`;
--- `BrickColor`;
--- `DateTime`.
--
--Tables must remain compatible with the declared persistent shape.
--
-----
--
--# Compact Player Keys
--
--Player keys use a compact Base85 unsigned-integer representation.
--
--The alphabet contains 85 characters.
--
--The permanent key is generated from the numeric UserId.
--
--There is no need to store:
--
--```text
--Player_10800269681
--```
--
--as the actual key string.
--
--Inspect a key with:
--
--```lua
--local info = Store:GetKeyInfo(player)
--
--print("UserId:", info.UserId)
--print("Key:", info.Key)
--print("Key bytes:", info.KeyBytes)
--print("Plain bytes:", info.PlainKeyBytes)
--print("Saved bytes:", info.SavedBytes)
--print("Savings:", info.SavingsPercent)
--print("Codec:", info.Codec)
--```
--
--Current codec label:
--
--```text
--Base85UInt
--```
--
--The player key is separate from the player-data buffer.
--
-----
--
--# Diagnostics
--
--## Profile storage info
--
--```lua
--local info = profile:GetStorageInfo()
--
--print("Version:", info.Version)
--print("Player key:", info.PlayerKey)
--print("Stored bytes:", info.StoredBytes)
--print("Raw bytes:", info.RawBytes)
--print("Saved bytes:", info.SavedBytes)
--print("Savings:", info.SavingsPercent)
--print("Codec:", info.Codec)
--print("Useful bits:", info.UsefulBits)
--print("Physical bits:", info.PhysicalBits)
--print("Padding bits:", info.PaddingBits)
--print("Dirty:", info.Dirty)
--print("Revision:", info.Revision)
--```
--
--These values are diagnostics.
--
--They are not inserted into the permanent player buffer.
--
--## Runtime statistics
--
--```lua
--local stats = Store:GetRuntimeStats()
--
--print("Loads:", stats.Loads)
--print("LoadFailures:", stats.LoadFailures)
--print("Saves:", stats.Saves)
--print("SaveFailures:", stats.SaveFailures)
--print("Autosaves:", stats.Autosaves)
--print("SessionRefreshes:", stats.SessionRefreshes)
--print("SessionRefreshFailures:", stats.SessionRefreshFailures)
--print("SessionLosses:", stats.SessionLosses)
--print("BytesWritten:", stats.BytesWritten)
--```
--
--## Compression layout info
--
--```lua
--local info = Store:GetCompressionLayoutInfo()
--
--print("Available:", info.Available)
--print("DataVersion:", info.DataVersion)
--print("LayoutVersion:", info.LayoutVersion)
--print("Mode:", info.Mode)
--print("FieldCount:", info.FieldCount)
--
--for _, version in info.HistoricalVersions do
--    print("Historical version:", version)
--end
--```
--
-----
--
--# Exact Stored Buffer
--
--To inspect the literal value returned from Roblox DataStore:
--
--```lua
--local storedBuffer, errorMessage =
--    Store:GetStoredBufferAsync(player)
--
--if storedBuffer ~= nil then
--    print("Payload bytes:", buffer.len(storedBuffer))
--else
--    warn(errorMessage)
--end
--```
--
--This is the closest module-level value to compare with a storage inspector that reports `buffer.len()`.
--
--Roblox Creator Hub accounting can include platform-side representation costs that are not the same thing as the raw Luau buffer length.
--
-----
--
--# Read-Only Inspection
--
--## View template
--
--```lua
--local dataTemplate, errorMessage =
--    Store:ViewTemplateAsync(player.UserId)
--
--if dataTemplate ~= nil then
--    print(dataTemplate.Version)
--    print(dataTemplate.Data.Coins)
--else
--    warn(errorMessage)
--end
--```
--
--## View data only
--
--```lua
--local playerData, version, errorMessage =
--    Store:ViewAsync(player.UserId)
--
--if playerData ~= nil then
--    print(version)
--    print(playerData.Coins)
--else
--    warn(errorMessage)
--end
--```
--
--These methods do not create an active profile.
--
-----
--
--# Session Inspection
--
--```lua
--local session, errorMessage =
--    Store:GetSessionLockInfoAsync(player)
--
--if session ~= nil then
--    print("Id:", session.Id)
--    print("Released:", session.Released)
--    print("Bytes:", session.Bytes)
--    print("Codec:", session.Codec)
--else
--    warn(errorMessage)
--end
--```
--
--This describes MemoryStore session ownership, not permanent player progression.
--
-----
--
--# Signals
--
--## Profile Changed
--
--```lua
--profile.Changed:Connect(function(key, newValue, oldValue)
--    print("Changed:", key, oldValue, "->", newValue)
--end)
--```
--
--Multi-field operations may use `key == nil`.
--
--## Profile Saved
--
--```lua
--profile.Saved:Connect(function(storageInfo)
--    print("Saved:", storageInfo.StoredBytes)
--end)
--```
--
--## Profile Released
--
--```lua
--profile.Released:Connect(function(reason)
--    print("Released:", reason)
--end)
--```
--
--## Store ProfileLoaded
--
--```lua
--Store.ProfileLoaded:Connect(function(profile)
--    print("Loaded:", profile.UserId)
--end)
--```
--
--## Store ProfileReleased
--
--```lua
--Store.ProfileReleased:Connect(function(profile, reason)
--    print("Released:", profile.UserId, reason)
--end)
--```
--
--## Store Issue
--
--```lua
--Store.Issue:Connect(function(kind, ...)
--    warn("[DataStore Issue]", kind, ...)
--end)
--```
--
-----
--
--# Configuration Reference
--
--| Option | Default | Description |
--|---|---:|---|
--| `Name` | required | Roblox DataStore name |
--| `Scope` | `nil` | Optional DataStore scope |
--| `DataTemplate` | required | Current `{Version, Data}` template |
--| `DataTemplateHistory` | `{}` | Old templates keyed by old DataTemplate version |
--| `Reconcile` | `true` | Fill missing fields after decode |
--| `AutoSave` | `true` | Enable automatic saving |
--| `AutoSaveInterval` | `60` | Target autosave interval |
--| `SaveOnlyDirty` | `true` | Skip unchanged profiles |
--| `SaveOnRelease` | `true` | Save dirty data before releasing |
--| `SessionLocking` | `true` | Enable MemoryStore session ownership |
--| `SessionLockTimeout` | `180` | Session lock TTL |
--| `SessionRefreshInterval` | `60` | MemoryStore heartbeat interval |
--| `LoadTimeout` | `30` | Maximum load/session wait |
--| `LockRetryInterval` | `1` | Wait-mode retry interval |
--| `MemoryLockRetryAttempts` | `4` | MemoryStore retry count |
--| `RetryAttempts` | `5` | DataStore retry count |
--| `RetryDelay` | `0.75` | Initial DataStore retry delay |
--| `MaxRetryDelay` | `8` | Maximum retry delay |
--| `ShutdownTimeout` | `25` | Maximum shutdown wait |
--| `BudgetAware` | `true` | Respect DataStore request budget |
--| `BudgetWaitTimeout` | `10` | Maximum budget wait |
--| `CompressionCompressStrings` | `true` | Enable string compression |
--| `CompressionStringStrategy` | `"Auto"` | String codec strategy |
--| `CompressionUseStringDictionary` | `true` | Enable string dictionary |
--| `CompressionHomogeneousArrays` | `true` | Optimize homogeneous arrays |
--| `CompressionDeltaArrays` | `true` | Enable delta arrays |
--| `CompressionRunLengthArrays` | `true` | Enable run-length arrays |
--| `CompressionCompactMapKeys` | `true` | Compact map keys |
--| `CompressionTableKeyMapping` | `true` | Enable mapped table keys |
--| `CompressionTableStrategy` | `"Auto"` | Table codec strategy |
--| `CompressionEntropyCoding` | `true` | Enable entropy coding |
--| `CompressionEntropyStrategy` | `"Auto"` | Entropy strategy |
--| `CompressionAllowExpansion` | `false` | Avoid selecting expanding compression |
--| `CompressionBufferStrategy` | `"Auto"` | Buffer codec strategy |
--| `CompressionBufferMinLength` | `6` | Minimum buffer length considered |
--| `CompressionBufferSearchDepth` | `32` | Buffer search depth |
--| `CompressionBufferWindowSize` | `32767` | Buffer search window |
--| `CompressionBufferMaxMatch` | `66` | Maximum match length |
--| `MaxBufferBytes` | `3800000` | Maximum encoded player buffer |
--| `MaxDepth` | `64` | Maximum persistent table depth |
--| `MaxTableEntries` | `100000` | Maximum validated entries |
--| `Debug` | `false` | Enable debug warnings |
--
-----
--
--# Store API
--
--## Construction
--
--```lua
--DataStore.new(config)
--```
--
--## Active profiles
--
--```lua
--Store:GetProfile(subject)
--Store:OpenPlayerAsync(subject, options?)
--Store:GetLoadedProfiles()
--```
--
--## Read-only stored data
--
--```lua
--Store:ViewTemplateAsync(subject)
--Store:ViewAsync(subject)
--Store:GetStoredBufferAsync(subject)
--Store:GetStoredPayloadAsync(subject)
--```
--
--## Session ownership
--
--```lua
--Store:GetSessionLockInfoAsync(subject)
--```
--
--## Save and release
--
--```lua
--Store:SavePlayerAsync(subject)
--Store:ReleasePlayerAsync(subject, reason?)
--Store:FlushAsync()
--Store:CloseAsync()
--```
--
--## Diagnostics
--
--```lua
--Store:IsClosed()
--Store:GetRuntimeStats()
--Store:GetKeyInfo(subject)
--Store:GetCompressionLayoutInfo()
--```
--
-----
--
--# Profile API
--
--```lua
--profile:IsActive()
--profile:IsDirty()
--
--profile:Get(key)
--profile:GetDataCopy()
--profile:GetDataTemplate()
--profile:GetBuffer()
--profile:GetStorageInfo()
--
--profile:MarkDirty()
--profile:Set(key, value)
--profile:Update(key, callback)
--profile:Increment(key, amount?)
--profile:Overwrite(data)
--profile:Reconcile()
--profile:Mutate(callback)
--
--profile:SaveAsync()
--profile:ReleaseAsync(reason?)
--```
--
-----
--
--# Static API
--
--## DataTemplate compression
--
--```lua
--local packet = DataStore.CompressDataTemplate({
--    Version = 2,
--    Data = PlayersData,
--})
--
--print(buffer.len(packet.Data))
--```
--
--To decode:
--
--```lua
--local decoded = DataStore.DecompressDataTemplate(
--    packet.Data,
--    {
--        DataTemplate = {
--            Version = 2,
--            Data = PlayersData,
--        },
--
--        DataTemplateHistory = {
--            [1] = PlayersDataV1,
--        },
--    }
--)
--```
--
--## Generic encoding
--
--```lua
--local encoded = DataStore.Encode(value)
--local decoded = DataStore.Decode(encoded)
--```
--
--These generic helpers are not the same as the persistent `IndexedLayout` profile path.
--
--## UserId key codec
--
--```lua
--local key = DataStore.EncodeUserIdKey(userId)
--local userIdAgain = DataStore.DecodeUserIdKey(key)
--```
--
--## Version helpers
--
--```lua
--print(DataStore.Version())
--print(DataStore.FormatVersion())
--print(DataStore.CompressionVersion())
--print(DataStore.SessionFormatVersion)
--```
--
--Expected for this release:
--
--```text
--DataStore.Version()       = 4.1.1
--DataStore.FormatVersion() = 12
--CompressionVersion()      = 3.1.0
--SessionFormatVersion      = 5
--```
--
-----
--
--# Compression SchemaPacketVersion
--
--The Sparse Defaults Compression build exposes:
--
--```lua
--local schemaVersion =
--    Compression.SchemaPacketVersion(packetOrBuffer)
--```
--
--It reads only the schema/delta header.
--
--It does not need to decode all fields just to discover which DataTemplate layout produced the payload.
--
--For DataStore persistence:
--
--```text
--schema 2 -> DataTemplate 1
--schema 3 -> DataTemplate 2
--schema 4 -> DataTemplate 3
--```
--
--This API is important for migration routing.
--
-----
--
--# Testing
--
--## 400-key test
--
--Use:
--
--```text
--PlayersData400.luau
--SparseDefaults_400Keys_Test.server.luau
--```
--
--The script checks:
--
--```text
--400 keys - all defaults
--400 keys - 1 changed
--400 keys - 10 changed
--400 keys - 100 changed
--400 keys - all 400 changed
--```
--
--It prints:
--
--```text
--Keys
--Changed Keys
--Codec
--Bytes
--buffer.len
--Bits
--Useful Bits
--Physical Bits
--Padding Bits
--Raw Bytes
--Saved Bytes
--Savings
--Schema Version
--Buffer bytes
--Round Trip
--```
--
--It also benchmarks repeated encode/decode operations.
--
--## What to verify
--
--Every case should print:
--
--```text
--Round Trip: true
--```
--
--For the all-default flat 400-field schema, the Sparse Defaults frame is designed to fit in about:
--
--```text
--2 bytes
--```
--
--for schema version 3 before any Roblox platform-side accounting.
--
--## Migration test
--
--A migration test should:
--
--1. save using version 1;
--2. stop the server;
--3. change to version 2;
--4. keep `DataTemplateHistory[1]`;
--5. rejoin;
--6. verify old values remain;
--7. verify new fields receive defaults;
--8. save;
--9. rejoin again;
--10. verify the player now loads directly through version 2.
--
--## Production test matrix
--
--Before deploying a live game, test:
--
--- first join;
--- normal save;
--- leave/rejoin;
--- server shutdown;
--- dirty-only autosave;
--- session lock contention;
--- killed-server lock expiry;
--- historical template migration;
--- 100-key default profile;
--- 400-key default profile;
--- several changed fields;
--- all fields changed;
--- malformed/corrupt buffer handling;
--- DataStore budget pressure;
--- long-running servers.
--
-----
--
--# Production Safety
--
--## Never trust client-provided progression
--
--Bad:
--
--```lua
--RemoteEvent.OnServerEvent:Connect(function(player, coins)
--    profile:Set("Coins", coins)
--end)
--```
--
--Better:
--
--```lua
--RemoteEvent.OnServerEvent:Connect(function(player)
--    local profile = Store:GetProfile(player)
--
--    if profile == nil then
--        return
--    end
--
--    profile:Increment("Coins", 1)
--end)
--```
--
--The server should decide what persistent changes are valid.
--
--## Do not replace decode failures with blank profiles
--
--If a real stored profile cannot be decoded, stop player initialization.
--
--Silently replacing it with defaults can destroy progression on the next save.
--
--## Keep DataTemplateHistory while it is needed
--
--Do not delete:
--
--```lua
--DataTemplateHistory[1]
--```
--
--while version-1 IndexedSchema saves still exist.
--
--Once every live player entry has been migrated and rewritten, old historical templates can be retired deliberately.
--
--## Keep data bounded
--
--Compression does not remove Roblox's DataStore limits.
--
--Inventories, strings, arrays, and nested tables should still have intentional caps.
--
-----
--
--# FAQ
--
--## Why did I see lots of zero bytes?
--
--Because the previous default-eliding bitmap wrote one state bit for every defaulted field.
--
--Hundreds of `0` state bits become physical zero bytes after bit packing.
--
--Sparse Defaults removes that per-field cost when few fields differ from defaults.
--
--## Does a stored `0` always cost one byte?
--
--No.
--
--For a schema-known default, the value itself may consume no value payload at all.
--
--Sparse Defaults can also remove the old per-field state bit.
--
--## Can an all-default 400-key profile really stay around 2 bytes?
--
--For the current flat defaulted schema and schema version 3, the sparse bit layout fits into 2 physical bytes.
--
--That is the raw Compression payload.
--
--Creator Hub may report a different storage/accounting number.
--
--## Does Sparse Defaults remove changed values?
--
--No.
--
--Only unchanged default fields are omitted.
--
--Changed values still have to be encoded.
--
--## Is Sparse always used?
--
--No.
--
--Compression compares sparse and bitmap candidates and chooses the smaller physical representation.
--
--## Can the payload be zero bytes?
--
--Not safely for this versioned schema design.
--
--The decoder still needs enough information to identify the frame and schema version.
--
--## Are old bitmap saves still readable?
--
--Yes.
--
--The original `0xD1` schema frame remains supported.
--
--Sparse Defaults uses a different frame marker.
--
--## Why do I need DataTemplateHistory?
--
--Because IndexedSchema intentionally avoids writing field names/types into every player payload.
--
--The schema version can identify **which** historical layout is needed, but the exact old layout still has to exist in server code.
--
--## Does reconciliation reset Coins or Rebirths?
--
--No.
--
--Reconciliation fills only missing fields.
--
--Existing decoded values are preserved.
--
--## What causes `schema version mismatch`?
--
--Usually a payload is being decoded with a layout compiled for a different DataTemplate version.
--
--v4.1.1 avoids this by reading the stored schema version first and routing to the matching current or historical template.
--
--## Is the DataTemplate version stored as a wrapper field?
--
--No.
--
--The player value is still a raw Compression buffer.
--
--The Compression schema header contains the schema version used for routing.
--
--## Is the session lock stored inside player data?
--
--No.
--
--Session ownership lives in MemoryStore.
--
--## Are `Dirty`, `Revision`, and `LastSaveClock` persisted?
--
--No.
--
--They are runtime profile state.
--
--## Is the player key stored inside the player buffer?
--
--No.
--
--Roblox receives the key and value separately.
--
--## Does the DataStore use Base62 keys?
--
--No.
--
--The current v4.1.1 build uses `Base85UInt`.
--
--## Should I bump DataTemplate.Version when adding keys?
--
--Yes.
--
--For an IndexedSchema persistence format, changing the persistent layout should use a new DataTemplate version.
--
--Keep the previous layout in `DataTemplateHistory` until old saves are migrated.
--
-----
--
--# Release Summary
--
--DataStore v4.1.1 keeps a narrow permanent persistence contract:
--
--```text
--PlayersData
--    |
--    v
--Compression.IndexedLayout
--    |
--    +--> Bitmap IndexedSchema
--    |
--    `--> Sparse Defaults IndexedSchema
--             |
--             v
--       smaller candidate
--             |
--             v
--      Roblox DataStore
--```
--
--Historical loads use:
--
--```text
--stored schema version
-+ToNumber / clamp / round
-         |
-         v
--DataTemplate version
-+set / max / min
-         |
-         v
--current template
--or DataTemplateHistory
--        |
--        v
--decode
--        |
--        v
--reconcile
--        |
--        v
--rewrite newest schema
--```
--
--The result is designed for large simulator-style templates where most fields remain at known defaults.
--
--A 400-key profile does not need to spend hundreds of bits simply proving that hundreds of values are still `0`.
--
--Changed progression is encoded.
--
--Unchanged defaults are reconstructed from the schema.
--
--Session ownership stays in MemoryStore.
--
--Runtime diagnostics stay in memory.
--
--The permanent player value remains only the compact player-data buffer.+Roblox OrderedDataStore
-+```
-+
-+The design priorities are:
-+
-+1. preserve player progression;
-+2. reject malformed or corrupt data rather than silently overwrite it;
-+3. keep one authoritative typed `PlayersData.Data` shape;
-+4. make retried saves deterministic;
-+5. prevent stale-session overwrites;
-+6. compress when it actually helps storage;
-+7. keep leaderboard writes aligned with successful profile saves.
+# NexusDataStore
+
+![Version](https://img.shields.io/badge/version-v7.0.2-4c8bf5)
+![Language](https://img.shields.io/badge/language-Luau-00A2FF)
+![Platform](https://img.shields.io/badge/platform-Roblox-111111)
+![Runtime](https://img.shields.io/badge/runtime-server--only-orange)
+![Record Format](https://img.shields.io/badge/record%20format-700-2ea44f)
+![Compression](https://img.shields.io/badge/compression-v2.3.x%20%7C%20codec%20230-6f42c1)
+
+**NexusDataStore v7.0.2** is a typed, session-aware Roblox persistence layer built for reliable player data, compact storage, controlled mutations, migrations, snapshots, observability, and integrated OrderedDataStore synchronization.
+
+The current build is tied directly to a `PlayersData` ModuleScript:
+
+```lua
+local PlayersData = require(script.PlayersData)
+
+export type Data = PlayersData.Data
+```
+
+That type flows through the public API:
+
+```text
+PlayersData.Data
+      |
+      v
+ Store<Data>
+      |
+      v
+Session<Data>
+      |
+      v
+profile.Data
+```
+
+This means `profile.Data.Coins`, `profile.Data.Inventory`, and every other declared field can be understood by Luau instead of collapsing to `any`.
+
+> **Current release:** NexusDataStore `7.0.2`  
+> **Record format:** `700`  
+> **Compression series:** `2.3.x`  
+> **Compression codec:** `230`  
+> **Recommended Compression build:** `2.3.2`
+
+---
+
+## Contents
+
+- [Core Features](#core-features)
+- [Project Structure](#project-structure)
+- [PlayersData and Strict Typing](#playersdata-and-strict-typing)
+- [Quick Start](#quick-start)
+- [Loading Players](#loading-players)
+- [Working With Profile Data](#working-with-profile-data)
+- [Nested Paths](#nested-paths)
+- [Atomic Mutations](#atomic-mutations)
+- [Snapshots and Rollback](#snapshots-and-rollback)
+- [Watching Data](#watching-data)
+- [Saving and Releasing](#saving-and-releasing)
+- [Autosave and Session Ownership](#autosave-and-session-ownership)
+- [Schema Validation](#schema-validation)
+- [Schema Migrations](#schema-migrations)
+- [Compression](#compression)
+  - [Supported Compression Types](#supported-compression-types)
+  - [Compression Quick Start](#compression-quick-start)
+  - [Compression Examples for Every Supported Type](#compression-examples-for-every-supported-type)
+  - [Compression Reports](#compression-reports)
+  - [Compression Options](#compression-options)
+  - [DataStore Compression Transport](#datastore-compression-transport)
+  - [Corruption Protection](#corruption-protection)
+- [OrderedDataStore](#ordereddatastore)
+  - [Leaderboard Configuration](#leaderboard-configuration)
+  - [Set Max and Min Modes](#set-max-and-min-modes)
+  - [Manual Ordered Writes](#manual-ordered-writes)
+  - [Incrementing](#incrementing)
+  - [Reading Leaderboards](#reading-leaderboards)
+  - [Getting a Player Rank](#getting-a-player-rank)
+  - [Automatic Session Sync](#automatic-session-sync)
+  - [Projected Ordered Values](#projected-ordered-values)
+  - [Custom Ordered Keys](#custom-ordered-keys)
+- [Events](#events)
+- [Health and Metrics](#health-and-metrics)
+- [Configuration Reference](#configuration-reference)
+- [API Reference](#api-reference)
+- [Production Patterns](#production-patterns)
+- [Testing](#testing)
+- [FAQ](#faq)
+
+---
+
+# Core Features
+
+NexusDataStore provides:
+
+- typed `PlayersData.Data` integration;
+- `Store<Data>` and `Session<Data>` inference;
+- `profile.Data` autocomplete in strict Luau;
+- `UpdateAsync`-based persistence;
+- server/session ownership locks;
+- revision conflict protection;
+- retry-stable commits;
+- DataStore budget awareness;
+- bounded load/save deadlines;
+- autosave and lock heartbeats;
+- direct-change detection;
+- template reconciliation;
+- optional runtime schema validation;
+- schema migrations;
+- snapshots and restore;
+- path-based mutation helpers;
+- mutation watchers;
+- compression with checksum validation;
+- automatic compressed/raw persistence selection;
+- buffer/Base64 compression transports;
+- built-in OrderedDataStore support;
+- leaderboard synchronization;
+- cross-server events through `MessagingService`;
+- health and metrics reporting.
+
+---
+
+# Project Structure
+
+The simplest supported layout is:
+
+```text
+ServerScriptService
+└── Data
+    ├── NexusDataStore            ModuleScript
+    │   ├── PlayersData           ModuleScript
+    │   └── Compression           ModuleScript
+    │
+    └── DataBootstrap             Script
+```
+
+`PlayersData` must be a child of `NexusDataStore` in the current build because the module loads it with:
+
+```lua
+local PlayersData = require(script.PlayersData)
+```
+
+`Compression` can also be supplied explicitly with `CompressionModule`, but keeping it as a child of `NexusDataStore` is the cleanest default.
+
+---
+
+# PlayersData and Strict Typing
+
+Create `PlayersData` under `NexusDataStore`:
+
+```lua
+--!strict
+
+local PlayersData = {
+    Coins = 0,
+    Rebirths = 0,
+    Gems = 0,
+
+    Settings = {
+        Music = true,
+        SFX = true,
+    },
+
+    Inventory = {} :: {string},
+}
+
+export type Data = typeof(PlayersData)
+
+return PlayersData
+```
+
+NexusDataStore imports that exported type:
+
+```lua
+export type Data = PlayersData.Data
+```
+
+The public aliases include:
+
+```lua
+export type Profile = Session<Data>
+export type PlayerProfile = Session<Data>
+export type PlayerStore = Store<Data>
+export type PlayerStoreConfig = StoreConfig<Data>
+export type PlayerSnapshot = Snapshot<Data>
+```
+
+You can also reuse the exported aliases from another strict server module:
+
+```lua
+local NexusDataStore = require(path.To.NexusDataStore)
+
+type Data = NexusDataStore.Data
+type Profile = NexusDataStore.Profile
+type PlayerStore = NexusDataStore.PlayerStore
+```
+
+So a loaded profile resolves to the real player-data shape:
+
+```lua
+local profile, err = Store:OpenPlayerAsync(player)
+
+if not profile then
+    warn(err)
+    return
+end
+
+profile.Data.Coins += 100
+profile.Data.Rebirths += 1
+profile.Data.Settings.Music = false
+```
+
+With `--!strict`, Luau can reject invalid assignments:
+
+```lua
+profile.Data.Coins = "100"
+-- Type error: string is not a number
+```
+
+and invalid fields:
+
+```lua
+print(profile.Data.Coinss)
+-- Type error: field 'Coinss' does not exist
+```
+
+---
+
+# Quick Start
+
+```lua
+--!strict
+
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local DataFolder = ServerScriptService.Data
+local NexusDataStore = require(DataFolder.NexusDataStore)
+
+local Store = NexusDataStore.new({
+    Name = "PlayerData",
+
+    Template = require(DataFolder.NexusDataStore.PlayersData),
+
+    Compression = true,
+    CompressionTransport = "auto",
+
+    AutoSave = true,
+    AutoSaveInterval = 30,
+
+    BudgetAware = true,
+    Reconcile = true,
+    EnforceTemplateTypes = true,
+    ValidateOnWrite = true,
+    DetectDirectChanges = true,
+})
+```
+
+The minimum configuration is:
+
+```lua
+local Store = NexusDataStore.new({
+    Name = "PlayerData",
+    Template = require(script.Parent.NexusDataStore.PlayersData),
+})
+```
+
+Important defaults include:
+
+```text
+Scope                  = "Global"
+SchemaVersion          = 1
+Reconcile              = true
+EnforceTemplateTypes   = true
+ValidateOnWrite        = true
+DetectDirectChanges    = true
+Compression            = true
+CompressionTransport   = "auto"
+AutoSave               = true
+AutoSaveInterval       = 30
+LockTimeout            = 120
+RetryAttempts          = 6
+BudgetAware            = true
+LoadTimeout            = 30
+SaveTimeout            = 30
+```
+
+---
+
+# Loading Players
+
+```lua
+local Players = game:GetService("Players")
+
+local function onPlayerAdded(player: Player)
+    local profile, err = Store:OpenPlayerAsync(player)
+
+    if not profile then
+        warn("[NexusDataStore] Load failed:", player, err)
+        player:Kick("Your data could not be loaded. Please rejoin.")
+        return
+    end
+
+    print("Loaded", player.Name)
+    print("Coins:", profile.Data.Coins)
+end
+
+Players.PlayerAdded:Connect(onPlayerAdded)
+
+for _, player in Players:GetPlayers() do
+    task.spawn(onPlayerAdded, player)
+end
+```
+
+Do not continue player initialization after a failed load.
+
+A failed or corrupt stored record should not silently be replaced with blank progression.
+
+---
+
+# Working With Profile Data
+
+## Direct typed access
+
+```lua
+profile.Data.Coins += 10
+```
+
+Direct edits are supported when `DetectDirectChanges = true`. The store detects that the live table changed before persistence.
+
+For explicit mutation tracking, prefer the mutation API.
+
+## Get
+
+```lua
+local coins = profile:Get("Coins")
+```
+
+## GetOr
+
+```lua
+local value = profile:GetOr("Coins", 0)
+```
+
+## Has
+
+```lua
+if profile:Has("Settings") then
+    print("Settings exist")
+end
+```
+
+## Set
+
+```lua
+local ok, err = profile:Set("Coins", 500)
+
+if not ok then
+    warn(err)
+end
+```
+
+## Increment
+
+```lua
+local ok, newCoins = profile:Increment("Coins", 25)
+
+if ok then
+    print("Coins:", newCoins)
+end
+```
+
+Default increment:
+
+```lua
+profile:Increment("Coins")
+```
+
+## IncrementClamped
+
+```lua
+local ok, stamina = profile:IncrementClamped(
+    "Stamina",
+    -10,
+    0,
+    100
+)
+```
+
+## Toggle
+
+```lua
+profile:Toggle({"Settings", "Music"})
+```
+
+## Append
+
+```lua
+profile:Append("Inventory", "WoodenSword")
+```
+
+## RemoveAt
+
+```lua
+profile:RemoveAt("Inventory", 1)
+```
+
+## Award
+
+`Award()` accepts a non-negative finite amount:
+
+```lua
+local ok, coins = profile:Award("Coins", 100)
+```
+
+## Spend
+
+`Spend()` refuses the mutation when the balance is too low:
+
+```lua
+local ok, balanceOrError = profile:Spend("Coins", 250)
+
+if not ok then
+    warn(balanceOrError)
+end
+```
+
+## UpdatePath
+
+```lua
+profile:UpdatePath("Coins", function(oldCoins)
+    return (oldCoins or 0) * 2
+end)
+```
+
+## Patch
+
+Apply multiple path writes as one validated draft:
+
+```lua
+local ok, err = profile:Patch({
+    {
+        Path = "Coins",
+        Value = 1000,
+    },
+    {
+        Path = "Rebirths",
+        Value = 10,
+    },
+    {
+        Path = {"Settings", "Music"},
+        Value = false,
+    },
+})
+
+if not ok then
+    warn(err)
+end
+```
+
+---
+
+# Nested Paths
+
+A path can be:
+
+```lua
+"Coins"
+```
+
+a numeric array index:
+
+```lua
+1
+```
+
+or a path array:
+
+```lua
+{"Settings", "Music"}
+```
+
+Example:
+
+```lua
+local music = profile:Get({"Settings", "Music"})
+
+profile:Set({"Settings", "Music"}, false)
+```
+
+For arrays:
+
+```lua
+local firstItem = profile:Get({"Inventory", 1})
+```
+
+Path arrays must be non-empty.
+
+Numeric path keys must be positive safe integers.
+
+---
+
+# Atomic Mutations
+
+Use `Mutate()` when several fields must change together:
+
+```lua
+if profile.Data.Coins < 1000 then
+    warn("NOT_ENOUGH_COINS")
+    return
+end
+
+local ok, result = profile:Mutate(function(data, session)
+    data.Coins -= 1000
+    data.Rebirths += 1
+
+    return "REBIRTH_COMPLETE"
+end)
+
+if not ok then
+    warn(result)
+else
+    print(result)
+end
+```
+
+The callback receives:
+
+```lua
+data: PlayersData.Data
+session: Session<PlayersData.Data>
+```
+
+The mutation flow is conceptually:
+
+```text
+clone profile.Data
+       |
+       v
+run callback on draft
+       |
+       v
+validate draft
+       |
+   +---+---+
+   |       |
+ valid   invalid
+   |       |
+   v       v
+commit    reject
+```
+
+This is useful for:
+
+- purchases;
+- rebirths;
+- prestige resets;
+- crafting;
+- reward claims;
+- multi-stat upgrades;
+- inventory transactions.
+
+---
+
+# Snapshots and Rollback
+
+Create a snapshot:
+
+```lua
+local snapshot = profile:Snapshot("before-rebirth")
+```
+
+The returned object is typed as:
+
+```lua
+Snapshot<Data>
+```
+
+Restore it:
+
+```lua
+local ok, err = profile:Restore(snapshot)
+
+if not ok then
+    warn(err)
+end
+```
+
+Inspect differences from the last successfully persisted state:
+
+```lua
+local changes = profile:DiffFromPersisted()
+
+for _, change in changes do
+    print(change.Path, change.Before, change.After)
+end
+```
+
+The number of retained runtime snapshots is controlled by:
+
+```lua
+MaxSnapshots = 10
+```
+
+Snapshots are runtime objects. They are not a second permanent DataStore history system.
+
+---
+
+# Watching Data
+
+Watch a specific path:
+
+```lua
+local connection = profile:Watch("Coins", function(newValue, oldValue, session, path)
+    print("Coins:", oldValue, "->", newValue)
+end)
+```
+
+Watch every controlled mutation:
+
+```lua
+local connection = profile:Watch(nil, function(newValue, oldValue, session, path)
+    print("Changed path:", path)
+end)
+```
+
+Disconnect:
+
+```lua
+connection:Disconnect()
+```
+
+---
+
+# Saving and Releasing
+
+## Manual save
+
+```lua
+local ok, err = profile:SaveAsync()
+
+if not ok then
+    warn("Save failed:", err)
+end
+```
+
+Optional priority:
+
+```lua
+profile:SaveAsync("normal")
+profile:SaveAsync("high")
+profile:SaveAsync("critical")
+```
+
+When omitted, the current implementation uses `"high"`.
+
+`"normal"` saves can return:
+
+```text
+DEFERRED
+```
+
+when `MinimumSaveInterval` has not elapsed. `"high"` and `"critical"` bypass that normal-save spacing check.
+
+The current priority type is:
+
+```lua
+"normal" | "high" | "critical"
+```
+
+## Release
+
+```lua
+local ok, err = profile:ReleaseAsync()
+
+if not ok then
+    warn("Release failed:", err)
+end
+```
+
+A release performs the final ownership-safe commit and removes the active session when successful.
+
+## Flush the store
+
+```lua
+local ok, err = Store:FlushAsync(20)
+
+if not ok then
+    warn(err)
+end
+```
+
+## Release every active session
+
+```lua
+local results = Store:ReleaseAllAsync()
+
+for key, result in pairs(results) do
+    print(key, result.Success, result.Error)
+end
+```
+
+## Close
+
+```lua
+local ok, err = Store:CloseAsync(25)
+
+if not ok then
+    warn(err)
+end
+```
+
+---
+
+# Autosave and Session Ownership
+
+NexusDataStore uses a lock inside the stored record.
+
+A stored record contains metadata conceptually similar to:
+
+```lua
+{
+    Format = 700,
+    SchemaVersion = 1,
+    Revision = 12,
+    CreatedAt = 0,
+    UpdatedAt = 0,
+
+    Data = {
+        -- PlayersData
+    },
+
+    Lock = {
+        JobId = "...",
+        SessionId = "...",
+        HeartbeatAt = 0,
+        ExpiresAt = 0,
+    },
+
+    LastCommitId = "...",
+}
+```
+
+The lock is renewed independently through heartbeat commits.
+
+Defaults:
+
+```text
+LockTimeout       = 120 seconds
+HeartbeatInterval = floor(LockTimeout / 3), capped to <= LockTimeout / 2
+AutoSaveInterval  = 30 seconds
+```
+
+The store also protects against stale overwrites with a revision check.
+
+If the stored revision no longer matches the active session revision, the commit fails with:
+
+```text
+REVISION_CONFLICT
+```
+
+The session is not allowed to blindly overwrite the newer record.
+
+---
+
+# Schema Validation
+
+Template-type enforcement is enabled by default:
+
+```lua
+EnforceTemplateTypes = true
+```
+
+For:
+
+```lua
+local PlayersData = {
+    Coins = 0,
+    Name = "",
+    Settings = {
+        Music = true,
+    },
+}
+```
+
+the store rejects incompatible shapes such as:
+
+```lua
+{
+    Coins = "not a number",
+    Name = 123,
+}
+```
+
+You can also provide an explicit schema:
+
+```lua
+local Store = NexusDataStore.new({
+    Name = "PlayerData",
+    Template = PlayersData,
+
+    Schema = {
+        Coins = {
+            Type = "number",
+            Required = true,
+            Min = 0,
+        },
+
+        Rebirths = {
+            Type = "integer",
+            Required = true,
+            Min = 0,
+        },
+
+        Inventory = {
+            Type = "array",
+            ArrayOf = {
+                Type = "string",
+            },
+        },
+
+        Settings = {
+            Type = "table",
+            Children = {
+                Music = {
+                    Type = "boolean",
+                    Required = true,
+                },
+            },
+            AllowUnknown = false,
+        },
+    },
+})
+```
+
+Supported schema type names are:
+
+```text
+any
+boolean
+number
+integer
+string
+table
+array
+```
+
+A custom validator can return `true`, `false`, or an error string:
+
+```lua
+Schema = {
+    Coins = {
+        Type = "number",
+
+        Validate = function(value, path)
+            if value % 1 ~= 0 then
+                return path .. " must be a whole number"
+            end
+
+            return true
+        end,
+    },
+}
+```
+
+---
+
+# Schema Migrations
+
+Increase `SchemaVersion` when your persistent layout needs a migration.
+
+Example old data:
+
+```lua
+local PlayersDataV1 = {
+    Coins = 0,
+}
+```
+
+New data:
+
+```lua
+local PlayersData = {
+    Coins = 0,
+    Gems = 0,
+}
+```
+
+Configure:
+
+```lua
+local Store = NexusDataStore.new({
+    Name = "PlayerData",
+    Template = PlayersData,
+
+    SchemaVersion = 2,
+
+    Migrations = {
+        [2] = function(data, context)
+            data.Gems = data.Gems or 0
+
+            print(
+                "Migrating",
+                context.Key,
+                context.FromVersion,
+                "->",
+                context.ToVersion
+            )
+
+            return data
+        end,
+    },
+})
+```
+
+Migration entries are keyed by the **target version**.
+
+For a profile moving from version `1` to version `2`, the function is:
+
+```lua
+Migrations[2]
+```
+
+For multiple upgrades:
+
+```lua
+Migrations = {
+    [2] = function(data)
+        data.Gems = data.Gems or 0
+        return data
+    end,
+
+    [3] = function(data)
+        data.Rebirths = data.Rebirths or 0
+        return data
+    end,
+}
+```
+
+NexusDataStore applies every missing migration in order.
+
+---
+
+# Compression
+
+NexusDataStore v7.0.2 is compatible with the **Compression v2.3.x** series using codec:
+
+```text
+230
+```
+
+The recommended module build is:
+
+```text
+Compression v2.3.2
+```
+
+The packet format has a fixed 11-byte header containing the codec identity, flags, and checksum metadata.
+
+The direct compression API is:
+
+```lua
+Compression.CompressTablePacket(value, options?)
+Compression.DecompressTable(buffer, options?)
+Compression.Measure(value, options?)
+Compression.TableMode(value, options?)
+Compression.Version()
+```
+
+---
+
+## Supported Compression Types
+
+Compression v2.3.2 directly supports these Luau value types:
+
+| Luau value | Supported | Encoding behavior |
+|---|---:|---|
+| `nil` | Yes | dedicated tag |
+| `boolean` | Yes | dedicated `true` / `false` tags |
+| safe integer `number` | Yes | signed variable-length integer |
+| non-integer finite `number` | Yes | `f64` |
+| `string` | Yes | raw string or dictionary reference |
+| dense array `table` | Yes | array tag + count + values |
+| map `table` | Yes | map tag + count + key/value pairs |
+| nested tables | Yes | recursive |
+| circular tables | No | rejected |
+| `NaN` / `math.huge` | No | rejected |
+| `buffer` | No | rejected by Compression v2.3.2 |
+| `Vector2` | No | rejected |
+| `Vector3` | No | rejected |
+| `CFrame` | No | rejected |
+| `Color3` | No | rejected |
+| `Instance` | No | rejected |
+| functions / threads | No | rejected |
+
+The DataStore persistence validator is intentionally narrower than the standalone codec:
+
+- the root player data must be a table;
+- arrays must be dense;
+- dictionary keys must be strings;
+- mixed/sparse tables are rejected;
+- circular references are rejected;
+- non-finite numbers are rejected;
+- Roblox datatypes such as `Vector3`, `CFrame`, and `buffer` are not persistent values in this v7.0.2 codec path.
+
+---
+
+## Compression Quick Start
+
+```lua
+local Compression = require(script.Parent.Compression)
+
+local value = {
+    Coins = 150000,
+    Rebirths = 25,
+    Title = "Legendary",
+}
+
+local packet, report = Compression.CompressTablePacket(value)
+
+print("Raw bytes:", report.RawBytes)
+print("Encoded bytes:", report.EncodedBytes)
+print("Saved bytes:", report.SavedBytes)
+print("Savings:", report.SavingsPercent)
+print("Dictionary entries:", report.DictionaryEntries)
+
+local decoded = Compression.DecompressTable(packet)
+
+print(decoded.Coins)
+print(decoded.Rebirths)
+print(decoded.Title)
+```
+
+Always test the round trip:
+
+```lua
+assert(decoded.Coins == value.Coins)
+assert(decoded.Rebirths == value.Rebirths)
+assert(decoded.Title == value.Title)
+```
+
+---
+
+## Compression Examples for Every Supported Type
+
+### Nil
+
+The direct codec can encode a root `nil`:
+
+```lua
+local packet = Compression.CompressTablePacket(nil)
+local decoded = Compression.DecompressTable(packet)
+
+assert(decoded == nil)
+```
+
+A NexusDataStore player record itself cannot use `nil` as its root data because persistent player data must be a table.
+
+### Boolean
+
+```lua
+local packet = Compression.CompressTablePacket(true)
+local decoded = Compression.DecompressTable(packet)
+
+assert(decoded == true)
+```
+
+False:
+
+```lua
+local packet = Compression.CompressTablePacket(false)
+local decoded = Compression.DecompressTable(packet)
+
+assert(decoded == false)
+```
+
+### Small integer
+
+Integers use the signed variable-length path when they are within the codec's supported integer range:
+
+```lua
+local packet, report = Compression.CompressTablePacket(30)
+
+print(report.EncodedBytes)
+
+local decoded = Compression.DecompressTable(packet)
+
+assert(decoded == 30)
+```
+
+### Negative integer
+
+```lua
+local packet = Compression.CompressTablePacket(-250)
+local decoded = Compression.DecompressTable(packet)
+
+assert(decoded == -250)
+```
+
+### Large integer
+
+```lua
+local value = 1_000_000_000
+
+local packet = Compression.CompressTablePacket(value)
+local decoded = Compression.DecompressTable(packet)
+
+assert(decoded == value)
+```
+
+### Floating-point number
+
+Non-integer finite numbers use `f64`:
+
+```lua
+local value = 123.456
+
+local packet = Compression.CompressTablePacket(value)
+local decoded = Compression.DecompressTable(packet)
+
+assert(decoded == value)
+```
+
+Invalid numbers are rejected:
+
+```lua
+-- Compression.CompressTablePacket(0 / 0)
+-- NON_FINITE_NUMBER
+
+-- Compression.CompressTablePacket(math.huge)
+-- NON_FINITE_NUMBER
+```
+
+### String
+
+```lua
+local value = "NexusDataStore"
+
+local packet = Compression.CompressTablePacket(value)
+local decoded = Compression.DecompressTable(packet)
+
+assert(decoded == value)
+```
+
+For a single short string, packet framing can be larger than the original value. Compression becomes more useful when strings repeat inside larger structures.
+
+### Dense numeric array
+
+```lua
+local value = {1, 30, 3490}
+
+local packet, report = Compression.CompressTablePacket(value)
+local decoded = Compression.DecompressTable(packet)
+
+assert(decoded[1] == 1)
+assert(decoded[2] == 30)
+assert(decoded[3] == 3490)
+
+print("Encoded:", report.EncodedBytes)
+```
+
+### String array
+
+```lua
+local value = {
+    "Common",
+    "Common",
+    "Common",
+    "Rare",
+    "Legendary",
+}
+
+local packet, report = Compression.CompressTablePacket(value)
+local decoded = Compression.DecompressTable(packet)
+
+assert(decoded[5] == "Legendary")
+
+print("Dictionary entries:", report.DictionaryEntries)
+```
+
+Repeated strings can be replaced with dictionary references when that is profitable.
+
+### String-keyed map
+
+```lua
+local value = {
+    Coins = 5000,
+    Rebirths = 12,
+    Rank = "Elite",
+}
+
+local packet = Compression.CompressTablePacket(value)
+local decoded = Compression.DecompressTable(packet)
+
+assert(decoded.Coins == 5000)
+assert(decoded.Rebirths == 12)
+assert(decoded.Rank == "Elite")
+```
+
+### Nested table
+
+```lua
+local value = {
+    Coins = 5000,
+
+    Settings = {
+        Music = true,
+        SFX = false,
+    },
+
+    Inventory = {
+        "Sword",
+        "Potion",
+        "Potion",
+    },
+}
+
+local packet = Compression.CompressTablePacket(value)
+local decoded = Compression.DecompressTable(packet)
+
+assert(decoded.Settings.Music == true)
+assert(decoded.Inventory[1] == "Sword")
+```
+
+### Repeated map keys and values
+
+This is where the string dictionary is useful:
+
+```lua
+local value = {
+    Inventory = {
+        {
+            Id = "CommonRune",
+            Type = "CommonRune",
+            Name = "CommonRune",
+        },
+        {
+            Id = "CommonRune",
+            Type = "CommonRune",
+            Name = "CommonRune",
+        },
+        {
+            Id = "CommonRune",
+            Type = "CommonRune",
+            Name = "CommonRune",
+        },
+    },
+}
+
+local packet, report = Compression.CompressTablePacket(value)
+
+print("Dictionary entries:", report.DictionaryEntries)
+print("Dictionary bytes:", report.DictionaryBytes)
+print("Savings:", report.SavingsPercent)
+```
+
+### Deterministic maps
+
+Enable deterministic key ordering when stable packet ordering is important:
+
+```lua
+local options = {
+    DeterministicMaps = true,
+}
+
+local packetA = Compression.CompressTablePacket({
+    Coins = 10,
+    Gems = 20,
+}, options)
+
+local packetB = Compression.CompressTablePacket({
+    Gems = 20,
+    Coins = 10,
+}, options)
+
+assert(buffer.tostring(packetA) == buffer.tostring(packetB))
+```
+
+In deterministic mode, map keys must be:
+
+```text
+string
+number
+boolean
+```
+
+For persistent NexusDataStore dictionaries, use string keys.
+
+---
+
+## Complete Compression Type Smoke Test
+
+This test exercises every value category supported by Compression v2.3.2:
+
+```lua
+local Compression = require(script.Parent.Compression)
+
+local cases = {
+    {
+        Name = "nil",
+        Value = nil,
+    },
+    {
+        Name = "false",
+        Value = false,
+    },
+    {
+        Name = "true",
+        Value = true,
+    },
+    {
+        Name = "positive integer",
+        Value = 3490,
+    },
+    {
+        Name = "negative integer",
+        Value = -3490,
+    },
+    {
+        Name = "float",
+        Value = 123.456,
+    },
+    {
+        Name = "string",
+        Value = "NexusDataStore",
+    },
+    {
+        Name = "array",
+        Value = {1, 30, 3490},
+    },
+    {
+        Name = "map",
+        Value = {
+            Coins = 5000,
+            Rebirths = 12,
+        },
+    },
+    {
+        Name = "nested",
+        Value = {
+            Stats = {
+                Coins = 5000,
+            },
+
+            Runes = {
+                "Common",
+                "Common",
+                "Legendary",
+            },
+        },
+    },
+}
+
+for _, case in cases do
+    local packet, report =
+        Compression.CompressTablePacket(case.Value)
+
+    local decoded =
+        Compression.DecompressTable(packet)
+
+    print(
+        case.Name,
+        "bytes =", report.EncodedBytes,
+        "savings =", report.SavingsPercent
+    )
+
+    if case.Value == nil then
+        assert(decoded == nil)
+    elseif typeof(case.Value) ~= "table" then
+        assert(decoded == case.Value)
+    end
+end
+```
+
+For table cases, verify the fields that matter to your schema, or use your own deep-equality helper.
+
+Do not include unsupported values such as:
+
+```lua
+Vector3.new(1, 2, 3)
+CFrame.new()
+buffer.create(8)
+workspace.Part
+function() end
+```
+
+Compression v2.3.2 rejects them with `UNSUPPORTED_TYPE:<type>`.
+
+---
+
+## Compression Reports
+
+Measure without manually handling the packet:
+
+```lua
+local report = Compression.Measure({
+    Coins = 1000000,
+    Rebirths = 100,
+    Inventory = {
+        "Common",
+        "Common",
+        "Rare",
+    },
+})
+
+print("RawBytes:", report.RawBytes)
+print("RawBits:", report.RawBits)
+
+print("EncodedBytes:", report.EncodedBytes)
+print("EncodedBits:", report.EncodedBits)
+
+print("PayloadBytes:", report.PayloadBytes)
+print("HeaderBytes:", report.HeaderBytes)
+
+print("SavedBytes:", report.SavedBytes)
+print("SavedBits:", report.SavedBits)
+
+print("Ratio:", report.Ratio)
+print("SavingsPercent:", report.SavingsPercent)
+
+print("DictionaryEntries:", report.DictionaryEntries)
+print("DictionaryBytes:", report.DictionaryBytes)
+
+print("Codec:", report.Codec)
+print("EngineVersion:", report.EngineVersion)
+```
+
+The key formulas are:
+
+```text
+Ratio = EncodedBytes / RawBytes
+
+SavingsPercent =
+    (1 - Ratio) * 100
+```
+
+A negative savings percentage means the compressed packet is larger than the codec's raw-size estimate.
+
+That is normal for very small values because the packet has fixed framing overhead.
+
+---
+
+## Compression Options
+
+```lua
+local options = {
+    StringDictionary = true,
+
+    DictionaryMinLength = 4,
+    DictionaryMinUses = 2,
+    DictionaryMaxEntries = 16384,
+    DictionaryMaxCandidates = 100000,
+
+    MaxDepth = 128,
+    MaxNodes = 2000000,
+
+    DeterministicMaps = false,
+
+    PreallocateLimit = 4194304,
+
+    AllowExpansion = false,
+}
+```
+
+### `StringDictionary`
+
+Default:
+
+```lua
+true
+```
+
+Allows profitable repeated strings to be stored once and referenced by index.
+
+### `DictionaryMinLength`
+
+Default:
+
+```lua
+4
+```
+
+Strings shorter than this are not dictionary candidates.
+
+### `DictionaryMinUses`
+
+Default:
+
+```lua
+2
+```
+
+A candidate must occur at least this many times.
+
+### `DictionaryMaxEntries`
+
+Default:
+
+```lua
+16384
+```
+
+Bounds the final dictionary size.
+
+### `DictionaryMaxCandidates`
+
+Default:
+
+```lua
+100000
+```
+
+Bounds candidate collection work.
+
+### `MaxDepth`
+
+Default:
+
+```lua
+128
+```
+
+Rejects excessively deep values.
+
+### `MaxNodes`
+
+Default:
+
+```lua
+2000000
+```
+
+Bounds encode/decode traversal.
+
+### `DeterministicMaps`
+
+Default:
+
+```lua
+false
+```
+
+When enabled, supported map keys are sorted before encoding.
+
+### `PreallocateLimit`
+
+Default:
+
+```lua
+4194304
+```
+
+Caps the writer's initial preallocation estimate.
+
+### `AllowExpansion`
+
+This option is important to NexusDataStore persistence selection.
+
+The direct `Compression.CompressTablePacket()` API still returns a packet.
+
+NexusDataStore uses `AllowExpansion = false` to avoid persisting the compressed representation when the final stored representation is not smaller than the raw record.
+
+---
+
+## DataStore Compression Transport
+
+NexusDataStore can persist compression with:
+
+```lua
+CompressionTransport = "auto"
+```
+
+Available modes:
+
+```text
+auto
+buffer
+base64
+```
+
+### Auto
+
+Recommended:
+
+```lua
+CompressionTransport = "auto"
+```
+
+The store evaluates the actual serialized size of the candidates and keeps the better persistence representation.
+
+Conceptually:
+
+```text
+raw record
+    |
+    +--> Compression packet
+             |
+             +--> buffer envelope
+             |
+             `--> Base64 envelope
+    |
+    v
+compare stored sizes
+    |
+    v
+smallest allowed representation
+```
+
+If compression is larger and expansion is disabled, NexusDataStore stores the raw record instead.
+
+### Buffer
+
+```lua
+CompressionTransport = "buffer"
+```
+
+Forces the compressed envelope to use a Roblox `buffer` payload.
+
+### Base64
+
+```lua
+CompressionTransport = "base64"
+```
+
+Uses a Base64 string payload.
+
+This mode exists as a compatibility/fallback transport.
+
+---
+
+## Compression Through the Store
+
+Use the exact options configured on the store:
+
+```lua
+local packet, report = Store:EncodeCompressed({
+    Coins = 1000,
+    Rebirths = 10,
+})
+
+if not packet then
+    warn(report)
+    return
+end
+
+print("Packet bytes:", buffer.len(packet))
+print("Savings:", report.SavingsPercent)
+```
+
+Decode:
+
+```lua
+local decoded, err = Store:DecodeCompressed(packet)
+
+if not decoded then
+    warn(err)
+    return
+end
+
+print(decoded.Coins)
+```
+
+Inspect what persistence would actually choose:
+
+```lua
+local report, err = Store:GetCompressionReport(profile)
+
+if not report then
+    warn(err)
+    return
+end
+
+print("RawStorageEstimate:", report.RawStorageEstimate)
+print("StorageBytes:", report.StorageBytes)
+print("Transport:", report.Transport)
+print("PersistedCompressed:", report.PersistedCompressed)
+```
+
+This report follows the same persistence selection path used by saves.
+
+---
+
+## Corruption Protection
+
+Compression v2.3.2 validates:
+
+- packet magic;
+- codec version;
+- packet flags;
+- Adler-32 payload checksum;
+- dictionary counts;
+- duplicate dictionary entries;
+- node limits;
+- depth limits;
+- array counts;
+- map counts;
+- duplicate map keys;
+- finite numbers;
+- trailing bytes.
+
+Examples of decode failures include:
+
+```text
+COMPRESSION_TRUNCATED
+COMPRESSION_MAGIC_MISMATCH
+UNSUPPORTED_COMPRESSION_VERSION
+COMPRESSION_CHECKSUM_MISMATCH
+INVALID_DICTIONARY_COUNT
+DUPLICATE_DICTIONARY_ENTRY
+INVALID_ARRAY_COUNT
+INVALID_MAP_COUNT
+DUPLICATE_MAP_KEY
+COMPRESSION_TRAILING_BYTES
+```
+
+NexusDataStore treats decode failure as a load failure.
+
+It does not intentionally replace a corrupt profile with defaults and then overwrite the stored progression.
+
+---
+
+# OrderedDataStore
+
+NexusDataStore has a built-in wrapper around Roblox OrderedDataStore.
+
+It can be used independently or synchronized from a profile path.
+
+Ordered values are numeric.
+
+Each ordered store is configured under:
+
+```lua
+OrderedDataStores = {
+    Alias = {
+        -- config
+    },
+}
+```
+
+Retrieve it with:
+
+```lua
+local leaderboard, err = Store:GetOrderedStore("Coins")
+
+if not leaderboard then
+    error(err)
+end
+```
+
+---
+
+## Leaderboard Configuration
+
+Example:
+
+```lua
+local Store = NexusDataStore.new({
+    Name = "PlayerData",
+    Template = PlayersData,
+
+    OrderedDataStores = {
+        Coins = {
+            Name = "CoinsLeaderboard",
+            Scope = "Global",
+
+            Path = "Coins",
+
+            Mode = "max",
+            AutoSync = true,
+
+            Integer = true,
+            ClampMin = 0,
+        },
+
+        Rebirths = {
+            Name = "RebirthLeaderboard",
+            Path = "Rebirths",
+
+            Mode = "max",
+            AutoSync = true,
+
+            Integer = true,
+            ClampMin = 0,
+        },
+    },
+})
+```
+
+When `Name` is omitted, the default is:
+
+```text
+<MainStoreName>_<Alias>
+```
+
+Example:
+
+```text
+PlayerData_Coins
+```
+
+When `Scope` is omitted, the parent store scope is used.
+
+---
+
+## Set Max and Min Modes
+
+Three write modes are available.
+
+### Set
+
+Always replace the current value:
+
+```lua
+Mode = "set"
+```
+
+Equivalent manual call:
+
+```lua
+ordered:SetAsync(userId, 500)
+```
+
+### Max
+
+Only replace when the new value is greater:
+
+```lua
+Mode = "max"
+```
+
+Useful for:
+
+- highest score;
+- best wave;
+- most rebirths;
+- fastest progression value where larger is better.
+
+```lua
+ordered:MaxAsync(userId, 500)
+```
+
+If the existing value is `700`, writing `500` becomes a no-op.
+
+### Min
+
+Only replace when the new value is lower:
+
+```lua
+Mode = "min"
+```
+
+Useful for:
+
+- fastest completion time;
+- fewest moves;
+- best low-score metric.
+
+```lua
+ordered:MinAsync(userId, 42)
+```
+
+If the existing value is `30`, writing `42` becomes a no-op.
+
+---
+
+## Manual Ordered Writes
+
+### SetAsync
+
+```lua
+local ok, value = ordered:SetAsync(player.UserId, 1000)
+
+if not ok then
+    warn(value)
+end
+```
+
+### WriteAsync
+
+Uses the store's configured mode:
+
+```lua
+local ok, value = ordered:WriteAsync(player.UserId, 1000)
+```
+
+Override the mode for one call:
+
+```lua
+ordered:WriteAsync(player.UserId, 1000, "set")
+ordered:WriteAsync(player.UserId, 1000, "max")
+ordered:WriteAsync(player.UserId, 1000, "min")
+```
+
+### UpdateAsync
+
+```lua
+local ok, value, state = ordered:UpdateAsync(
+    player.UserId,
+
+    function(oldValue)
+        oldValue = oldValue or 0
+
+        if oldValue >= 1_000_000 then
+            return nil
+        end
+
+        return oldValue + 100
+    end
+)
+
+if not ok then
+    warn(value)
+elseif state == "CANCELLED" then
+    print("No write was needed")
+else
+    print("New value:", value)
+end
+```
+
+The transform must be:
+
+- non-yielding;
+- deterministic enough to be retried;
+- safe to execute more than once by the underlying `UpdateAsync` process.
+
+### RemoveAsync
+
+```lua
+local ok, err = ordered:RemoveAsync(player.UserId)
+
+if not ok then
+    warn(err)
+end
+```
+
+---
+
+## Incrementing
+
+Default delta:
+
+```lua
+ordered:IncrementAsync(player.UserId)
+```
+
+Custom delta:
+
+```lua
+ordered:IncrementAsync(player.UserId, 25)
+```
+
+For an integer store without clamping or rounding, NexusDataStore can use Roblox's native OrderedDataStore increment path.
+
+When the ordered store uses floating-point values, clamps, or rounding, NexusDataStore routes the increment through `UpdateAsync` so normalization is still applied correctly.
+
+---
+
+## Reading Leaderboards
+
+### Get one value
+
+```lua
+local ok, value = ordered:GetAsync(player.UserId)
+
+if ok then
+    print("Ordered value:", value)
+else
+    warn(value)
+end
+```
+
+### Top entries
+
+```lua
+local ok, entries = ordered:GetTopAsync(10)
+
+if not ok then
+    warn(entries)
+    return
+end
+
+for _, entry in entries do
+    print(
+        "#" .. entry.Rank,
+        entry.Key,
+        entry.Value
+    )
+end
+```
+
+### Bottom entries
+
+```lua
+local ok, entries = ordered:GetBottomAsync(10)
+
+if not ok then
+    warn(entries)
+    return
+end
+
+for _, entry in entries do
+    print(entry.Rank, entry.Key, entry.Value)
+end
+```
+
+### Filtered top page
+
+```lua
+local ok, entries = ordered:GetTopAsync(
+    25,
+    1000,
+    1_000_000
+)
+```
+
+The minimum/maximum filters used by the current wrapper must be safe integers.
+
+### Raw sorted pages
+
+```lua
+local ok, pages = ordered:GetSortedAsync(
+    false, -- descending
+    100
+)
+
+if not ok then
+    warn(pages)
+    return
+end
+
+for _, entry in pages:GetCurrentPage() do
+    print(entry.key, entry.value)
+end
+```
+
+---
+
+## Getting a Player Rank
+
+```lua
+local ok, rankInfo = ordered:GetRankAsync(
+    player.UserId,
+    false, -- descending
+    10     -- maximum pages to scan
+)
+
+if not ok then
+    warn(rankInfo)
+    return
+end
+
+print("Rank:", rankInfo.Rank)
+print("Key:", rankInfo.Key)
+print("Value:", rankInfo.Value)
+```
+
+`GetRankAsync()` scans pages until:
+
+- the key is found;
+- the OrderedDataStore is exhausted; or
+- `maxPages` is reached.
+
+Possible non-success results include:
+
+```text
+ORDERED_KEY_NOT_FOUND
+RANK_SCAN_LIMIT
+```
+
+---
+
+## Automatic Session Sync
+
+Configure:
+
+```lua
+OrderedDataStores = {
+    Coins = {
+        Path = "Coins",
+        Mode = "max",
+        AutoSync = true,
+        Integer = true,
+    },
+}
+```
+
+`AutoSync = true` requires `Path`.
+
+After a successful persistent profile save, NexusDataStore synchronizes configured ordered stores when the saved snapshot is stable.
+
+Manual sync:
+
+```lua
+local ok, err = Store:SyncOrderedAsync(profile, "Coins")
+
+if not ok then
+    warn(err)
+end
+```
+
+Sync every ordered store configured for one profile:
+
+```lua
+Store:SyncOrderedAsync(profile)
+```
+
+Sync an alias across every active profile:
+
+```lua
+Store:SyncAllOrderedAsync("Coins")
+```
+
+Sync every ordered store across every active profile:
+
+```lua
+Store:SyncAllOrderedAsync()
+```
+
+---
+
+## Projected Ordered Values
+
+`ToNumber` can convert a stored profile value into the numeric value required by OrderedDataStore.
+
+Example data:
+
+```lua
+local PlayersData = {
+    BestRun = {
+        Round = 0,
+        Time = 0,
+    },
+}
+```
+
+Configuration:
+
+```lua
+OrderedDataStores = {
+    BestRound = {
+        Path = {"BestRun"},
+
+        Mode = "max",
+        AutoSync = true,
+        Integer = true,
+
+        ToNumber = function(bestRun, session)
+            return bestRun.Round
+        end,
+    },
+}
+```
+
+Another example:
+
+```lua
+ToNumber = function(value)
+    return math.floor(value * 1000)
+end
+```
+
+This is useful when the profile representation is not already a single numeric value.
+
+---
+
+## Custom Ordered Keys
+
+By default, synchronized ordered stores use:
+
+1. `session.UserId`, when available;
+2. otherwise `session.Key`.
+
+Override that behavior:
+
+```lua
+OrderedDataStores = {
+    Coins = {
+        Path = "Coins",
+        AutoSync = true,
+
+        KeyFromSession = function(session)
+            return "Season1_" .. tostring(session.UserId)
+        end,
+    },
+}
+```
+
+Ordered keys must normalize to a string between 1 and 50 bytes.
+
+---
+
+## Ordered Value Normalization
+
+Available options:
+
+```lua
+{
+    ClampMin = 0,
+    ClampMax = 1_000_000,
+
+    Integer = true,
+
+    Round = "nearest",
+}
+```
+
+Rounding modes:
+
+```text
+nearest
+floor
+ceil
+```
+
+Example:
+
+```lua
+OrderedDataStores = {
+    Rating = {
+        Path = "Rating",
+
+        Mode = "set",
+        AutoSync = true,
+
+        ClampMin = 0,
+        ClampMax = 5000,
+
+        Integer = true,
+        Round = "nearest",
+    },
+}
+```
+
+---
+
+# Events
+
+Subscribe with:
+
+```lua
+local connection = Store:On("Saved", function(profile, reason, release)
+    print(
+        "Saved",
+        profile.Key,
+        reason,
+        release
+    )
+end)
+```
+
+One-shot listener:
+
+```lua
+Store:Once("Opened", function(profile)
+    print("First opened profile:", profile.Key)
+end)
+```
+
+Events emitted by the current implementation include:
+
+```text
+Opened
+Saved
+Released
+Changed
+SessionLost
+CompressionReport
+OrderedSyncCompleted
+OrderedSyncFailed
+DirectChangeInvalid
+AutoSaveFailed
+HeartbeatFailed
+PlayerLoadFailed
+PlayerReleaseFailed
+PlayerKeyFailed
+CrossServerEvent
+CrossServerError
+Closed
+```
+
+Example compression diagnostics:
+
+```lua
+Store:On("CompressionReport", function(report)
+    print(
+        report.StorageBytes,
+        report.Transport,
+        report.PersistedCompressed
+    )
+end)
+```
+
+Enable these reports with:
+
+```lua
+CompressionReports = true
+```
+
+---
+
+# Health and Metrics
+
+## Metrics
+
+```lua
+local metrics = Store:GetMetrics()
+
+print("Opened:", metrics.Opened)
+print("Saved:", metrics.Saved)
+print("SaveFailed:", metrics.SaveFailed)
+print("Retries:", metrics.Retries)
+
+print("Heartbeats:", metrics.Heartbeats)
+print("SessionLost:", metrics.SessionLost)
+
+print("BytesEncoded:", metrics.BytesEncoded)
+
+print("OrderedReads:", metrics.OrderedReads)
+print("OrderedWrites:", metrics.OrderedWrites)
+print("OrderedUpdates:", metrics.OrderedUpdates)
+print("OrderedSyncs:", metrics.OrderedSyncs)
+print("OrderedSyncFailed:", metrics.OrderedSyncFailed)
+```
+
+## Health
+
+```lua
+local health = Store:GetHealth()
+
+print("Version:", health.Version)
+print("RecordFormat:", health.RecordFormat)
+print("CompressionVersion:", health.CompressionVersion)
+
+print("Closed:", health.Closed)
+print("Closing:", health.Closing)
+
+for requestName, budget in pairs(health.Budgets) do
+    print(requestName, budget)
+end
+```
+
+---
+
+# Configuration Reference
+
+## Store configuration
+
+| Option | Default | Description |
+|---|---:|---|
+| `Name` | required | Standard DataStore name |
+| `Scope` | `"Global"` | Standard DataStore scope |
+| `Template` | required | `PlayersData.Data` template |
+| `Schema` | `nil` | Optional runtime validation schema |
+| `SchemaVersion` | `1` | Persistent schema version |
+| `Migrations` | `{}` | Migration functions keyed by target version |
+| `Strict` | `false` | Reject unknown template/schema keys |
+| `Reconcile` | `true` | Fill missing template fields |
+| `EnforceTemplateTypes` | `true` | Require loaded/written values to match template types |
+| `ValidateOnWrite` | `true` | Validate controlled mutations before commit |
+| `DetectDirectChanges` | `true` | Detect direct edits to `profile.Data` |
+| `Compression` | `true` | Enable persistence compression selection |
+| `CompressionModule` | auto | Explicit Compression ModuleScript override |
+| `CompressionOptions` | `{}` | Compression v2.3.x options |
+| `CompressionReports` | `false` | Emit `CompressionReport` events |
+| `CompressionTransport` | `"auto"` | `"auto"`, `"buffer"`, or `"base64"` |
+| `AutoSave` | `true` | Enable periodic saves |
+| `AutoSaveInterval` | `30` | Seconds between target autosaves |
+| `LockTimeout` | `120` | Session-lock lifetime |
+| `HeartbeatInterval` | derived | Session-lock refresh interval |
+| `RetryAttempts` | `6` | Backend retry attempts |
+| `RetryBaseDelay` | `0.5` | Initial retry backoff |
+| `RetryMaxDelay` | `10` | Maximum retry backoff |
+| `BudgetAware` | `true` | Wait for Roblox request budget |
+| `BudgetWaitTimeout` | `10` | Maximum budget wait per attempt |
+| `MinimumSaveInterval` | `3` | Minimum normal-save spacing |
+| `LoadTimeout` | `30` | Overall load deadline |
+| `SaveTimeout` | `30` | Overall save deadline |
+| `MaxDataNodes` | `50000` | Maximum validated data nodes |
+| `MaxDataBytes` | `3900000` | Maximum estimated raw data size |
+| `MaxStoredBytes` | `3900000` | Maximum final stored representation |
+| `MaxDepth` | `64` | Maximum persistent table depth |
+| `MaxSnapshots` | `10` | Runtime snapshots retained |
+| `KeyPrefix` | `""` | Prefix added to normal DataStore keys |
+| `PlayerKey` | `nil` | Custom player key function |
+| `AutoPlayerLifecycle` | `false` | Automatically open/release players |
+| `EnableCrossServerEvents` | `false` | Enable MessagingService events |
+| `CrossServerTopic` | generated | Cross-server MessagingService topic |
+| `OrderedDataStores` | `{}` | OrderedDataStore definitions |
+| `Debug` | `false` | Debug logging |
+
+## Compression options
+
+| Option | Default |
+|---|---:|
+| `StringDictionary` | `true` |
+| `DictionaryMinLength` | `4` |
+| `DictionaryMinUses` | `2` |
+| `DictionaryMaxEntries` | `16384` |
+| `DictionaryMaxCandidates` | `100000` |
+| `MaxDepth` | `128` |
+| `MaxNodes` | `2000000` |
+| `DeterministicMaps` | `false` |
+| `PreallocateLimit` | `4194304` |
+| `AllowExpansion` | `false` |
+
+## OrderedDataStore configuration
+
+| Option | Default | Description |
+|---|---:|---|
+| `Name` | `<Store>_<Alias>` | OrderedDataStore name |
+| `Scope` | parent scope | OrderedDataStore scope |
+| `Path` | `nil` | Profile path to synchronize |
+| `Mode` | `"max"` | `"set"`, `"max"`, or `"min"` |
+| `AutoSync` | `false` | Sync after successful profile saves |
+| `ToNumber` | `nil` | Convert profile value to a number |
+| `KeyFromSession` | UserId/key | Custom ordered key |
+| `ClampMin` | `nil` | Minimum output value |
+| `ClampMax` | `nil` | Maximum output value |
+| `Integer` | `false` | Require a safe integer |
+| `Round` | `nil` | `"nearest"`, `"floor"`, or `"ceil"` |
+| `RemoveWhenNil` | `false` | Remove ordered entry when synced path is nil |
+
+---
+
+# API Reference
+
+## NexusDataStore
+
+```lua
+NexusDataStore.new(config)
+```
+
+Public metadata:
+
+```lua
+NexusDataStore.Version
+NexusDataStore.RecordFormat
+NexusDataStore.RequiredCompressionVersion
+NexusDataStore.Errors
+NexusDataStore.OrderedDataStore
+NexusDataStore.Compression
+```
+
+## Store
+
+```lua
+Store:OpenAsync(key, context?)
+Store:OpenPlayerAsync(player)
+
+Store:PeekAsync(key)
+
+Store:GetSession(keyOrPlayer)
+Store:WaitForSession(keyOrPlayer, timeout?)
+
+Store:SaveAsync(session, priority?)
+Store:ReleaseAsync(session)
+
+Store:FlushAsync(timeout?)
+Store:ReleaseAllAsync()
+Store:CloseAsync(timeout?)
+
+Store:Validate(data)
+
+Store:GetTemplate()
+Store:GetSchema()
+Store:GetVersion()
+
+Store:EncodeCompressed(data)
+Store:DecodeCompressed(buffer)
+Store:GetCompressionReport(dataOrSession)
+
+Store:GetOrderedStore(alias)
+Store:SyncOrderedAsync(session, alias?)
+Store:SyncAllOrderedAsync(alias?)
+
+Store:GetMetrics()
+Store:GetHealth()
+
+Store:AttachPlayerLifecycle()
+Store:BindToClose()
+
+Store:On(eventName, callback)
+Store:Once(eventName, callback)
+```
+
+## Session / Profile
+
+```lua
+profile:IsActive()
+profile:IsDirty()
+
+profile:Get(path)
+profile:GetOr(path, fallback)
+profile:Has(path)
+
+profile:Set(path, value)
+profile:Delete(path)
+
+profile:Increment(path, amount?)
+profile:IncrementClamped(path, amount?, min?, max?)
+
+profile:Toggle(path)
+
+profile:Append(path, value)
+profile:RemoveAt(path, index)
+
+profile:Award(path, amount)
+profile:Spend(path, amount)
+
+profile:UpdatePath(path, callback)
+profile:Mutate(callback)
+profile:Patch(changes)
+
+profile:Watch(path?, callback)
+
+profile:Snapshot(label?)
+profile:Restore(snapshot)
+profile:DiffFromPersisted()
+
+profile:SaveAsync(priority?)
+profile:ReleaseAsync()
+
+profile:GetStatus()
+profile:GetStats()
+```
+
+## OrderedStore
+
+```lua
+ordered:GetAsync(key)
+
+ordered:SetAsync(key, value)
+ordered:UpdateAsync(key, transform)
+
+ordered:MaxAsync(key, value)
+ordered:MinAsync(key, value)
+
+ordered:IncrementAsync(key, delta?)
+ordered:RemoveAsync(key)
+
+ordered:WriteAsync(key, value, mode?)
+
+ordered:GetSortedAsync(ascending?, pageSize?, minimum?, maximum?)
+ordered:GetPageAsync(ascending?, pageSize?, minimum?, maximum?)
+
+ordered:GetTopAsync(limit?, minimum?, maximum?)
+ordered:GetBottomAsync(limit?, minimum?, maximum?)
+
+ordered:GetRankAsync(key, ascending?, maxPages?)
+
+ordered:SyncSessionAsync(profile)
+```
+
+## Compression
+
+```lua
+Compression.Version()
+Compression.TableMode(value, options?)
+
+Compression.CompressTablePacket(value, options?)
+Compression.DecompressTable(packet, options?)
+
+Compression.Measure(value, options?)
+```
+
+---
+
+# Production Patterns
+
+## Use server authority
+
+Do not trust a client-supplied balance:
+
+```lua
+RemoteEvent.OnServerEvent:Connect(function(player, requestedCoins)
+    local profile = Store:GetSession(player)
+
+    if not profile then
+        return
+    end
+
+    profile:Set("Coins", requestedCoins)
+end)
+```
+
+Prefer server-defined progression:
+
+```lua
+RemoteEvent.OnServerEvent:Connect(function(player)
+    local profile = Store:GetSession(player)
+
+    if not profile then
+        return
+    end
+
+    profile:Award("Coins", 1)
+end)
+```
+
+## Keep progression bounded
+
+Compression does not remove Roblox platform limits.
+
+Put deliberate limits on:
+
+- inventory length;
+- string length;
+- nested table depth;
+- generated keys;
+- leaderboard scan depth;
+- snapshot count.
+
+## Do not overwrite decode failures
+
+If:
+
+```lua
+OpenPlayerAsync()
+```
+
+returns a decode or validation error, stop initialization.
+
+Do not create a fresh profile and immediately save it over the failed record.
+
+## Prefer controlled mutations
+
+This:
+
+```lua
+profile:Award("Coins", 100)
+```
+
+gives the store an immediate mutation boundary.
+
+Direct writes:
+
+```lua
+profile.Data.Coins += 100
+```
+
+can still be detected when `DetectDirectChanges = true`, but controlled APIs avoid waiting for a scan to discover the edit.
+
+## Use max mode for high-score leaderboards
+
+```lua
+Mode = "max"
+```
+
+prevents a lower later value from replacing a player's best score.
+
+## Use min mode for completion times
+
+```lua
+Mode = "min"
+```
+
+preserves the player's fastest time when lower is better.
+
+---
+
+# Testing
+
+Before production, test all of the following.
+
+## Persistence
+
+- first join;
+- manual save;
+- leave/rejoin;
+- server shutdown;
+- autosave;
+- release;
+- direct mutation detection;
+- controlled mutations;
+- invalid data rejection;
+- schema reconciliation;
+- migrations.
+
+## Concurrency
+
+- two servers attempting the same profile;
+- lock expiration;
+- heartbeat renewal;
+- revision conflict;
+- save during mutation;
+- release during mutation.
+
+## Compression
+
+Use representative player data, not only tiny values.
+
+```lua
+local test = {
+    Coins = 10_000_000,
+    Rebirths = 250,
+
+    Inventory = {
+        "CommonRune",
+        "CommonRune",
+        "CommonRune",
+        "LegendaryRune",
+    },
+
+    Upgrades = {
+        Click = 100,
+        Luck = 50,
+        Speed = 25,
+    },
+}
+
+local packet, report = Compression.CompressTablePacket(test)
+local decoded = Compression.DecompressTable(packet)
+
+print("Raw:", report.RawBytes)
+print("Encoded:", report.EncodedBytes)
+print("Saved:", report.SavedBytes)
+print("Savings:", report.SavingsPercent)
+print("Dictionary:", report.DictionaryEntries)
+
+assert(decoded.Coins == test.Coins)
+assert(decoded.Upgrades.Click == test.Upgrades.Click)
+assert(decoded.Inventory[4] == test.Inventory[4])
+```
+
+Also test:
+
+- corrupted checksum;
+- truncated packets;
+- repeated strings;
+- deep tables;
+- large arrays;
+- all-default player state;
+- heavily changed player state;
+- `CompressionTransport = "auto"`;
+- buffer transport;
+- Base64 transport.
+
+## OrderedDataStore
+
+Test:
+
+- `set`;
+- `max`;
+- `min`;
+- positive increment;
+- negative increment;
+- clamp min/max;
+- integer mode;
+- rounding;
+- top 10;
+- bottom 10;
+- rank lookup;
+- auto sync after save;
+- manual sync;
+- remove on nil;
+- budget pressure.
+
+---
+
+# FAQ
+
+## Is `profile.Data` really typed?
+
+Yes.
+
+The current module uses:
+
+```lua
+export type Data = PlayersData.Data
+```
+
+and exposes the player store as:
+
+```lua
+Store<Data>
+```
+
+which returns:
+
+```lua
+Session<Data>
+```
+
+therefore:
+
+```lua
+profile.Data
+```
+
+is `PlayersData.Data`.
+
+## Does Compression support every Roblox datatype?
+
+No.
+
+Compression v2.3.2 supports:
+
+```text
+nil
+boolean
+finite number
+string
+array table
+map table
+nested table
+```
+
+It does not currently encode Roblox datatypes such as `Vector3`, `CFrame`, or `buffer`.
+
+## Why can a tiny value become larger?
+
+Every packet has framing/checksum overhead.
+
+Compression is primarily useful for structured values large enough for compact integers and repeated-string dictionaries to outweigh the fixed header.
+
+## Does `AllowExpansion = false` make direct compression return the raw value?
+
+No.
+
+`Compression.CompressTablePacket()` always returns a compression packet.
+
+NexusDataStore uses `AllowExpansion = false` while choosing the final persistence representation, so it can keep the raw record when the compressed envelope would be larger.
+
+## What does `CompressionTransport = "auto"` do?
+
+It compares the available persisted representations and chooses the smaller allowed representation.
+
+That can be:
+
+```text
+raw table
+compressed buffer envelope
+compressed Base64 envelope
+```
+
+## Is compression checked for corruption?
+
+Yes.
+
+The packet contains an Adler-32 checksum and the decoder also validates its header, codec, counts, dictionary references, limits, and trailing bytes.
+
+## Are session locks stored in MemoryStore?
+
+Not in this v7 architecture.
+
+The current record owns a `Lock` structure containing the job/session identity and expiration information.
+
+## Does OrderedDataStore store tables?
+
+No.
+
+Roblox OrderedDataStore values are numeric. `ToNumber` exists to project profile data into a numeric leaderboard value.
+
+## What OrderedDataStore mode should I use?
+
+Use:
+
+```text
+set -> latest/current value
+max -> highest/best large value
+min -> lowest/best small value
+```
+
+## Does AutoSync require a path?
+
+Yes.
+
+```lua
+AutoSync = true
+```
+
+requires:
+
+```lua
+Path = ...
+```
+
+## Does OrderedDataStore sync before or after the main save?
+
+Automatic ordered synchronization runs after a successful stable persistent profile commit.
+
+That keeps the ordered value aligned with successfully persisted profile data.
+
+## Should I use direct writes or `profile:Set()`?
+
+Both can work.
+
+For most gameplay systems, controlled methods such as:
+
+```lua
+Set
+Increment
+Award
+Spend
+Mutate
+Patch
+```
+
+are easier to validate and track immediately.
+
+---
+
+# Release Summary
+
+NexusDataStore v7.0.2 uses a deliberately defensive save flow:
+
+```text
+PlayersData.Data
+      |
+      v
+Session<Data>
+      |
+      v
+validate / reconcile / mutate
+      |
+      v
+revision-safe UpdateAsync
+      |
+      +--> raw record
+      |
+      `--> Compression v2.3.x
+              |
+              +--> buffer transport
+              |
+              `--> Base64 transport
+      |
+      v
+smallest allowed persistent representation
+      |
+      v
+Roblox DataStore
+```
+
+Ordered data is synchronized separately:
+
+```text
+successful profile save
+        |
+        v
+LastPersistedSnapshot
+        |
+        v
+configured OrderedDataStore Path
+        |
+        v
+ToNumber / clamp / round
+        |
+        v
+set / max / min
+        |
+        v
+Roblox OrderedDataStore
+```
+
+The design priorities are:
+
+1. preserve player progression;
+2. reject malformed or corrupt data rather than silently overwrite it;
+3. keep one authoritative typed `PlayersData.Data` shape;
+4. make retried saves deterministic;
+5. prevent stale-session overwrites;
+6. compress when it actually helps storage;
+7. keep leaderboard writes aligned with successful profile saves.
