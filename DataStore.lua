@@ -1,6 +1,10 @@
 --!native
 --!optimize 2
 
+local PlayersData = require(script.PlayersData)
+
+export type Data = PlayersData.Data
+
 export type PathKey = string | number
 export type Path = PathKey | {PathKey}
 export type SavePriority = "normal" | "high" | "critical"
@@ -229,6 +233,27 @@ export type Store<T> = {
 	Once: (self: Store<T>, eventName: string, callback: (...any) -> ()) -> any,
 }
 
+
+-- Concrete public aliases backed by PlayersData.Data.
+-- Requiring NexusDataStore now gives callers one canonical player-data shape:
+-- Store<Data> -> Session<Data> -> profile.Data.
+export type Profile = Session<Data>
+export type PlayerProfile = Session<Data>
+export type PlayerStore = Store<Data>
+export type PlayerStoreConfig = StoreConfig<Data>
+export type PlayerSnapshot = Snapshot<Data>
+
+
+export type NexusDataStoreModule = {
+	new: (config: StoreConfig<Data>) -> Store<Data>,
+	Version: string,
+	RecordFormat: number,
+	RequiredCompressionVersion: string,
+	Errors: {[string]: string},
+	OrderedDataStore: any,
+	Compression: any,
+}
+
 local Players = game:GetService("Players")
 local DataStoreService = game:GetService("DataStoreService")
 local HttpService = game:GetService("HttpService")
@@ -237,7 +262,7 @@ local EncodingService = game:GetService("EncodingService")
 
 local NexusDataStore: any = {}
 NexusDataStore.__index = NexusDataStore
-NexusDataStore.Version = "7.0.1"
+NexusDataStore.Version = "7.0.2"
 NexusDataStore.RecordFormat = 700
 NexusDataStore.RequiredCompressionVersion = "2.3.0"
 
@@ -968,7 +993,7 @@ end
 
 function NexusDataStore:_Debug(...)
 	if self.Config.Debug then
-		print("[NexusDataStore v7.0.1]", ...)
+		print("[NexusDataStore v7.0.2]", ...)
 	end
 end
 
@@ -1309,7 +1334,7 @@ function NexusDataStore:_DecodeRecord(raw: any): (any?, string?)
 	return record
 end
 
-function NexusDataStore:Validate(data): (boolean, string?)
+function NexusDataStore:Validate(data: Data): (boolean, string?)
 	if typeof(data) ~= "table" then
 		return false, "ROOT_DATA_MUST_BE_TABLE"
 	end
@@ -1348,14 +1373,14 @@ function NexusDataStore:Validate(data): (boolean, string?)
 	return true
 end
 
-function NexusDataStore:_Reconcile(data: any): (any?, string?)
+function NexusDataStore:_Reconcile(data: Data): (Data?, string?)
 	if not self.Config.Reconcile then
 		return data
 	end
 	return reconcileTemplate(data, self.Template, self.Config.EnforceTemplateTypes, self.Config.Strict)
 end
 
-function NexusDataStore:_ApplyMigrations(data: any, fromVersion: number, key: string): (any?, string?)
+function NexusDataStore:_ApplyMigrations(data: Data, fromVersion: number, key: string): (Data?, string?)
 	if fromVersion > self.SchemaVersion then
 		return nil, ("SCHEMA_NEWER_THAN_SERVER:%d>%d"):format(fromVersion, self.SchemaVersion)
 	end
@@ -1388,7 +1413,7 @@ function NexusDataStore:_ApplyMigrations(data: any, fromVersion: number, key: st
 	return working
 end
 
-function NexusDataStore:_BuildNewRecord(data: any): any
+function NexusDataStore:_BuildNewRecord(data: Data): any
 	local stamp = unix()
 	return {
 		Format = RECORD_FORMAT,
@@ -1465,14 +1490,14 @@ function NexusDataStore:_WithLocalMutex(map: any, key: string, timeout: number, 
 	return a, b, c
 end
 
-function NexusDataStore:_CreateSession(key: string, record: any, sessionId: string, context: OpenContext): any
-	local session = setmetatable({
+function NexusDataStore:_CreateSession(key: string, record: any, sessionId: string, context: OpenContext): Session<Data>
+	local session: Session<Data> = setmetatable({
 		Store = self,
 		Key = key,
 		Player = context.Player,
 		UserId = context.UserId or (context.Player and context.Player.UserId or nil),
 		Context = context,
-		Data = clone(record.Data),
+		Data = clone(record.Data) :: Data,
 		Revision = record.Revision or 0,
 		SchemaVersion = record.SchemaVersion or self.SchemaVersion,
 		SessionId = sessionId,
@@ -1483,8 +1508,8 @@ function NexusDataStore:_CreateSession(key: string, record: any, sessionId: stri
 		LastSaveAt = now(),
 		LastHeartbeatAt = now(),
 		NextAutoSaveAt = now() + self.Config.AutoSaveInterval,
-		LastPersistedSnapshot = clone(record.Data),
-		ObservedSnapshot = clone(record.Data),
+		LastPersistedSnapshot = clone(record.Data) :: Data,
+		ObservedSnapshot = clone(record.Data) :: Data,
 		Snapshots = {},
 		Watchers = {},
 		CommitBusy = false,
@@ -1492,7 +1517,7 @@ function NexusDataStore:_CreateSession(key: string, record: any, sessionId: stri
 		DirectChangeInvalid = false,
 		SavePending = false,
 		HeartbeatPending = false,
-	}, Session)
+	}, Session) :: any
 	self.Sessions[key] = session
 	self.SessionById[sessionId] = session
 	if session.Player then
@@ -1502,7 +1527,7 @@ function NexusDataStore:_CreateSession(key: string, record: any, sessionId: stri
 end
 
 -- Opens and exclusively locks a v7 record, then migrates, reconciles, and validates it before creating a session.
-function NexusDataStore:OpenAsync(key: string | number, context: OpenContext?): (any?, string?)
+function NexusDataStore:OpenAsync(key: string | number, context: OpenContext?): (Session<Data>?, string?)
 	if self.Closed then
 		return nil, "STORE_CLOSED"
 	end
@@ -1561,7 +1586,7 @@ function NexusDataStore:OpenAsync(key: string | number, context: OpenContext?): 
 				end
 
 				local schemaVersion = tonumber(record.SchemaVersion) or 1
-				local migrated, migrationErr = self:_ApplyMigrations(record.Data, schemaVersion, normalizedKey)
+				local migrated, migrationErr = self:_ApplyMigrations(record.Data :: Data, schemaVersion, normalizedKey)
 				if not migrated then
 					acquireError = migrationErr
 					return nil
@@ -1577,7 +1602,7 @@ function NexusDataStore:OpenAsync(key: string | number, context: OpenContext?): 
 					return nil
 				end
 				local changedOnLoad = schemaVersion ~= self.SchemaVersion or not deepEqual(record.Data, reconciled)
-				record.Data = reconciled
+				record.Data = reconciled :: Data
 				record.SchemaVersion = self.SchemaVersion
 				if changedOnLoad then
 					record.Revision = (tonumber(record.Revision) or 0) + 1
@@ -1627,7 +1652,7 @@ function NexusDataStore:OpenAsync(key: string | number, context: OpenContext?): 
 end
 
 -- Opens a player record while protecting custom PlayerKey handlers from propagating callback errors.
-function NexusDataStore:OpenPlayerAsync(player: Player): (any?, string?)
+function NexusDataStore:OpenPlayerAsync(player: Player): (Session<Data>?, string?)
 	assert(typeof(player) == "Instance" and player:IsA("Player"), "OpenPlayerAsync expects a Player")
 	local key
 	if self.Config.PlayerKey then
@@ -1648,7 +1673,7 @@ function NexusDataStore:OpenPlayerAsync(player: Player): (any?, string?)
 	})
 end
 
-function NexusDataStore:PeekAsync(key: string | number): (any?, any)
+function NexusDataStore:PeekAsync(key: string | number): (Data?, {[string]: any} | string?)
 	if self.Closed then
 		return nil, "STORE_CLOSED"
 	end
@@ -1670,7 +1695,7 @@ function NexusDataStore:PeekAsync(key: string | number): (any?, any)
 	if not record then
 		return nil, err
 	end
-	return clone(record.Data), {
+	return clone(record.Data) :: Data, {
 		SchemaVersion = record.SchemaVersion,
 		Revision = record.Revision,
 		CreatedAt = record.CreatedAt,
@@ -1704,7 +1729,7 @@ function NexusDataStore:_ResolveKey(keyOrPlayer: any): string?
 	return nil
 end
 
-function NexusDataStore:GetSession(keyOrPlayer: any): any?
+function NexusDataStore:GetSession(keyOrPlayer: string | number | Player): Session<Data>?
 	if typeof(keyOrPlayer) == "Instance" and keyOrPlayer:IsA("Player") then
 		return self.SessionByPlayer[keyOrPlayer]
 	end
@@ -1712,7 +1737,7 @@ function NexusDataStore:GetSession(keyOrPlayer: any): any?
 	return key and self.Sessions[key] or nil
 end
 
-function NexusDataStore:WaitForSession(keyOrPlayer: any, timeout: number?): (any?, string?)
+function NexusDataStore:WaitForSession(keyOrPlayer: string | number | Player, timeout: number?): (Session<Data>?, string?)
 	local deadline = now() + (timeout or self.Config.LoadTimeout)
 	repeat
 		local session = self:GetSession(keyOrPlayer)
@@ -2242,8 +2267,8 @@ function NexusDataStore:GetHealth()
 	}
 end
 
-function NexusDataStore:GetTemplate()
-	return clone(self.Template)
+function NexusDataStore:GetTemplate(): Data
+	return clone(self.Template) :: Data
 end
 
 function NexusDataStore:GetSchema()
@@ -3021,15 +3046,15 @@ function Session:UpdatePath(path: Path, callback): (boolean, any)
 end
 
 -- Runs an atomic in-memory draft mutation and rejects callbacks that mutate the live session concurrently.
-function Session:Mutate(callback): (boolean, any)
+function Session:Mutate(callback: (draft: Data, session: Session<Data>) -> any): (boolean, any)
 	assert(typeof(callback) == "function", "Mutate callback required")
 	local mutable, mutableErr = self:_CanMutate()
 	if not mutable then
 		return false, mutableErr
 	end
-	local draft = clone(self.Data)
+	local draft = clone(self.Data) :: Data
 	local baseMutationId = self.MutationId
-	local ok, result = pcall(callback, draft, self)
+	local ok, result = pcall(callback, draft, self :: Session<Data>)
 	if not ok then
 		return false, tostring(result)
 	end
@@ -3090,23 +3115,23 @@ function Session:Watch(path: Path?, callback)
 	return connection
 end
 
-function Session:Snapshot(label: string?): any
+function Session:Snapshot(label: string?): Snapshot<Data>
 	local snapshot = {
 		Id = HttpService:GenerateGUID(false),
 		Label = label,
 		CreatedAt = unix(),
-		Data = clone(self.Data),
+		Data = clone(self.Data) :: Data,
 		Revision = self.Revision,
 	}
 	table.insert(self.Snapshots, snapshot)
 	while #self.Snapshots > self.Store.Config.MaxSnapshots do
 		table.remove(self.Snapshots, 1)
 	end
-	return clone(snapshot)
+	return clone(snapshot) :: Snapshot<Data>
 end
 
 -- Restores a snapshot through the same active-session validation path as other mutations.
-function Session:Restore(snapshot: any): (boolean, string?)
+function Session:Restore(snapshot: Snapshot<Data>): (boolean, string?)
 	local mutable, mutableErr = self:_CanMutate()
 	if not mutable then
 		return false, mutableErr
@@ -3114,7 +3139,7 @@ function Session:Restore(snapshot: any): (boolean, string?)
 	if typeof(snapshot) ~= "table" or typeof(snapshot.Data) ~= "table" then
 		return false, "INVALID_SNAPSHOT"
 	end
-	local draft = clone(snapshot.Data)
+	local draft = clone(snapshot.Data) :: Data
 	local valid, err = self.Store:Validate(draft)
 	if not valid then
 		return false, "SNAPSHOT_VALIDATION_FAILED:" .. tostring(err)
@@ -3173,7 +3198,7 @@ end
 
 
 -- Creates a v7 store, validates configuration and codec compatibility, and starts lifecycle/background handlers.
-function NexusDataStore.new<T>(config: StoreConfig<T>): Store<T>
+function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 	assert(typeof(config) == "table", "Configuration table required")
 	assert(typeof(config.Name) == "string" and #config.Name > 0 and #config.Name <= 50, "Name must be 1-50 bytes")
 	assert(typeof(config.Template) == "table", "Template must be a table")
@@ -3209,7 +3234,7 @@ function NexusDataStore.new<T>(config: StoreConfig<T>): Store<T>
 	self.Config = {
 		Name = config.Name,
 		Scope = config.Scope or "Global",
-		Template = clone(config.Template),
+		Template = clone(config.Template) :: Data,
 		Schema = config.Schema,
 		SchemaVersion = config.SchemaVersion or 1,
 		Migrations = config.Migrations or {},
@@ -3257,7 +3282,7 @@ function NexusDataStore.new<T>(config: StoreConfig<T>): Store<T>
 	if not self.Config.Compression then
 		self.Config.MaxDataBytes = math.min(self.Config.MaxDataBytes, self.Config.MaxStoredBytes)
 	end
-	self.Template = clone(config.Template)
+	self.Template = clone(config.Template) :: Data
 	self.Schema = config.Schema and clone(config.Schema) or nil
 	self.SchemaVersion = self.Config.SchemaVersion
 	self.DataStore = DataStoreService:GetDataStore(self.Config.Name, self.Config.Scope)
@@ -3358,7 +3383,7 @@ function NexusDataStore.new<T>(config: StoreConfig<T>): Store<T>
 	if self.Config.AutoPlayerLifecycle then
 		self:AttachPlayerLifecycle()
 	end
-	return self :: Store<T>
+	return self :: Store<Data>
 end
 
 NexusDataStore.OrderedDataStore = table.freeze({
@@ -3373,4 +3398,4 @@ NexusDataStore.Compression = table.freeze({
 	RecordFormat = RECORD_FORMAT,
 })
 
-return NexusDataStore
+return NexusDataStore :: NexusDataStoreModule
