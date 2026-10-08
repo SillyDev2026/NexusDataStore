@@ -262,7 +262,7 @@ local EncodingService = game:GetService("EncodingService")
 
 local NexusDataStore: any = {}
 NexusDataStore.__index = NexusDataStore
-NexusDataStore.Version = "7.0.2"
+NexusDataStore.Version = "7.0.3"
 NexusDataStore.RecordFormat = 700
 NexusDataStore.RequiredCompressionVersion = "2.3.0"
 
@@ -1509,7 +1509,7 @@ function NexusDataStore:_CreateSession(key: string, record: any, sessionId: stri
 		LastHeartbeatAt = now(),
 		NextAutoSaveAt = now() + self.Config.AutoSaveInterval,
 		LastPersistedSnapshot = clone(record.Data) :: Data,
-		ObservedSnapshot = clone(record.Data) :: Data,
+		ObservedSnapshot = self.Config.DetectDirectChanges and clone(record.Data) or nil,
 		Snapshots = {},
 		Watchers = {},
 		CommitBusy = false,
@@ -1912,10 +1912,10 @@ function NexusDataStore:_Commit(session: any, release: boolean, reason: string):
 			end
 			if changedDuringCommit then
 				session.Dirty = true
-				session.ObservedSnapshot = clone(session.Data)
+				session.ObservedSnapshot = self.Config.DetectDirectChanges and clone(session.Data) or nil
 			else
 				session.Dirty = false
-				session.ObservedSnapshot = clone(snapshot)
+				session.ObservedSnapshot = self.Config.DetectDirectChanges and clone(snapshot) or nil
 			end
 			self.Metrics.Saved += 1
 			self.Metrics.SaveTime += now() - startTime
@@ -2817,6 +2817,9 @@ end
 function Session:_EmitChange(path: {PathKey}?, newValue: any, oldValue: any)
 	local exact = self.Watchers[pathKey(path)]
 	local wildcard = self.Watchers["*"]
+	if exact == nil and wildcard == nil and self.Store.Events.Changed == nil then
+		return
+	end
 	local callbacks = {}
 	if exact then
 		for _, callback in pairs(exact) do
@@ -2848,7 +2851,7 @@ function Session:_CommitDraft(draft: any, path: {PathKey}?, oldValue: any, newVa
 	self.Data = draft
 	self.Dirty = true
 	self.MutationId += 1
-	self.ObservedSnapshot = clone(draft)
+	self.ObservedSnapshot = self.Store.Config.DetectDirectChanges and clone(draft) or nil
 	self.Store.Metrics.Mutations += 1
 	self:_EmitChange(path, newValue, oldValue)
 	return true
@@ -3277,7 +3280,8 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 		self.Config.CompressionOptions.MaxDepth = self.Config.MaxDepth + 8
 	end
 	if self.Config.CompressionOptions.MaxNodes == nil then
-		self.Config.CompressionOptions.MaxNodes = self.Config.MaxDataNodes + 1024
+		-- Codec nodes include map keys as well as values.
+		self.Config.CompressionOptions.MaxNodes = self.Config.MaxDataNodes * 2 + 4096
 	end
 	if not self.Config.Compression then
 		self.Config.MaxDataBytes = math.min(self.Config.MaxDataBytes, self.Config.MaxStoredBytes)
