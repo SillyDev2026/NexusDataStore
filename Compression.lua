@@ -344,6 +344,9 @@ function Reader:VarUInt(): number
 		position += 1
 		value += (byte % 128) * multiplier
 		if byte < 128 then
+			if count > 1 and byte == 0 then
+				error("NON_CANONICAL_VARUINT")
+			end
 			break
 		end
 		multiplier *= 128
@@ -730,7 +733,11 @@ local function readValue(
 				error("DUPLICATE_MAP_KEY")
 			end
 			seenKeys[key] = true
-			output[key] = readValue(reader, dictionary, state, options, depth + 1)
+			local child = readValue(reader, dictionary, state, options, depth + 1)
+			if child == nil then
+				error("NIL_MAP_VALUE")
+			end
+			output[key] = child
 		end
 		return output
 	end
@@ -739,7 +746,7 @@ end
 
 -- Returns the codec version exposed to dependent modules.
 function Compression.Version(): string
-	return "2.3.2"
+	return "2.3.3"
 end
 
 -- Returns the stable table codec mode identifier.
@@ -747,7 +754,7 @@ function Compression.TableMode(_value: any, _options: Options?): string
 	return "buffer-v230"
 end
 
--- Encodes using the v2.3 packet format with the v2.3.2 large-save engine.
+-- Encodes using the v2.3 packet format with the v2.3.3 hardened engine.
 function Compression.CompressTablePacket(value: any, options: Options?): (buffer, Report)
 	local normalized = normalizeOptions(options)
 	local dictionary, lookup, dictionaryBytes, scannedNodes = buildDictionary(value, normalized)
