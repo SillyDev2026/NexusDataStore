@@ -1,13 +1,13 @@
 # NexusDataStore
 
-![Version](https://img.shields.io/badge/version-v7.0.2-4c8bf5)
+![Version](https://img.shields.io/badge/version-v7.0.3-4c8bf5)
 ![Language](https://img.shields.io/badge/language-Luau-00A2FF)
 ![Platform](https://img.shields.io/badge/platform-Roblox-111111)
 ![Runtime](https://img.shields.io/badge/runtime-server--only-orange)
 ![Record Format](https://img.shields.io/badge/record%20format-700-2ea44f)
 ![Compression](https://img.shields.io/badge/compression-v2.3.x%20%7C%20codec%20230-6f42c1)
 
-**NexusDataStore v7.0.2** is a typed, session-aware Roblox persistence layer built for reliable player data, compact storage, controlled mutations, migrations, snapshots, observability, and integrated OrderedDataStore synchronization.
+**NexusDataStore v7.0.3** is a typed, session-aware Roblox persistence layer built for reliable player data, compact storage, controlled mutations, migrations, snapshots, observability, and integrated OrderedDataStore synchronization.
 
 The current build is tied directly to a `PlayersData` ModuleScript:
 
@@ -34,11 +34,31 @@ profile.Data
 
 This means `profile.Data.Coins`, `profile.Data.Inventory`, and every other declared field can be understood by Luau instead of collapsing to `any`.
 
-> **Current release:** NexusDataStore `7.0.2`  
+> **Current release:** NexusDataStore `7.0.3`  
 > **Record format:** `700`  
 > **Compression series:** `2.3.x`  
 > **Compression codec:** `230`  
-> **Recommended Compression build:** `2.3.2`
+> **Recommended Compression build:** `2.3.3`
+
+---
+
+## Maintenance update — v7.0.3 / Compression v2.3.3
+
+This release is a backward-compatible bug-fix update to the **GitHub v7.0.x line**. It keeps **record format 700** and **binary codec 230** unchanged; the Compression v2.3.x API remains supported.
+
+- **Fixed large map save failures:** the default codec node allowance now accounts for both values and string map keys. The persistence validator and binary encoder use different node-counting rules.
+- **Reduced unnecessary allocations:** profile snapshots used exclusively for direct-change detection are no longer cloned when `DetectDirectChanges = false`. Existing copy-on-write API behavior is unchanged.
+- **Faster no-listener mutations:** changed-event argument cloning is skipped when no session watcher or global `Changed` listener exists.
+- **Hardened packet decoding:** noncanonical variable-length integers and nil map values now fail explicitly instead of being accepted or silently discarded.
+- **Regression scripts:** `tests/CompressionRegression.server.lua` checks round-trips, corrupted checksums, and malformed packets. `tests/NexusDataStoreRegression.server.lua` checks a 2,200-key map and the revised node allowance.
+
+### Compatibility and testing
+
+Use `DataStore.lua` as a server-side ModuleScript containing the `PlayersData` child module described below; place the `Compression` ModuleScript next to it or pass `CompressionModule`. Existing v2.3.x codec-230 saved payloads remain readable; this update does **not** migrate or rewrite DataStore keys until they are naturally saved.
+
+**Studio tests are supplied but must be executed in Roblox Studio** before deployment to a live experience. Put each `.server.lua` test Script beside the required ModuleScripts in `ServerScriptService`, run it, and check the Output panel. The DataStore regression exercises module construction and local encode/decode only; it does not write player data.
+
+Roblox already compresses persisted DataStore values. Benchmark `Compression = true` against `Compression = false` on representative player saves rather than assuming extra application-side compression is always beneficial. Each per-key value must remain within Roblox's current 4,194,304-character limit; the library keeps its stricter `MaxStoredBytes` safety margin.
 
 ---
 
@@ -939,7 +959,7 @@ NexusDataStore applies every missing migration in order.
 
 # Compression
 
-NexusDataStore v7.0.2 is compatible with the **Compression v2.3.x** series using codec:
+NexusDataStore v7.0.3 is compatible with the **Compression v2.3.x** series using codec:
 
 ```text
 230
@@ -948,7 +968,7 @@ NexusDataStore v7.0.2 is compatible with the **Compression v2.3.x** series using
 The recommended module build is:
 
 ```text
-Compression v2.3.2
+Compression v2.3.3
 ```
 
 The packet format has a fixed 11-byte header containing the codec identity, flags, and checksum metadata.
@@ -967,7 +987,7 @@ Compression.Version()
 
 ## Supported Compression Types
 
-Compression v2.3.2 directly supports these Luau value types:
+Compression v2.3.3 directly supports these Luau value types:
 
 | Luau value | Supported | Encoding behavior |
 |---|---:|---|
@@ -981,7 +1001,7 @@ Compression v2.3.2 directly supports these Luau value types:
 | nested tables | Yes | recursive |
 | circular tables | No | rejected |
 | `NaN` / `math.huge` | No | rejected |
-| `buffer` | No | rejected by Compression v2.3.2 |
+| `buffer` | No | rejected by Compression v2.3.3 |
 | `Vector2` | No | rejected |
 | `Vector3` | No | rejected |
 | `CFrame` | No | rejected |
@@ -997,7 +1017,7 @@ The DataStore persistence validator is intentionally narrower than the standalon
 - mixed/sparse tables are rejected;
 - circular references are rejected;
 - non-finite numbers are rejected;
-- Roblox datatypes such as `Vector3`, `CFrame`, and `buffer` are not persistent values in this v7.0.2 codec path.
+- Roblox datatypes such as `Vector3`, `CFrame`, and `buffer` are not persistent values in this v7.0.3 codec path.
 
 ---
 
@@ -1286,7 +1306,7 @@ For persistent NexusDataStore dictionaries, use string keys.
 
 ## Complete Compression Type Smoke Test
 
-This test exercises every value category supported by Compression v2.3.2:
+This test exercises every value category supported by Compression v2.3.3:
 
 ```lua
 local Compression = require(script.Parent.Compression)
@@ -1380,7 +1400,7 @@ workspace.Part
 function() end
 ```
 
-Compression v2.3.2 rejects them with `UNSUPPORTED_TYPE:<type>`.
+Compression v2.3.3 rejects them with `UNSUPPORTED_TYPE:<type>`.
 
 ---
 
@@ -1678,7 +1698,7 @@ This report follows the same persistence selection path used by saves.
 
 ## Corruption Protection
 
-Compression v2.3.2 validates:
+Compression v2.3.3 validates:
 
 - packet magic;
 - codec version;
@@ -2789,7 +2809,7 @@ is `PlayersData.Data`.
 
 No.
 
-Compression v2.3.2 supports:
+Compression v2.3.3 supports:
 
 ```text
 nil
@@ -2898,7 +2918,7 @@ are easier to validate and track immediately.
 
 # Release Summary
 
-NexusDataStore v7.0.2 uses a deliberately defensive save flow:
+NexusDataStore v7.0.3 uses a deliberately defensive save flow:
 
 ```text
 PlayersData.Data
