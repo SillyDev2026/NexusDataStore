@@ -2,7 +2,7 @@
 -- Place beside DataStore ModuleScript; DataStore has a PlayersData child.
 -- Intentionally does not perform external DataStore requests.
 local DataStore = require(script.Parent:WaitForChild("DataStore"))
-local store = DataStore.new({
+local store: any = DataStore.new({
     Name = "NexusCloseRecoveryRegression",
     Template = {Coins = 0},
     Compression = false,
@@ -10,7 +10,7 @@ local store = DataStore.new({
     AutoPlayerLifecycle = false,
     DetectDirectChanges = false,
 })
-local fakeSession = {Key = "regression-key", Active = true}
+local fakeSession: any = {Key = "regression-key", Active = true}
 function fakeSession:IsActive(): boolean
     return self.Active
 end
