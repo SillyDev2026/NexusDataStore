@@ -21,7 +21,7 @@ local store = DataStore.new({
     AutoPlayerLifecycle = false,
     MaxDataNodes = 3000,
 })
-assert(store:GetVersion() == "7.0.3", "Unexpected NexusDataStore version")
+assert(store:GetVersion() == "7.0.4", "Unexpected NexusDataStore version")
 assert(store.Config.CompressionOptions.MaxNodes >= store.Config.MaxDataNodes * 2, "Codec node budget is too small")
 local packet, report = store:EncodeCompressed(template)
 assert(typeof(packet) == "buffer", "Large string-key map failed to encode: " .. tostring(report))
@@ -30,4 +30,4 @@ assert(result ~= nil, "Could not decode map: " .. tostring(err))
 assert(result.Inventory.Key_2200 == 2200, "Map data changed during encoding")
 local closed, closeErr = store:CloseAsync()
 assert(closed, "Test store cleanup failed: " .. tostring(closeErr))
-print("NexusDataStore v7.0.3 map-key regression PASS (2,200 keys)")
+print("NexusDataStore v7.0.4 map-key regression PASS (2,200 keys)")
