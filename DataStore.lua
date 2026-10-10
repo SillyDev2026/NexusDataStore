@@ -262,7 +262,7 @@ local EncodingService = game:GetService("EncodingService")
 
 local NexusDataStore: any = {}
 NexusDataStore.__index = NexusDataStore
-NexusDataStore.Version = "7.0.3"
+NexusDataStore.Version = "7.0.4"
 NexusDataStore.RecordFormat = 700
 NexusDataStore.RequiredCompressionVersion = "2.3.0"
 
@@ -2178,7 +2178,8 @@ function NexusDataStore:BindToClose()
 	end
 	self.BoundToClose = true
 	game:BindToClose(function()
-		self:CloseAsync(self.Config.SaveTimeout)
+        local ok, err = self:CloseAsync(self.Config.SaveTimeout)
+        if not ok then warn("[NexusDataStore] BindToClose could not release every session:", err) end
 	end)
 end
 
@@ -2186,6 +2187,12 @@ function NexusDataStore:CloseAsync(timeout: number?): (boolean, string?)
 	if self.Closed then
 		return true
 	end
+    if self.Closing then
+        return false, "CLOSE_IN_PROGRESS"
+    end
+    if timeout ~= nil and (not finiteNumber(timeout) or timeout <= 0) then
+        return false, "INVALID_CLOSE_TIMEOUT"
+    end
 	self.Closing = true
 	local deadline = now() + (timeout or self.Config.SaveTimeout)
 	local sessions = {}
@@ -2198,11 +2205,26 @@ function NexusDataStore:CloseAsync(timeout: number?): (boolean, string?)
 			firstError = firstError or "CLOSE_TIMEOUT"
 			break
 		end
-		local ok, err = self:ReleaseAsync(session)
-		if not ok then
-			firstError = firstError or err
-		end
+        local released, ok, err = pcall(self.ReleaseAsync, self, session)
+        if not released then
+            firstError = firstError or "RELEASE_EXCEPTION:" .. tostring(ok)
+        elseif not ok then
+            firstError = firstError or err or "RELEASE_FAILED"
+        end
 	end
+    -- Do not permanently stop heartbeats/saves while any active session
+    -- remains unreleased. Leave the store open so callers can retry CloseAsync.
+    for _, session in pairs(self.Sessions) do
+        if session:IsActive() then
+            firstError = firstError or "ACTIVE_SESSIONS_REMAIN"
+            break
+        end
+    end
+    if firstError ~= nil then
+        self.Closing = false
+        self:_Fire("CloseFailed", firstError)
+        return false, firstError
+    end
 	if self.CrossServerSubscription then
 		pcall(function()
 			self.CrossServerSubscription:Disconnect()

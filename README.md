@@ -1,13 +1,13 @@
 # NexusDataStore
 
-![Version](https://img.shields.io/badge/version-v7.0.3-4c8bf5)
+![Version](https://img.shields.io/badge/version-v7.0.4-4c8bf5)
 ![Language](https://img.shields.io/badge/language-Luau-00A2FF)
 ![Platform](https://img.shields.io/badge/platform-Roblox-111111)
 ![Runtime](https://img.shields.io/badge/runtime-server--only-orange)
 ![Record Format](https://img.shields.io/badge/record%20format-700-2ea44f)
 ![Compression](https://img.shields.io/badge/compression-v2.3.x%20%7C%20codec%20230-6f42c1)
 
-**NexusDataStore v7.0.3** is a typed, session-aware Roblox persistence layer built for reliable player data, compact storage, controlled mutations, migrations, snapshots, observability, and integrated OrderedDataStore synchronization.
+**NexusDataStore v7.0.4** is a typed, session-aware Roblox persistence layer built for reliable player data, compact storage, controlled mutations, migrations, snapshots, observability, and integrated OrderedDataStore synchronization.
 
 The current build is tied directly to a `PlayersData` ModuleScript:
 
@@ -39,6 +39,23 @@ This means `profile.Data.Coins`, `profile.Data.Inventory`, and every other decla
 > **Compression series:** `2.3.x`  
 > **Compression codec:** `230`  
 > **Recommended Compression build:** `2.3.3`
+
+---
+
+## v7.0.4 — safe failure handling during store shutdown
+
+`CloseAsync(timeout?)` now returns `false, errorCode` **without permanently marking the store closed** if any active session could not be released. Previously a failed release could still set `Closed = true`, disable background recovery, and prevent a subsequent save/release attempt. The failed store can now retry `CloseAsync`; successful releases remain released.
+
+Additional protections:
+
+- Concurrent `CloseAsync` attempts return `CLOSE_IN_PROGRESS` instead of racing with the existing close operation.
+- Nonfinite, zero, or negative explicit timeouts return `INVALID_CLOSE_TIMEOUT`.
+- Exceptions from one session release are captured and reported rather than aborting the whole release loop.
+- `BindToClose` warns if a release fails; **Roblox server termination can still interrupt any outstanding write**. This patch does not promise durable saves after the process ends.
+
+**Compatibility:** Public APIs, record format 700, Compression v2.3.x / codec 230, existing session data, and data-store keys remain unchanged. Only failure handling changes, and source version increases from `7.0.3` to `7.0.4`. `CloseFailed` is emitted on failed shutdown attempts.
+
+**Verification:** Run `tests/CloseRecoveryRegression.server.lua` in Roblox Studio beside the `DataStore` module and existing `PlayersData` child. It uses an in-memory fake session and deliberately does not write to the live DataStore service. Also run the existing map-key and compression regressions. Use Studio Script Analysis to verify Luau types; a directive alone is not a successful analyzer run.
 
 ---
 
