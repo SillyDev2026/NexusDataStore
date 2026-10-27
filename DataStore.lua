@@ -1402,7 +1402,9 @@ function NexusDataStore:_ApplyMigrations(data: Data, fromVersion: number, key: s
 	if fromVersion > self.SchemaVersion then
 		return nil, ("SCHEMA_NEWER_THAN_SERVER:%d>%d"):format(fromVersion, self.SchemaVersion)
 	end
-	local working = clone(data)
+	-- Reconciliation already copies the data when enabled; avoid a full clone
+	-- for the common case in which no migration is required.
+	local working = fromVersion == self.SchemaVersion and data or clone(data)
 	local version = fromVersion
 	while version < self.SchemaVersion do
 		local targetVersion = version + 1
@@ -1509,6 +1511,9 @@ function NexusDataStore:_WithLocalMutex(map: any, key: string, timeout: number, 
 end
 
 function NexusDataStore:_CreateSession(key: string, record: any, sessionId: string, context: OpenContext): Session<Data>
+	-- These snapshots are both read-only references until one is replaced.
+	-- Sharing them removes a redundant full-data clone on every load.
+	local persistedSnapshot = clone(record.Data)
 	local session: Session<Data> = setmetatable({
 		Store = self,
 		Key = key,
@@ -1526,8 +1531,8 @@ function NexusDataStore:_CreateSession(key: string, record: any, sessionId: stri
 		LastSaveAt = now(),
 		LastHeartbeatAt = now(),
 		NextAutoSaveAt = now() + self.Config.AutoSaveInterval,
-		LastPersistedSnapshot = clone(record.Data) :: Data,
-		ObservedSnapshot = self.Config.DetectDirectChanges and clone(record.Data) or nil,
+		LastPersistedSnapshot = persistedSnapshot :: Data,
+		ObservedSnapshot = self.Config.DetectDirectChanges and persistedSnapshot or nil,
 		Snapshots = {},
 		Watchers = {},
 		CommitBusy = false,
@@ -1633,7 +1638,9 @@ function NexusDataStore:OpenAsync(key: string | number, context: OpenContext?): 
 				end
 				record.UpdatedAt = unix()
 				self:_LockRecord(record, sessionId)
-				recordForSession = clone(record)
+				-- The decoder/record builder already owns this table; session creation
+				-- clones the player data, so copying the entire record here is redundant.
+				recordForSession = record
 				local encoded, encodeErr, currentReport = self:_EncodeRecord(record)
 				if encoded == nil then
 					acquireError = encodeErr
@@ -1963,7 +1970,7 @@ function NexusDataStore:_Commit(session: any, release: boolean, reason: string):
 				session.ObservedSnapshot = self.Config.DetectDirectChanges and clone(session.Data) or nil
 			else
 				session.Dirty = false
-				session.ObservedSnapshot = self.Config.DetectDirectChanges and clone(snapshot) or nil
+				session.ObservedSnapshot = self.Config.DetectDirectChanges and snapshot or nil
 			end
 			self.Metrics.Saved += 1
 			self.Metrics.SaveTime += now() - startTime
