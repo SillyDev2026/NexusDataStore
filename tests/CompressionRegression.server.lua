@@ -1,5 +1,5 @@
 --!strict
--- Roblox Studio server regression tests for Compression v2.3.3 (codec 230).
+-- Roblox Studio server regression tests for Compression v2.3.4 (codec 230).
 -- Place this Script beside a ModuleScript named Compression and run Play/Run.
 local Compression = require(script.Parent:WaitForChild("Compression"))
 
@@ -39,7 +39,7 @@ local function makePacket(payload: {number}): buffer
     return packet
 end
 
-assert(Compression.Version() == "2.3.3", "Unexpected compression version")
+assert(Compression.Version() == "2.3.4", "Unexpected compression version")
 assert(Compression.CodecVersion == 230, "Persistent codec must remain v230")
 assert(Compression.TableMode({}) == "buffer-v230", "Packet format changed")
 
@@ -84,4 +84,8 @@ passed += 1
 assertRejected(makePacket({0, 8, 1, 5, 1, 120, 0}), "NIL_MAP_VALUE")
 passed += 1
 
-print(("Compression v2.3.3 codec230 regression PASS: %d cases"):format(passed))
+-- The eighth VarUInt byte cannot contribute a 54th bit to a Luau safe integer.
+assertRejected(makePacket({0, 3, 128, 128, 128, 128, 128, 128, 128, 16}), "VARUINT_UNSAFE_INTEGER")
+passed += 1
+
+print(("Compression v2.3.4 codec230 regression PASS: %d cases"):format(passed))

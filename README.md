@@ -1,13 +1,13 @@
 # NexusDataStore
 
-![Version](https://img.shields.io/badge/version-v7.0.4-4c8bf5)
+![Version](https://img.shields.io/badge/version-v7.0.6-4c8bf5)
 ![Language](https://img.shields.io/badge/language-Luau-00A2FF)
 ![Platform](https://img.shields.io/badge/platform-Roblox-111111)
 ![Runtime](https://img.shields.io/badge/runtime-server--only-orange)
 ![Record Format](https://img.shields.io/badge/record%20format-700-2ea44f)
 ![Compression](https://img.shields.io/badge/compression-v2.3.x%20%7C%20codec%20230-6f42c1)
 
-**NexusDataStore v7.0.4** is a typed, session-aware Roblox persistence layer built for reliable player data, compact storage, controlled mutations, migrations, snapshots, observability, and integrated OrderedDataStore synchronization.
+**NexusDataStore v7.0.6** is a typed, session-aware Roblox persistence layer built for reliable player data, compact storage, controlled mutations, migrations, snapshots, observability, and integrated OrderedDataStore synchronization.
 
 The current build is tied directly to a `PlayersData` ModuleScript:
 
@@ -34,11 +34,61 @@ profile.Data
 
 This means `profile.Data.Coins`, `profile.Data.Inventory`, and every other declared field can be understood by Luau instead of collapsing to `any`.
 
-> **Current release:** NexusDataStore `7.0.3`  
+> **Current release:** NexusDataStore `7.0.6`  
 > **Record format:** `700`  
 > **Compression series:** `2.3.x`  
 > **Compression codec:** `230`  
-> **Recommended Compression build:** `2.3.3`
+> **Recommended Compression build:** `2.3.4`
+
+---
+
+
+## v7.0.6 — adaptive player compression and compact session locks
+
+This update builds on the v7.0.5 stability changes. The DataStore record format remains **700**, and Compression stays at **v2.3.4 / codec 230**. OrderedDataStore data and serialization are unchanged.
+
+- **CompressionStrategy = "balanced" (default):** one binary-encoding pass, compared against raw JSON, buffer and Base64 representations.
+- **CompressionStrategy = "smallest":** test dictionary-enabled and dictionary-disabled packet encodings, then choose the smallest *serialized* byte count among raw tables, direct buffers and Base64. This doubles encoding attempts and costs more CPU on each write or lock heartbeat.
+- **CompressionMinBytes = 512 (default):** skip custom compression for tiny records. Set it to 0 to test every record for minimum serialized bytes.
+- **CompactSessionLocks = false (default):** optionally store each player lock as a four-element array [JobId, SessionId, HeartbeatAt, ExpiresAt] instead of repeating field names. The decoder restores the original named fields before applying existing ownership checks. The change is lossless.
+- **GetCompressionReport(profile):** the estimate now includes the active session lock, if one exists. This is an estimate for one modeled record, not a measured Roblox compressed-at-rest result.
+
+**Important deployment rule:** older versions of NexusDataStore cannot decode compact lock arrays. All servers that may read these keys must run v7.0.6+ BEFORE enabling CompactSessionLocks. Drain old servers first, enable the flag consistently, and do not roll back to old code until compact locks have been rewritten as legacy named locks. Keeping the flag false preserves old-reader compatibility.
+
+Roblox compresses DataStore values internally, so the smallest serialized representation may not be the smallest *at-rest* representation. Compare real loads, save latency, CPU and request budgets before enabling size-first encoding globally.
+
+~~~
+Compression = true
+CompressionStrategy = "smallest"
+CompressionMinBytes = 0
+CompressionTransport = "auto"
+CompactSessionLocks = false
+~~~
+
+---
+## v7.0.5 — persistence acknowledgements, shutdown coordination, and compression efficiency
+
+This release preserves **record format 700**, **codec 230 / `buffer-v230`**, the existing DataStore names/keys, the public save/load API, and all v2.3.x packets. New records remain readable using the same decoder. New **Compression v2.3.4** is recommended; the codec number has **not** changed.
+
+### Recovery and lifecycle fixes
+
+- When `UpdateAsync` reports a failure **after** writing remotely, load and save attempt a **single uncached `GetAsync`** to verify ownership or the unique `LastCommitId`. Only proven commits are treated as successful; an uncertain outcome remains a failure.
+- `CloseAsync` waits for already-started `OpenAsync` calls to finish before enumerating sessions, so a late-loading player cannot escape shutdown release. If opens cannot finish before the requested deadline, close returns `OPEN_IN_FLIGHT_TIMEOUT` and leaves the store recoverable.
+- Commit-lock acquisition checks that a session is still active **after** waiting for another commit, preventing an older waiter from saving a released session.
+- Loading and saving now avoid redundant full-table clones when existing snapshots can safely be reused.
+
+### Encoding changes
+
+- New `CompressionMinBytes` option defaults to **512** serialized JSON bytes. Smaller records bypass custom compression and are stored as the existing **raw v7 record**, avoiding unnecessary dictionary scans and binary/Base64 encoding. Set to `0` to preserve the previous always-try behavior. This does not affect decoding of existing compressed profiles.
+- Larger records still use the existing exact transport comparison and fall back to raw records whenever that uses fewer bytes, unless `AllowExpansion` is configured.
+- Dictionary-disabled packets now reserve a more reasonable initial buffer capacity; malformed eight-byte varints that exceed Luau safe integer precision are rejected before rounding.
+- Roblox already applies its own storage compression. The custom codec is preserved for compatibility and evaluated only when it provides a serialization benefit; smaller JSON does not necessarily mean proportionally less Roblox storage.
+
+### Regression coverage
+
+Studio scripts in `tests/` now cover dropped load/save acknowledgements, a yielding open racing with shutdown, short-record/raw and large-record codec roundtrips, varint overflow, existing codec fixtures, and close recovery. **These scripts must still be executed in Roblox Studio**: source review and GitHub commits do not verify live DataStore behavior. Test with a separate test universe and never use production keys.
+
+Roblox references: [DataStore best practices](https://create.roblox.com/docs/cloud-services/data-stores/best-practices), [DataStore limits](https://create.roblox.com/docs/cloud-services/data-stores/error-codes-and-limits), and [uncached verification](https://create.roblox.com/docs/cloud-services/data-stores/versioning-listing-and-caching).
 
 ---
 
@@ -974,9 +1024,258 @@ NexusDataStore applies every missing migration in order.
 
 ---
 
+
+# Practical API and persisted-type cookbook
+
+All examples below are **server-side Luau**. First create a PlayersData child ModuleScript of DataStore.lua. Put Compression.lua beside DataStore.lua. Ensure the Template declares every field used by your game; the library enforces template types by default.
+
+## One typed template for all supported persisted types
+
+~~~lua
+--!strict
+local PlayersData = {
+    Coins = 0,
+    Experience = 0.0,
+    Title = "",
+    Premium = false,
+    Inventory = {} :: {string},
+    Upgrades = {} :: {[string]: number},
+    Settings = {Music = true, Volume = 0.5},
+    Location = {X = 0, Y = 0, Z = 0},
+    Color = {R = 1, G = 1, B = 1},
+}
+export type Data = typeof(PlayersData)
+return PlayersData
+~~~
+
+| Type | Example | Supported directly? |
+|---|---|---|
+| Boolean | true / false | Yes |
+| Integer | 15000 | Yes, finite safe integers recommended |
+| Float | 12.5 | Yes, if finite |
+| UTF-8 string | "Legend" | Yes |
+| Dense array | {"Sword", "Potion"} | Yes |
+| String-key map | {Speed = 2, Luck = 4} | Yes |
+| Nested table | {Music = true, Volume = 0.5} | Yes |
+| Nil | absent table field | Yes as a missing optional field; reconciliation restores template defaults |
+| Vector3 | {X = 1, Y = 2, Z = 3} | Convert to numeric fields |
+| Color3 | {R = 1, G = 0, B = 0} | Convert to numeric fields |
+| CFrame | dense array of components | Convert to numeric components first |
+| DateTime | Unix timestamp | Convert to integer number |
+| EnumItem | enum name string | Convert to a string |
+| Instance | persistent ID/path string | Store an app-defined ID, not the Instance |
+| buffer | raw buffer | **Not supported** by this Nexus codec, even though Roblox's native DataStore serializer accepts buffers |
+| Function, thread, cyclic/sparse or mixed table | value | Rejected, do not persist |
+| NaN / infinity | non-finite number | Rejected |
+
+## One complete server lifecycle example
+
+Place a Script in ServerScriptService and adjust DataFolder to your actual location. Call the lifecycle attachment only once per Store. **Do not use the manual PlayerAdded/PlayerRemoving code and AutoPlayerLifecycle at the same time.**
+
+~~~lua
+--!strict
+local Players = game:GetService("Players")
+local DataFolder = game:GetService("ServerScriptService"):WaitForChild("Data")
+local NexusDataStore = require(DataFolder:WaitForChild("DataStore"))
+local PlayersData = require(DataFolder.DataStore:WaitForChild("PlayersData"))
+local Store = NexusDataStore.new({
+    Name = "PlayerData",
+    Template = PlayersData,
+    Compression = true,
+    CompressionStrategy = "balanced",
+    CompressionMinBytes = 512,
+    CompressionTransport = "auto",
+    CompactSessionLocks = false,
+    AutoSave = true,
+    AutoSaveInterval = 30,
+    BudgetAware = true,
+})
+Store:On("SessionLost", function(profile, reason)
+    warn("Session lost:", profile.Key, reason)
+    if profile.Player and profile.Player.Parent == Players then profile.Player:Kick("Your data session was lost.") end
+end)
+local function onJoin(player: Player)
+    local profile, err = Store:OpenPlayerAsync(player)
+    if not profile then
+        warn("Load failed:", player.UserId, err)
+        if player.Parent == Players then player:Kick("Could not load data; please rejoin.") end
+        return
+    end
+    if player.Parent ~= Players then
+        local released, releaseErr = profile:ReleaseAsync()
+        if not released then warn("Late release failed:", releaseErr) end
+        return
+    end
+    print("Loaded", player.Name, profile:Get("Coins"))
+end
+Players.PlayerAdded:Connect(function(player) task.spawn(onJoin, player) end)
+for _, player in ipairs(Players:GetPlayers()) do task.spawn(onJoin, player) end
+Players.PlayerRemoving:Connect(function(player)
+    local profile = Store:GetSession(player)
+    if profile then
+        local ok, err = profile:ReleaseAsync()
+        if not ok then warn("Release failed:", err) end
+    end
+end)
+Store:BindToClose()
+~~~
+
+## Reading and writing common values
+
+These snippets assume profile is an active loaded session with the example template above.
+
+~~~lua
+local ok, err = profile:Set("Coins", 1500)
+if not ok then warn("Set failed", err) end
+assert(profile:Set("Premium", true))
+assert(profile:Set("Experience", 12.5))
+assert(profile:Set("Title", "Legend"))
+assert(profile:Set("Inventory", {"Sword", "Potion"}))
+assert(profile:Set("Upgrades", {Speed = 3, Luck = 1}))
+assert(profile:Set({"Settings", "Music"}, false))
+assert(profile:Set({"Settings", "Volume"}, 0.75))
+
+local coins = profile:Get("Coins")
+local display = profile:GetOr("Title", "New Player")
+local exists = profile:Has({"Settings", "Music"})
+print(coins, display, exists)
+~~~
+
+## Money, upgrades, toggles, and arrays
+
+~~~lua
+local awarded, newCoins = profile:Award("Coins", 50)
+local purchased, afterPurchase = profile:Spend("Coins", 20)
+local advanced, experience = profile:Increment("Experience", 2.5)
+local bounded, volume = profile:IncrementClamped({"Settings", "Volume"}, 0.2, 0, 1)
+local switched, musicEnabled = profile:Toggle({"Settings", "Music"})
+local appended, inventoryLength = profile:Append("Inventory", "Sword")
+local removed, removedItem = profile:RemoveAt("Inventory", 1)
+local upgradeOK, nextUpgrade = profile:UpdatePath({"Upgrades", "Speed"}, function(value)
+    return (value or 0) + 1
+end)
+if not awarded or not purchased then warn(newCoins, afterPurchase) end
+~~~
+
+## Atomic in-memory purchase, patch, and delete
+
+Use Mutate for one validated local transaction; do not save between individual draft field changes.
+
+~~~lua
+local ok, result, status = profile:Mutate(function(draft)
+    if draft.Coins < 100 then return false end
+    draft.Coins -= 100
+    table.insert(draft.Inventory, "PremiumSword")
+    return true
+end)
+if not ok then warn("Mutation failed", result) elseif status == "CANCELLED" then print("Not enough coins") end
+
+local changed, errorMessage = profile:Patch({
+    {Path = "Coins", Value = 900},
+    {Path = {"Settings", "Music"}, Value = true},
+})
+if not changed then warn(errorMessage) end
+local deleted, deleteError = profile:Delete("Title")
+if not deleted then warn(deleteError) end
+~~~
+
+Mutate only atomically edits the **local active session**. It is not a multi-key transaction, and a canceled callback returns success with status CANCELLED. Deleting a field that is present in the Template may cause that default to be restored at the next load.
+
+## Converting unsupported Roblox datatypes
+
+~~~lua
+local pos = Vector3.new(12, 5, -9)
+assert(profile:Set("Location", {X = pos.X, Y = pos.Y, Z = pos.Z}))
+local savedPosition = profile:Get("Location")
+local restoredVector = Vector3.new(savedPosition.X, savedPosition.Y, savedPosition.Z)
+
+local color = Color3.fromRGB(20, 150, 255)
+assert(profile:Set("Color", {R = color.R, G = color.G, B = color.B}))
+local savedColor = profile:Get("Color")
+local restoredColor = Color3.new(savedColor.R, savedColor.G, savedColor.B)
+
+local unixTimestamp = DateTime.now().UnixTimestamp
+print(unixTimestamp, restoredVector, restoredColor)
+~~~
+
+## Watchers, snapshot rollback, and diffs
+
+~~~lua
+local changedSubscription = profile:Watch("Coins", function(newCoins, oldCoins)
+    print("Coins changed", oldCoins, newCoins)
+end)
+local checkpoint = profile:Snapshot("Before shop")
+assert(profile:Award("Coins", 200))
+local changedPaths = profile:DiffFromPersisted()
+print("Changed paths:", #changedPaths)
+local restored, restoreErr = profile:Restore(checkpoint)
+if not restored then warn(restoreErr) end
+changedSubscription:Disconnect()
+print(profile:IsActive(), profile:IsDirty(), profile:GetStatus(), profile:GetStats())
+~~~
+
+Snapshots are in-memory copies. They are not a separately saved historical DataStore version.
+
+## Save, release, peek, flush, and status
+
+~~~lua
+local profile = Store:GetSession(player)
+if profile then
+    local ok, err = profile:SaveAsync("critical")
+    if not ok then warn("Save failed", err) end
+end
+local loaded, waitError = Store:WaitForSession(player, 10)
+if not loaded then warn(waitError) end
+local peekData, peekMetaOrError = Store:PeekAsync(player.UserId)
+if peekData then print("Read-only coins", peekData.Coins) else warn(peekMetaOrError) end
+local flushed, flushErr = Store:FlushAsync(20)
+if not flushed then warn(flushErr) end
+print(Store:GetMetrics(), Store:GetHealth())
+~~~
+
+Normal-priority SaveAsync may return true with a DEFERRED status. Critical saves bypass the minimum-save interval but are still subject to backend failure. Never reset player progress on a loading or decoding failure.
+
+## Direct compression, reports, and compact session locks
+
+~~~lua
+local Compression = require(DataFolder:WaitForChild("Compression"))
+local packet, report = Compression.CompressTablePacket({
+    Coins = 100, Inventory = {"Potion", "Potion"}, Enabled = true
+}, {StringDictionary = true})
+local decoded = Compression.DecompressTable(packet)
+assert(decoded.Coins == 100)
+print(report.EncodedBytes, report.SavingsPercent)
+local storeReport, reportErr = Store:GetCompressionReport(profile)
+if storeReport then
+    print(storeReport.StorageBytes, storeReport.Transport, storeReport.CompactLock, storeReport.IncludesSessionLock)
+else
+    warn(reportErr)
+end
+~~~
+
+To find the smallest *serialized* representation on each write, use the following **alternative Store configuration**, not a second Store accessing the same keys:
+
+~~~lua
+Compression = true,
+CompressionStrategy = "smallest",
+CompressionMinBytes = 0,
+CompressionTransport = "auto",
+CompactSessionLocks = false,
+~~~
+
+### Session-lock compression rollout
+
+1. Update ALL game servers to v7.0.6 with CompactSessionLocks = false and confirm legacy records open and close correctly.
+2. Drain all older servers sharing the same standard player DataStore. Do not enable compact locks while any earlier reader is active.
+3. Enable CompactSessionLocks = true for all writers. The saved lock uses [JobId, SessionId, HeartbeatAt, ExpiresAt]; decoded profiles expose the same named lock fields and ownership checks as before.
+4. Monitor SessionLost, SaveFailed, PlayerLoadFailed and load latency. To downgrade, first rewrite compact locks using v7.0.6 with the option off, drain those sessions, and only then deploy older code.
+
+OrderedDataStore is deliberately unchanged and continues to store numeric values. See the existing **OrderedDataStore** documentation below for every ordered method.
+
+---
 # Compression
 
-NexusDataStore v7.0.3 is compatible with the **Compression v2.3.x** series using codec:
+NexusDataStore v7.0.6 is compatible with the **Compression v2.3.x** series using codec:
 
 ```text
 230
@@ -985,7 +1284,7 @@ NexusDataStore v7.0.3 is compatible with the **Compression v2.3.x** series using
 The recommended module build is:
 
 ```text
-Compression v2.3.3
+Compression v2.3.4
 ```
 
 The packet format has a fixed 11-byte header containing the codec identity, flags, and checksum metadata.
@@ -1004,7 +1303,7 @@ Compression.Version()
 
 ## Supported Compression Types
 
-Compression v2.3.3 directly supports these Luau value types:
+Compression v2.3.4 directly supports these Luau value types:
 
 | Luau value | Supported | Encoding behavior |
 |---|---:|---|
@@ -1018,7 +1317,7 @@ Compression v2.3.3 directly supports these Luau value types:
 | nested tables | Yes | recursive |
 | circular tables | No | rejected |
 | `NaN` / `math.huge` | No | rejected |
-| `buffer` | No | rejected by Compression v2.3.3 |
+| `buffer` | No | rejected by Compression v2.3.4 |
 | `Vector2` | No | rejected |
 | `Vector3` | No | rejected |
 | `CFrame` | No | rejected |
@@ -1034,7 +1333,7 @@ The DataStore persistence validator is intentionally narrower than the standalon
 - mixed/sparse tables are rejected;
 - circular references are rejected;
 - non-finite numbers are rejected;
-- Roblox datatypes such as `Vector3`, `CFrame`, and `buffer` are not persistent values in this v7.0.3 codec path.
+- Roblox datatypes such as `Vector3`, `CFrame`, and `buffer` are not persistent values in this v7.0.6 codec path.
 
 ---
 
@@ -2393,6 +2692,9 @@ end
 | `DetectDirectChanges` | `true` | Detect direct edits to `profile.Data` |
 | `Compression` | `true` | Enable persistence compression selection |
 | `CompressionModule` | auto | Explicit Compression ModuleScript override |
+| `CompressionMinBytes` | `512` | Minimum JSON bytes before custom compression |
+| `CompressionStrategy` | `"balanced"` | One pass, or `"smallest"` to evaluate two dictionaries |
+| `CompactSessionLocks` | `false` | Opt-in compact player lock storage after all servers update |
 | `CompressionOptions` | `{}` | Compression v2.3.x options |
 | `CompressionReports` | `false` | Emit `CompressionReport` events |
 | `CompressionTransport` | `"auto"` | `"auto"`, `"buffer"`, or `"base64"` |

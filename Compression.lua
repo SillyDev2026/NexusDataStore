@@ -342,6 +342,11 @@ function Reader:VarUInt(): number
 		end
 		local byte = buffer.readu8(source, position)
 		position += 1
+		-- The eighth base-128 digit may only use four payload bits for a
+		-- 53-bit safe integer; check before float arithmetic can round it.
+		if count == 8 and byte >= 16 then
+			error("VARUINT_UNSAFE_INTEGER")
+		end
 		value += (byte % 128) * multiplier
 		if byte < 128 then
 			if count > 1 and byte == 0 then
@@ -746,7 +751,7 @@ end
 
 -- Returns the codec version exposed to dependent modules.
 function Compression.Version(): string
-	return "2.3.3"
+	return "2.3.4"
 end
 
 -- Returns the stable table codec mode identifier.
@@ -754,12 +759,15 @@ function Compression.TableMode(_value: any, _options: Options?): string
 	return "buffer-v230"
 end
 
--- Encodes using the v2.3 packet format with the v2.3.3 hardened engine.
+-- Encodes using the unchanged v2.3 packet format with the v2.3.4 engine.
 function Compression.CompressTablePacket(value: any, options: Options?): (buffer, Report)
 	local normalized = normalizeOptions(options)
 	local dictionary, lookup, dictionaryBytes, scannedNodes = buildDictionary(value, normalized)
 
-	local estimatedCapacity = math.max(256, HEADER_BYTES + dictionaryBytes + scannedNodes * 6)
+	-- With the dictionary disabled there was no sizing scan: starting at 256
+	-- bytes repeatedly reallocated the buffer for ordinary profiles.
+	local initialCapacity = normalized.StringDictionary and 256 or 4096
+	local estimatedCapacity = math.max(initialCapacity, HEADER_BYTES + dictionaryBytes + scannedNodes * 6)
 	estimatedCapacity = math.min(estimatedCapacity, normalized.PreallocateLimit :: number)
 	local packetWriter = Writer.new(estimatedCapacity)
 	packetWriter.Position = HEADER_BYTES
