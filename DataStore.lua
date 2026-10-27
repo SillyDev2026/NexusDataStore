@@ -1795,6 +1795,9 @@ function NexusDataStore:GetSession(keyOrPlayer: string | number | Player): Sessi
 end
 
 function NexusDataStore:WaitForSession(keyOrPlayer: string | number | Player, timeout: number?): (Session<Data>?, string?)
+	if timeout ~= nil and (not finiteNumber(timeout) or timeout < 0) then
+		return nil, "INVALID_WAIT_TIMEOUT"
+	end
 	local deadline = now() + (timeout or self.Config.LoadTimeout)
 	repeat
 		local session = self:GetSession(keyOrPlayer)
@@ -3068,6 +3071,9 @@ function Session:Toggle(path: Path): (boolean, any)
 end
 
 function Session:Append(path: Path, value: any): (boolean, any)
+	if value == nil then
+		return false, "INVALID_APPEND_VALUE"
+	end
 	local current = getAt(self.Data, path)
 	if typeof(current) ~= "table" then
 		return false, "NOT_ARRAY"
@@ -3136,16 +3142,20 @@ function Session:UpdatePath(path: Path, callback): (boolean, any)
 		return false, mutableErr
 	end
 	local baseMutationId = self.MutationId
-	local current = clone(getAt(self.Data, path))
-	local ok, transformed = pcall(callback, current, self)
+	-- A yielding callback must not overwrite a direct edit of this path.
+	local original = clone(getAt(self.Data, path))
+	local ok, transformed = pcall(callback, clone(original), self)
 	if not ok then
 		return false, tostring(transformed)
 	end
 	if self.MutationId ~= baseMutationId then
 		return false, "CONCURRENT_MUTATION"
 	end
+	if self.Store.Config.DetectDirectChanges and not deepEqual(getAt(self.Data, path), original) then
+		return false, "CONCURRENT_DIRECT_MUTATION"
+	end
 	if transformed == nil then
-		return true, current, "CANCELLED"
+		return true, original, "CANCELLED"
 	end
 	local changed, err = self:Set(path, transformed)
 	if not changed then
@@ -3162,6 +3172,10 @@ function Session:Mutate(callback: (draft: Data, session: Session<Data>) -> any):
 		return false, mutableErr
 	end
 	local draft = clone(self.Data) :: Data
+	-- Preserve the callback-start state when direct edits can bypass MutationId.
+	-- Without this guard, a yielding Mutate callback could silently replace newer
+	-- direct changes with an outdated draft.
+	local baseline = self.Store.Config.DetectDirectChanges and clone(self.Data) or nil
 	local baseMutationId = self.MutationId
 	local ok, result = pcall(callback, draft, self :: Session<Data>)
 	if not ok then
@@ -3169,6 +3183,9 @@ function Session:Mutate(callback: (draft: Data, session: Session<Data>) -> any):
 	end
 	if self.MutationId ~= baseMutationId then
 		return false, "CONCURRENT_MUTATION"
+	end
+	if baseline ~= nil and not deepEqual(self.Data, baseline) then
+		return false, "CONCURRENT_DIRECT_MUTATION"
 	end
 	if result == false then
 		return true, nil, "CANCELLED"
@@ -3191,12 +3208,22 @@ function Session:Patch(changes: {{Path: Path, Value: any}}): (boolean, string?)
 	if typeof(changes) ~= "table" then
 		return false, "PATCH_TABLE_REQUIRED"
 	end
+	local isArray, count = inspectTable(changes)
+	if not isArray then
+		return false, "PATCH_MUST_BE_DENSE_ARRAY"
+	end
+	if count == 0 then
+		return true
+	end
 	local draft = clone(self.Data)
 	for _, patch in ipairs(changes) do
 		if typeof(patch) ~= "table" or patch.Path == nil then
 			return false, "INVALID_PATCH"
 		end
-		local ok, err = setAt(draft, patch.Path, clone(patch.Value))
+		local called, ok, err = pcall(setAt, draft, patch.Path, clone(patch.Value))
+		if not called then
+			return false, "INVALID_PATCH_PATH:" .. tostring(ok)
+		end
 		if not ok then
 			return false, err
 		end
