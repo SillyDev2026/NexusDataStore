@@ -86,6 +86,8 @@ export type StoreConfig<T> = {
 	CompressionOptions: CompressionOptions?,
 	CompressionReports: boolean?,
 	CompressionMinBytes: number?,
+	CompressionStrategy: ("balanced" | "smallest")?,
+	CompactSessionLocks: boolean?,
 	CompressionTransport: CompressionTransport?,
 	AutoSave: boolean?,
 	AutoSaveInterval: number?,
@@ -263,7 +265,7 @@ local EncodingService = game:GetService("EncodingService")
 
 local NexusDataStore: any = {}
 NexusDataStore.__index = NexusDataStore
-NexusDataStore.Version = "7.0.5"
+NexusDataStore.Version = "7.0.6"
 NexusDataStore.RecordFormat = 700
 NexusDataStore.RequiredCompressionVersion = "2.3.0"
 
@@ -1143,123 +1145,117 @@ end
 
 -- Encodes one v7 record without side effects so it is safe inside a retried UpdateAsync transform.
 function NexusDataStore:_EncodeRecord(record: any): (any?, string?, any?)
-	local rawBytes, rawMeasureErr = self:_MeasureStoredValue(record)
+	-- Lock compaction is a wire-only conversion: never mutate a decoded record
+	-- that the UpdateAsync transform or caller still owns.
+	local storageRecord = record
+	local hasCompactLock = self.Config.CompactSessionLocks and typeof(record.Lock) == "table"
+	if hasCompactLock then
+		local lock = record.Lock
+		if typeof(lock.JobId) ~= "string" or #lock.JobId == 0 or typeof(lock.SessionId) ~= "string" or #lock.SessionId == 0
+			or not finiteNumber(lock.HeartbeatAt) or lock.HeartbeatAt < 0 or not finiteNumber(lock.ExpiresAt) or lock.ExpiresAt < lock.HeartbeatAt then
+			return nil, "INVALID_RECORD_LOCK"
+		end
+		storageRecord = table.clone(record)
+		storageRecord.Lock = {lock.JobId, lock.SessionId, lock.HeartbeatAt, lock.ExpiresAt}
+	end
+	local rawBytes, rawMeasureErr = self:_MeasureStoredValue(storageRecord)
 	if rawBytes == nil then
 		return nil, rawMeasureErr
 	end
+	local rawReport = {StorageBytes = rawBytes, RawStorageEstimate = rawBytes, Transport = "raw-table", PersistedCompressed = false, CompactLock = hasCompactLock}
 	if not self.Config.Compression then
 		if rawBytes > self.Config.MaxStoredBytes then
 			return nil, ("STORED_BYTES_EXCEEDED:%d>%d"):format(rawBytes, self.Config.MaxStoredBytes)
 		end
-		return record, nil, {
-			StorageBytes = rawBytes,
-			Transport = "raw-table",
-			PersistedCompressed = false,
-		}
+		return storageRecord, nil, rawReport
 	end
-	-- For small records, skip the dictionary pass and binary encoding entirely.
-	-- Raw tables remain readable by every v7 decoder and Roblox compresses at rest.
 	if rawBytes < self.Config.CompressionMinBytes then
-		return record, nil, {StorageBytes = rawBytes, Transport = "raw-table", PersistedCompressed = false, SkippedCompression = true}
+		if rawBytes > self.Config.MaxStoredBytes then
+			return nil, ("STORED_BYTES_EXCEEDED:%d>%d"):format(rawBytes, self.Config.MaxStoredBytes)
+		end
+		rawReport.SkippedCompression = true
+		return storageRecord, nil, rawReport
 	end
 	if not self.CompressionEngine then
 		return nil, "COMPRESSION_ENGINE_UNAVAILABLE:" .. tostring(self.CompressionEngineError)
 	end
-
-	local ok, encoded, report = pcall(self.CompressionEngine.CompressTablePacket, record, self.Config.CompressionOptions)
-	if not ok then
-		return nil, "COMPRESSED_ENCODE_FAILED:" .. tostring(encoded)
-	end
-	if typeof(encoded) ~= "buffer" then
-		return nil, "COMPRESSED_ENCODE_INVALID_BUFFER"
-	end
-	if typeof(report) ~= "table" then
-		report = {
-			EngineVersion = self.CompressionEngineVersion,
-			EncodedBytes = buffer.len(encoded),
-		}
-	end
-
-	local codec = tonumber(self.CompressionEngine.CodecVersion) or 230
 	local transport = self.Config.CompressionTransport
-	local bestEnvelope = nil
-	local bestBytes = math.huge
-	local bestTransport = nil
-
-	-- A direct buffer lets Roblox's serializer choose its current buffer representation
-	-- (including its own compression when profitable). JSONEncode is the documented way
-	-- to measure the exact DataStore serialization size, so compare that actual size.
-	if transport == "auto" or transport == "buffer" then
-		local bufferEnvelope = {
-			Format = RECORD_FORMAT,
-			Codec = codec,
-			Compressed = true,
-			Encoding = "buffer",
-			Payload = encoded,
-		}
-		local bufferBytes, bufferMeasureErr = self:_MeasureStoredValue(bufferEnvelope)
-		if bufferBytes ~= nil then
-			bestEnvelope = bufferEnvelope
-			bestBytes = bufferBytes
-			bestTransport = "buffer"
-		elseif transport == "buffer" then
-			return nil, "BUFFER_TRANSPORT_SIZE_MEASURE_FAILED:" .. tostring(bufferMeasureErr)
-		end
+	local codec = tonumber(self.CompressionEngine.CodecVersion) or 230
+	local bestEnvelope, bestReport, bestBytes, bestTransport = nil, nil, math.huge, nil
+	local variants = {self.Config.CompressionOptions.StringDictionary ~= false}
+	if self.Config.CompressionStrategy == "smallest" then
+		variants[2] = not variants[1]
 	end
-
-	-- Keep Base64 as a compatibility/fallback transport and compare it in auto mode.
-	-- Its characters do not require JSON escaping, so cached envelope overhead + payload
-	-- length is exact and avoids another whole JSONEncode for this candidate.
-	if transport == "auto" or transport == "base64" then
-		local base64OK, base64Buffer = pcall(EncodingService.Base64Encode, EncodingService, encoded)
-		if not base64OK then
-			if transport == "base64" or bestEnvelope == nil then
-				return nil, "BASE64_ENCODE_FAILED:" .. tostring(base64Buffer)
-			end
-		else
-			local payload = buffer.tostring(base64Buffer)
-			local base64Envelope = {
-				Format = RECORD_FORMAT,
-				Codec = codec,
-				Compressed = true,
-				Encoding = "base64",
-				Payload = payload,
-			}
-			local base64Bytes = self.CompressedEnvelopeBaseBytes + #payload
-			if base64Bytes < bestBytes then
-				bestEnvelope = base64Envelope
-				bestBytes = base64Bytes
-				bestTransport = "base64"
+	for _, dictionaryEnabled in ipairs(variants) do
+		local options = self.Config.CompressionOptions
+		if self.Config.CompressionStrategy == "smallest" then
+			options = table.clone(options)
+			options.StringDictionary = dictionaryEnabled
+		end
+		local ok, encoded, report = pcall(self.CompressionEngine.CompressTablePacket, storageRecord, options)
+		if not ok then
+			return nil, "COMPRESSED_ENCODE_FAILED:" .. tostring(encoded)
+		end
+		if typeof(encoded) ~= "buffer" then
+			return nil, "COMPRESSED_ENCODE_INVALID_BUFFER"
+		end
+		if typeof(report) ~= "table" then
+			report = {EngineVersion = self.CompressionEngineVersion, EncodedBytes = buffer.len(encoded)}
+		end
+		local candidate, candidateBytes, candidateTransport = nil, math.huge, nil
+		if transport == "auto" or transport == "buffer" then
+			local envelope = {Format = RECORD_FORMAT, Codec = codec, Compressed = true, Encoding = "buffer", Payload = encoded}
+			local bytes, sizeError = self:_MeasureStoredValue(envelope)
+			if bytes ~= nil then
+				candidate, candidateBytes, candidateTransport = envelope, bytes, "buffer"
+			elseif transport == "buffer" then
+				return nil, "BUFFER_TRANSPORT_SIZE_MEASURE_FAILED:" .. tostring(sizeError)
 			end
 		end
+		if transport == "auto" or transport == "base64" then
+			local success, base64Buffer = pcall(EncodingService.Base64Encode, EncodingService, encoded)
+			if not success then
+				if transport == "base64" or candidate == nil then
+					return nil, "BASE64_ENCODE_FAILED:" .. tostring(base64Buffer)
+				end
+			else
+				local payload = buffer.tostring(base64Buffer)
+				local size = self.CompressedEnvelopeBaseBytes + #payload
+				if size < candidateBytes then
+					candidate = {Format = RECORD_FORMAT, Codec = codec, Compressed = true, Encoding = "base64", Payload = payload}
+					candidateBytes, candidateTransport = size, "base64"
+				end
+			end
+		end
+		if candidate ~= nil and candidateBytes < bestBytes then
+			bestEnvelope, bestBytes, bestTransport, bestReport = candidate, candidateBytes, candidateTransport, report
+			bestReport.DictionaryEnabled = dictionaryEnabled
+		end
 	end
-
 	if bestEnvelope == nil then
 		return nil, "NO_COMPRESSION_TRANSPORT_AVAILABLE"
 	end
-
-	report.RawStorageEstimate = rawBytes
-	local allowExpansion = self.Config.CompressionOptions.AllowExpansion == true
-	if not allowExpansion and rawBytes <= self.Config.MaxStoredBytes and bestBytes >= rawBytes then
-		report.StorageBytes = rawBytes
-		report.Transport = "raw-table"
-		report.PersistedCompressed = false
-		return record, nil, report
+	bestReport.RawStorageEstimate = rawBytes
+	bestReport.CompactLock = hasCompactLock
+	bestReport.AlternativeCodecCandidates = #variants
+	-- The size-first strategy always selects the smallest JSON representation.
+	-- Balanced maintains the legacy AllowExpansion behaviour.
+	local forceEncode = self.Config.CompressionStrategy == "balanced" and self.Config.CompressionOptions.AllowExpansion == true
+	if rawBytes <= self.Config.MaxStoredBytes and not forceEncode and bestBytes >= rawBytes then
+		rawReport.DictionaryEnabled = bestReport.DictionaryEnabled
+		rawReport.AlternativeCodecCandidates = #variants
+		return storageRecord, nil, rawReport
 	end
 	if bestBytes > self.Config.MaxStoredBytes then
 		if rawBytes <= self.Config.MaxStoredBytes then
-			report.StorageBytes = rawBytes
-			report.Transport = "raw-table"
-			report.PersistedCompressed = false
-			return record, nil, report
+			return storageRecord, nil, rawReport
 		end
-		return nil, ("STORED_BYTES_EXCEEDED:%d>%d"):format(bestBytes, self.Config.MaxStoredBytes)
+		return nil, ("STORED_BYTES_EXCEEDED:%d>%d"):format(math.min(rawBytes, bestBytes), self.Config.MaxStoredBytes)
 	end
-
-	report.StorageBytes = bestBytes
-	report.Transport = bestTransport
-	report.PersistedCompressed = true
-	return bestEnvelope, nil, report
+	bestReport.StorageBytes = bestBytes
+	bestReport.Transport = bestTransport
+	bestReport.PersistedCompressed = true
+	return bestEnvelope, nil, bestReport
 end
 
 -- Decodes one v7 record and rejects malformed envelopes before they reach session acquisition.
@@ -1325,6 +1321,25 @@ function NexusDataStore:_DecodeRecord(raw: any): (any?, string?)
 	end
 	if record.Lock ~= nil then
 		local lock = record.Lock
+		-- Both historical named locks and opt-in compact tuples decode to
+		-- exactly the same in-memory lock fields for the session state machine.
+		if typeof(lock) == "table" and lock.JobId == nil and lock.SessionId == nil then
+			local compact = true
+			local count = 0
+			for key in pairs(lock) do
+				count += 1
+				if typeof(key) ~= "number" or key % 1 ~= 0 or key < 1 or key > 4 then
+					compact = false
+					break
+				end
+			end
+			if not compact or count ~= 4 then
+				return nil, "INVALID_COMPACT_RECORD_LOCK"
+			end
+			lock = {JobId = lock[1], SessionId = lock[2], HeartbeatAt = lock[3], ExpiresAt = lock[4]}
+			record = table.clone(record)
+			record.Lock = lock
+		end
 		if typeof(lock) ~= "table"
 			or typeof(lock.JobId) ~= "string"
 			or #lock.JobId == 0
@@ -2403,10 +2418,16 @@ function NexusDataStore:GetCompressionReport(dataOrSession: any): (any?, string?
 	-- Reuse the exact persistence selection path so reports cannot drift away from
 	-- what SaveAsync will actually write.
 	local record = self:_BuildNewRecord(clone(data))
+	local sessionReport = typeof(dataOrSession) == "table" and dataOrSession.Store == self and typeof(dataOrSession.IsActive) == "function" and dataOrSession:IsActive()
+	if sessionReport then
+		record.Revision = dataOrSession.Revision
+		self:_LockRecord(record, dataOrSession.SessionId)
+	end
 	local encoded, encodeErr, report = self:_EncodeRecord(record)
 	if encoded == nil then
 		return nil, encodeErr
 	end
+	report.IncludesSessionLock = sessionReport
 	return report
 end
 
@@ -3303,6 +3324,8 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 	end
 	assert(config.CompressionOptions == nil or typeof(config.CompressionOptions) == "table", "CompressionOptions must be a table")
 	assert(config.CompressionTransport == nil or config.CompressionTransport == "auto" or config.CompressionTransport == "buffer" or config.CompressionTransport == "base64", "CompressionTransport must be auto, buffer, or base64")
+	assert(config.CompressionStrategy == nil or config.CompressionStrategy == "balanced" or config.CompressionStrategy == "smallest", "CompressionStrategy must be balanced or smallest")
+	assert(config.CompactSessionLocks == nil or typeof(config.CompactSessionLocks) == "boolean", "CompactSessionLocks must be a boolean")
 	assert(config.OrderedDataStores == nil or typeof(config.OrderedDataStores) == "table", "OrderedDataStores must be a table")
 	assert(config.PlayerKey == nil or typeof(config.PlayerKey) == "function", "PlayerKey must be a function")
 	assert(config.KeyPrefix == nil or typeof(config.KeyPrefix) == "string", "KeyPrefix must be a string")
@@ -3336,6 +3359,8 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 		CompressionOptions = clone(config.CompressionOptions or {}),
 		CompressionReports = config.CompressionReports == true,
 		CompressionMinBytes = configNumber(config.CompressionMinBytes, 512, 0, "CompressionMinBytes", true),
+		CompressionStrategy = config.CompressionStrategy or "balanced",
+		CompactSessionLocks = config.CompactSessionLocks == true,
 		CompressionTransport = config.CompressionTransport or "auto",
 		AutoSave = config.AutoSave ~= false,
 		AutoSaveInterval = configNumber(config.AutoSaveInterval, 30, 10, "AutoSaveInterval"),
