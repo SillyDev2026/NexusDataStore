@@ -85,6 +85,7 @@ export type StoreConfig<T> = {
 	CompressionModule: ModuleScript?,
 	CompressionOptions: CompressionOptions?,
 	CompressionReports: boolean?,
+	CompressionMinBytes: number?,
 	CompressionTransport: CompressionTransport?,
 	AutoSave: boolean?,
 	AutoSaveInterval: number?,
@@ -262,7 +263,7 @@ local EncodingService = game:GetService("EncodingService")
 
 local NexusDataStore: any = {}
 NexusDataStore.__index = NexusDataStore
-NexusDataStore.Version = "7.0.4"
+NexusDataStore.Version = "7.0.5"
 NexusDataStore.RecordFormat = 700
 NexusDataStore.RequiredCompressionVersion = "2.3.0"
 
@@ -1156,6 +1157,11 @@ function NexusDataStore:_EncodeRecord(record: any): (any?, string?, any?)
 			PersistedCompressed = false,
 		}
 	end
+	-- For small records, skip the dictionary pass and binary encoding entirely.
+	-- Raw tables remain readable by every v7 decoder and Roblox compresses at rest.
+	if rawBytes < self.Config.CompressionMinBytes then
+		return record, nil, {StorageBytes = rawBytes, Transport = "raw-table", PersistedCompressed = false, SkippedCompression = true}
+	end
 	if not self.CompressionEngine then
 		return nil, "COMPRESSION_ENGINE_UNAVAILABLE:" .. tostring(self.CompressionEngineError)
 	end
@@ -1332,6 +1338,18 @@ function NexusDataStore:_DecodeRecord(raw: any): (any?, string?)
 		end
 	end
 	return record
+end
+
+-- A failed UpdateAsync can still have committed remotely. Bypass the four-second
+-- GetAsync cache when verifying an ambiguous acknowledgement before retrying.
+function NexusDataStore:_ReadUncachedRecord(key: string): (any?, string?)
+	local options = Instance.new("DataStoreGetOptions")
+	options.UseCache = false
+	local ok, raw = pcall(self.DataStore.GetAsync, self.DataStore, key, options)
+	if not ok then
+		return nil, tostring(raw)
+	end
+	return self:_DecodeRecord(raw)
 end
 
 function NexusDataStore:Validate(data: Data): (boolean, string?)
@@ -1553,7 +1571,13 @@ function NexusDataStore:OpenAsync(key: string | number, context: OpenContext?): 
 	end
 	local openStartedAt = now()
 	local openDeadline = openStartedAt + self.Config.LoadTimeout
-	return self:_WithLocalMutex(self.OpenLocks, normalizedKey, self.Config.LoadTimeout, function()
+	-- Count every in-progress open before its first yield, so CloseAsync cannot
+	-- finish before an acquiring profile is registered and released.
+	self.OpenInFlight += 1
+	local openedSession, openError = self:_WithLocalMutex(self.OpenLocks, normalizedKey, self.Config.LoadTimeout, function()
+		if self.Closing or self.Closed then
+			return nil, "STORE_CLOSING"
+		end
 		local existing = self.Sessions[normalizedKey]
 		if existing and existing:IsActive() then
 			return existing
@@ -1621,8 +1645,17 @@ function NexusDataStore:OpenAsync(key: string | number, context: OpenContext?): 
 		end, REQUEST_STANDARD_UPDATE, openDeadline, "LOAD_TIMEOUT")
 
 		if not success then
-			self.Metrics.LoadsFailed += 1
-			return nil, tostring(result)
+			-- The lock acquisition may have committed even if its acknowledgement was lost.
+			local confirmed = self:_ReadUncachedRecord(normalizedKey)
+			if confirmed and self:_OwnsRecord(confirmed, {SessionId = sessionId}) then
+				success = true
+				recordForSession = confirmed
+				acquireError = nil
+				encodeReport = nil
+			else
+				self.Metrics.LoadsFailed += 1
+				return nil, tostring(result)
+			end
 		end
 		if acquireError then
 			self.Metrics.LoadsFailed += 1
@@ -1649,6 +1682,8 @@ function NexusDataStore:OpenAsync(key: string | number, context: OpenContext?): 
 		self:_Publish("Opened", {Key = normalizedKey, Revision = session.Revision})
 		return session
 	end)
+	self.OpenInFlight -= 1
+	return openedSession, openError
 end
 
 -- Opens a player record while protecting custom PlayerKey handlers from propagating callback errors.
@@ -1759,6 +1794,9 @@ function NexusDataStore:_AcquireCommitLock(session: any, absoluteDeadline: numbe
 			return false, "COMMIT_LOCK_TIMEOUT"
 		end
 		task.wait(0.02)
+	end
+	if not session:IsActive() then
+		return false, "SESSION_INACTIVE"
 	end
 	session.CommitBusy = true
 	return true
@@ -1885,8 +1923,18 @@ function NexusDataStore:_Commit(session: any, release: boolean, reason: string):
 		end, REQUEST_STANDARD_UPDATE, commitDeadline, "SAVE_TIMEOUT")
 
 		if not success then
-			self.Metrics.SaveFailed += 1
-			return false, tostring(result)
+			-- An UpdateAsync error is not proof that the backend rejected the write.
+			-- Verify the unique commit id against an uncached read before failing.
+			local confirmed = self:_ReadUncachedRecord(session.Key)
+			if confirmed and confirmed.LastCommitId == commitId
+				and ((release and confirmed.Lock == nil) or (not release and self:_OwnsRecord(confirmed, session))) then
+				success = true
+				nextRevision = confirmed.Revision
+				encodeReport = nil
+			else
+				self.Metrics.SaveFailed += 1
+				return false, tostring(result)
+			end
 		end
 		if saveError then
 			self.Metrics.SaveFailed += 1
@@ -2195,6 +2243,14 @@ function NexusDataStore:CloseAsync(timeout: number?): (boolean, string?)
     end
 	self.Closing = true
 	local deadline = now() + (timeout or self.Config.SaveTimeout)
+	while self.OpenInFlight > 0 and now() < deadline do
+		task.wait(0.02)
+	end
+	if self.OpenInFlight > 0 then
+		self.Closing = false
+		self:_Fire("CloseFailed", "OPEN_IN_FLIGHT_TIMEOUT")
+		return false, "OPEN_IN_FLIGHT_TIMEOUT"
+	end
 	local sessions = {}
 	for _, session in pairs(self.Sessions) do
 		table.insert(sessions, session)
@@ -3272,6 +3328,7 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 		CompressionModule = config.CompressionModule,
 		CompressionOptions = clone(config.CompressionOptions or {}),
 		CompressionReports = config.CompressionReports == true,
+		CompressionMinBytes = configNumber(config.CompressionMinBytes, 512, 0, "CompressionMinBytes", true),
 		CompressionTransport = config.CompressionTransport or "auto",
 		AutoSave = config.AutoSave ~= false,
 		AutoSaveInterval = configNumber(config.AutoSaveInterval, 30, 10, "AutoSaveInterval"),
@@ -3317,6 +3374,7 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 	self.SessionById = {}
 	self.SessionByPlayer = {}
 	self.OpenLocks = {}
+	self.OpenInFlight = 0
 	self.Events = {}
 	self.OrderedStores = {}
 	self.Closed = false
