@@ -2418,10 +2418,16 @@ function NexusDataStore:GetCompressionReport(dataOrSession: any): (any?, string?
 	-- Reuse the exact persistence selection path so reports cannot drift away from
 	-- what SaveAsync will actually write.
 	local record = self:_BuildNewRecord(clone(data))
+	local sessionReport = typeof(dataOrSession) == "table" and dataOrSession.Store == self and dataOrSession:IsActive()
+	if sessionReport then
+		record.Revision = dataOrSession.Revision
+		self:_LockRecord(record, dataOrSession.SessionId)
+	end
 	local encoded, encodeErr, report = self:_EncodeRecord(record)
 	if encoded == nil then
 		return nil, encodeErr
 	end
+	report.IncludesSessionLock = sessionReport
 	return report
 end
 
