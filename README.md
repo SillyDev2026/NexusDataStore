@@ -1,13 +1,13 @@
 # NexusDataStore
 
-![Version](https://img.shields.io/badge/version-v7.0.4-4c8bf5)
+![Version](https://img.shields.io/badge/version-v7.0.5-4c8bf5)
 ![Language](https://img.shields.io/badge/language-Luau-00A2FF)
 ![Platform](https://img.shields.io/badge/platform-Roblox-111111)
 ![Runtime](https://img.shields.io/badge/runtime-server--only-orange)
 ![Record Format](https://img.shields.io/badge/record%20format-700-2ea44f)
 ![Compression](https://img.shields.io/badge/compression-v2.3.x%20%7C%20codec%20230-6f42c1)
 
-**NexusDataStore v7.0.4** is a typed, session-aware Roblox persistence layer built for reliable player data, compact storage, controlled mutations, migrations, snapshots, observability, and integrated OrderedDataStore synchronization.
+**NexusDataStore v7.0.5** is a typed, session-aware Roblox persistence layer built for reliable player data, compact storage, controlled mutations, migrations, snapshots, observability, and integrated OrderedDataStore synchronization.
 
 The current build is tied directly to a `PlayersData` ModuleScript:
 
@@ -34,11 +34,37 @@ profile.Data
 
 This means `profile.Data.Coins`, `profile.Data.Inventory`, and every other declared field can be understood by Luau instead of collapsing to `any`.
 
-> **Current release:** NexusDataStore `7.0.3`  
+> **Current release:** NexusDataStore `7.0.5`  
 > **Record format:** `700`  
 > **Compression series:** `2.3.x`  
 > **Compression codec:** `230`  
-> **Recommended Compression build:** `2.3.3`
+> **Recommended Compression build:** `2.3.4`
+
+---
+
+## v7.0.5 — persistence acknowledgements, shutdown coordination, and compression efficiency
+
+This release preserves **record format 700**, **codec 230 / `buffer-v230`**, the existing DataStore names/keys, the public save/load API, and all v2.3.x packets. New records remain readable using the same decoder. New **Compression v2.3.4** is recommended; the codec number has **not** changed.
+
+### Recovery and lifecycle fixes
+
+- When `UpdateAsync` reports a failure **after** writing remotely, load and save attempt a **single uncached `GetAsync`** to verify ownership or the unique `LastCommitId`. Only proven commits are treated as successful; an uncertain outcome remains a failure.
+- `CloseAsync` waits for already-started `OpenAsync` calls to finish before enumerating sessions, so a late-loading player cannot escape shutdown release. If opens cannot finish before the requested deadline, close returns `OPEN_IN_FLIGHT_TIMEOUT` and leaves the store recoverable.
+- Commit-lock acquisition checks that a session is still active **after** waiting for another commit, preventing an older waiter from saving a released session.
+- Loading and saving now avoid redundant full-table clones when existing snapshots can safely be reused.
+
+### Encoding changes
+
+- New `CompressionMinBytes` option defaults to **512** serialized JSON bytes. Smaller records bypass custom compression and are stored as the existing **raw v7 record**, avoiding unnecessary dictionary scans and binary/Base64 encoding. Set to `0` to preserve the previous always-try behavior. This does not affect decoding of existing compressed profiles.
+- Larger records still use the existing exact transport comparison and fall back to raw records whenever that uses fewer bytes, unless `AllowExpansion` is configured.
+- Dictionary-disabled packets now reserve a more reasonable initial buffer capacity; malformed eight-byte varints that exceed Luau safe integer precision are rejected before rounding.
+- Roblox already applies its own storage compression. The custom codec is preserved for compatibility and evaluated only when it provides a serialization benefit; smaller JSON does not necessarily mean proportionally less Roblox storage.
+
+### Regression coverage
+
+Studio scripts in `tests/` now cover dropped load/save acknowledgements, a yielding open racing with shutdown, short-record/raw and large-record codec roundtrips, varint overflow, existing codec fixtures, and close recovery. **These scripts must still be executed in Roblox Studio**: source review and GitHub commits do not verify live DataStore behavior. Test with a separate test universe and never use production keys.
+
+Roblox references: [DataStore best practices](https://create.roblox.com/docs/cloud-services/data-stores/best-practices), [DataStore limits](https://create.roblox.com/docs/cloud-services/data-stores/error-codes-and-limits), and [uncached verification](https://create.roblox.com/docs/cloud-services/data-stores/versioning-listing-and-caching).
 
 ---
 
