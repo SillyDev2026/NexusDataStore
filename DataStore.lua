@@ -1151,6 +1151,10 @@ function NexusDataStore:_EncodeRecord(record: any): (any?, string?, any?)
 	local hasCompactLock = self.Config.CompactSessionLocks and typeof(record.Lock) == "table"
 	if hasCompactLock then
 		local lock = record.Lock
+		if typeof(lock.JobId) ~= "string" or #lock.JobId == 0 or typeof(lock.SessionId) ~= "string" or #lock.SessionId == 0
+			or not finiteNumber(lock.HeartbeatAt) or lock.HeartbeatAt < 0 or not finiteNumber(lock.ExpiresAt) or lock.ExpiresAt < lock.HeartbeatAt then
+			return nil, "INVALID_RECORD_LOCK"
+		end
 		storageRecord = table.clone(record)
 		storageRecord.Lock = {lock.JobId, lock.SessionId, lock.HeartbeatAt, lock.ExpiresAt}
 	end
