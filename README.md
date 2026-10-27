@@ -1024,6 +1024,255 @@ NexusDataStore applies every missing migration in order.
 
 ---
 
+
+# Practical API and persisted-type cookbook
+
+All examples below are **server-side Luau**. First create a PlayersData child ModuleScript of DataStore.lua. Put Compression.lua beside DataStore.lua. Ensure the Template declares every field used by your game; the library enforces template types by default.
+
+## One typed template for all supported persisted types
+
+~~~lua
+--!strict
+local PlayersData = {
+    Coins = 0,
+    Experience = 0.0,
+    Title = "",
+    Premium = false,
+    Inventory = {} :: {string},
+    Upgrades = {} :: {[string]: number},
+    Settings = {Music = true, Volume = 0.5},
+    Location = {X = 0, Y = 0, Z = 0},
+    Color = {R = 1, G = 1, B = 1},
+}
+export type Data = typeof(PlayersData)
+return PlayersData
+~~~
+
+| Type | Example | Supported directly? |
+|---|---|---|
+| Boolean | true / false | Yes |
+| Integer | 15000 | Yes, finite safe integers recommended |
+| Float | 12.5 | Yes, if finite |
+| UTF-8 string | "Legend" | Yes |
+| Dense array | {"Sword", "Potion"} | Yes |
+| String-key map | {Speed = 2, Luck = 4} | Yes |
+| Nested table | {Music = true, Volume = 0.5} | Yes |
+| Nil | absent table field | Yes as a missing optional field; reconciliation restores template defaults |
+| Vector3 | {X = 1, Y = 2, Z = 3} | Convert to numeric fields |
+| Color3 | {R = 1, G = 0, B = 0} | Convert to numeric fields |
+| CFrame | dense array of components | Convert to numeric components first |
+| DateTime | Unix timestamp | Convert to integer number |
+| EnumItem | enum name string | Convert to a string |
+| Instance | persistent ID/path string | Store an app-defined ID, not the Instance |
+| buffer | raw buffer | **Not supported** by this Nexus codec, even though Roblox's native DataStore serializer accepts buffers |
+| Function, thread, cyclic/sparse or mixed table | value | Rejected, do not persist |
+| NaN / infinity | non-finite number | Rejected |
+
+## One complete server lifecycle example
+
+Place a Script in ServerScriptService and adjust DataFolder to your actual location. Call the lifecycle attachment only once per Store. **Do not use the manual PlayerAdded/PlayerRemoving code and AutoPlayerLifecycle at the same time.**
+
+~~~lua
+--!strict
+local Players = game:GetService("Players")
+local DataFolder = game:GetService("ServerScriptService"):WaitForChild("Data")
+local NexusDataStore = require(DataFolder:WaitForChild("DataStore"))
+local PlayersData = require(DataFolder.DataStore:WaitForChild("PlayersData"))
+local Store = NexusDataStore.new({
+    Name = "PlayerData",
+    Template = PlayersData,
+    Compression = true,
+    CompressionStrategy = "balanced",
+    CompressionMinBytes = 512,
+    CompressionTransport = "auto",
+    CompactSessionLocks = false,
+    AutoSave = true,
+    AutoSaveInterval = 30,
+    BudgetAware = true,
+})
+Store:On("SessionLost", function(profile, reason)
+    warn("Session lost:", profile.Key, reason)
+    if profile.Player and profile.Player.Parent == Players then profile.Player:Kick("Your data session was lost.") end
+end)
+local function onJoin(player: Player)
+    local profile, err = Store:OpenPlayerAsync(player)
+    if not profile then
+        warn("Load failed:", player.UserId, err)
+        if player.Parent == Players then player:Kick("Could not load data; please rejoin.") end
+        return
+    end
+    if player.Parent ~= Players then
+        local released, releaseErr = profile:ReleaseAsync()
+        if not released then warn("Late release failed:", releaseErr) end
+        return
+    end
+    print("Loaded", player.Name, profile:Get("Coins"))
+end
+Players.PlayerAdded:Connect(function(player) task.spawn(onJoin, player) end)
+for _, player in ipairs(Players:GetPlayers()) do task.spawn(onJoin, player) end
+Players.PlayerRemoving:Connect(function(player)
+    local profile = Store:GetSession(player)
+    if profile then
+        local ok, err = profile:ReleaseAsync()
+        if not ok then warn("Release failed:", err) end
+    end
+end)
+Store:BindToClose()
+~~~
+
+## Reading and writing common values
+
+These snippets assume profile is an active loaded session with the example template above.
+
+~~~lua
+local ok, err = profile:Set("Coins", 1500)
+if not ok then warn("Set failed", err) end
+assert(profile:Set("Premium", true))
+assert(profile:Set("Experience", 12.5))
+assert(profile:Set("Title", "Legend"))
+assert(profile:Set("Inventory", {"Sword", "Potion"}))
+assert(profile:Set("Upgrades", {Speed = 3, Luck = 1}))
+assert(profile:Set({"Settings", "Music"}, false))
+assert(profile:Set({"Settings", "Volume"}, 0.75))
+
+local coins = profile:Get("Coins")
+local display = profile:GetOr("Title", "New Player")
+local exists = profile:Has({"Settings", "Music"})
+print(coins, display, exists)
+~~~
+
+## Money, upgrades, toggles, and arrays
+
+~~~lua
+local awarded, newCoins = profile:Award("Coins", 50)
+local purchased, afterPurchase = profile:Spend("Coins", 20)
+local advanced, experience = profile:Increment("Experience", 2.5)
+local bounded, volume = profile:IncrementClamped({"Settings", "Volume"}, 0.2, 0, 1)
+local switched, musicEnabled = profile:Toggle({"Settings", "Music"})
+local appended, inventoryLength = profile:Append("Inventory", "Sword")
+local removed, removedItem = profile:RemoveAt("Inventory", 1)
+local upgradeOK, nextUpgrade = profile:UpdatePath({"Upgrades", "Speed"}, function(value)
+    return (value or 0) + 1
+end)
+if not awarded or not purchased then warn(newCoins, afterPurchase) end
+~~~
+
+## Atomic in-memory purchase, patch, and delete
+
+Use Mutate for one validated local transaction; do not save between individual draft field changes.
+
+~~~lua
+local ok, result, status = profile:Mutate(function(draft)
+    if draft.Coins < 100 then return false end
+    draft.Coins -= 100
+    table.insert(draft.Inventory, "PremiumSword")
+    return true
+end)
+if not ok then warn("Mutation failed", result) elseif status == "CANCELLED" then print("Not enough coins") end
+
+local changed, errorMessage = profile:Patch({
+    {Path = "Coins", Value = 900},
+    {Path = {"Settings", "Music"}, Value = true},
+})
+if not changed then warn(errorMessage) end
+local deleted, deleteError = profile:Delete("Title")
+if not deleted then warn(deleteError) end
+~~~
+
+Mutate only atomically edits the **local active session**. It is not a multi-key transaction, and a canceled callback returns success with status CANCELLED. Deleting a field that is present in the Template may cause that default to be restored at the next load.
+
+## Converting unsupported Roblox datatypes
+
+~~~lua
+local pos = Vector3.new(12, 5, -9)
+assert(profile:Set("Location", {X = pos.X, Y = pos.Y, Z = pos.Z}))
+local savedPosition = profile:Get("Location")
+local restoredVector = Vector3.new(savedPosition.X, savedPosition.Y, savedPosition.Z)
+
+local color = Color3.fromRGB(20, 150, 255)
+assert(profile:Set("Color", {R = color.R, G = color.G, B = color.B}))
+local savedColor = profile:Get("Color")
+local restoredColor = Color3.new(savedColor.R, savedColor.G, savedColor.B)
+
+local unixTimestamp = DateTime.now().UnixTimestamp
+print(unixTimestamp, restoredVector, restoredColor)
+~~~
+
+## Watchers, snapshot rollback, and diffs
+
+~~~lua
+local changedSubscription = profile:Watch("Coins", function(newCoins, oldCoins)
+    print("Coins changed", oldCoins, newCoins)
+end)
+local checkpoint = profile:Snapshot("Before shop")
+assert(profile:Award("Coins", 200))
+local changedPaths = profile:DiffFromPersisted()
+print("Changed paths:", #changedPaths)
+local restored, restoreErr = profile:Restore(checkpoint)
+if not restored then warn(restoreErr) end
+changedSubscription:Disconnect()
+print(profile:IsActive(), profile:IsDirty(), profile:GetStatus(), profile:GetStats())
+~~~
+
+Snapshots are in-memory copies. They are not a separately saved historical DataStore version.
+
+## Save, release, peek, flush, and status
+
+~~~lua
+local profile = Store:GetSession(player)
+if profile then
+    local ok, err = profile:SaveAsync("critical")
+    if not ok then warn("Save failed", err) end
+end
+local loaded, waitError = Store:WaitForSession(player, 10)
+if not loaded then warn(waitError) end
+local peekData, peekMetaOrError = Store:PeekAsync(player.UserId)
+if peekData then print("Read-only coins", peekData.Coins) else warn(peekMetaOrError) end
+local flushed, flushErr = Store:FlushAsync(20)
+if not flushed then warn(flushErr) end
+print(Store:GetMetrics(), Store:GetHealth())
+~~~
+
+Normal-priority SaveAsync may return true with a DEFERRED status. Critical saves bypass the minimum-save interval but are still subject to backend failure. Never reset player progress on a loading or decoding failure.
+
+## Direct compression, reports, and compact session locks
+
+~~~lua
+local Compression = require(DataFolder:WaitForChild("Compression"))
+local packet, report = Compression.CompressTablePacket({
+    Coins = 100, Inventory = {"Potion", "Potion"}, Enabled = true
+}, {StringDictionary = true})
+local decoded = Compression.DecompressTable(packet)
+assert(decoded.Coins == 100)
+print(report.EncodedBytes, report.SavingsPercent)
+local storeReport, reportErr = Store:GetCompressionReport(profile)
+if storeReport then
+    print(storeReport.StorageBytes, storeReport.Transport, storeReport.CompactLock, storeReport.IncludesSessionLock)
+else
+    warn(reportErr)
+end
+~~~
+
+To find the smallest *serialized* representation on each write, use the following **alternative Store configuration**, not a second Store accessing the same keys:
+
+~~~lua
+Compression = true,
+CompressionStrategy = "smallest",
+CompressionMinBytes = 0,
+CompressionTransport = "auto",
+CompactSessionLocks = false,
+~~~
+
+### Session-lock compression rollout
+
+1. Update ALL game servers to v7.0.6 with CompactSessionLocks = false and confirm legacy records open and close correctly.
+2. Drain all older servers sharing the same standard player DataStore. Do not enable compact locks while any earlier reader is active.
+3. Enable CompactSessionLocks = true for all writers. The saved lock uses [JobId, SessionId, HeartbeatAt, ExpiresAt]; decoded profiles expose the same named lock fields and ownership checks as before.
+4. Monitor SessionLost, SaveFailed, PlayerLoadFailed and load latency. To downgrade, first rewrite compact locks using v7.0.6 with the option off, drain those sessions, and only then deploy older code.
+
+OrderedDataStore is deliberately unchanged and continues to store numeric values. See the existing **OrderedDataStore** documentation below for every ordered method.
+
+---
 # Compression
 
 NexusDataStore v7.0.6 is compatible with the **Compression v2.3.x** series using codec:
