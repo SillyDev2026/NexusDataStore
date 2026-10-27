@@ -41,8 +41,8 @@ local failedOK, failedError = profile:Patch({{Path = "Coins", Value = 42}, {Path
 assert(not failedOK and failedError ~= nil, "Invalid multi-patch must fail")
 assert(profile.Data.Coins == 10, "Rejected patch partially modified live profile")
 
-local pathOK, pathError = profile:Patch({{Path = {}, Value = 77}})
-assert(pathOK == false and string.find(tostring(pathError), "INVALID_PATCH_PATH", 1, true) == 1, "Invalid patch path should not throw")
+local invalidPathOK, invalidPathError = profile:Patch({{Path = {}, Value = 77}})
+assert(invalidPathOK == false and string.find(tostring(invalidPathError), "INVALID_PATCH_PATH", 1, true) == 1, "Invalid patch path should not throw")
 assert(profile.Data.Coins == 10, "Invalid path modified the profile")
 
 local patchOK, patchError = profile:Patch({{Path = "Coins", Value = 20}, {Path = {"Inventory", 1}, Value = "SuperPotion"}})
