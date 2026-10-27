@@ -1,13 +1,13 @@
 # NexusDataStore
 
-![Version](https://img.shields.io/badge/version-v7.0.5-4c8bf5)
+![Version](https://img.shields.io/badge/version-v7.0.6-4c8bf5)
 ![Language](https://img.shields.io/badge/language-Luau-00A2FF)
 ![Platform](https://img.shields.io/badge/platform-Roblox-111111)
 ![Runtime](https://img.shields.io/badge/runtime-server--only-orange)
 ![Record Format](https://img.shields.io/badge/record%20format-700-2ea44f)
 ![Compression](https://img.shields.io/badge/compression-v2.3.x%20%7C%20codec%20230-6f42c1)
 
-**NexusDataStore v7.0.5** is a typed, session-aware Roblox persistence layer built for reliable player data, compact storage, controlled mutations, migrations, snapshots, observability, and integrated OrderedDataStore synchronization.
+**NexusDataStore v7.0.6** is a typed, session-aware Roblox persistence layer built for reliable player data, compact storage, controlled mutations, migrations, snapshots, observability, and integrated OrderedDataStore synchronization.
 
 The current build is tied directly to a `PlayersData` ModuleScript:
 
@@ -34,7 +34,7 @@ profile.Data
 
 This means `profile.Data.Coins`, `profile.Data.Inventory`, and every other declared field can be understood by Luau instead of collapsing to `any`.
 
-> **Current release:** NexusDataStore `7.0.5`  
+> **Current release:** NexusDataStore `7.0.6`  
 > **Record format:** `700`  
 > **Compression series:** `2.3.x`  
 > **Compression codec:** `230`  
@@ -42,6 +42,30 @@ This means `profile.Data.Coins`, `profile.Data.Inventory`, and every other decla
 
 ---
 
+
+## v7.0.6 — adaptive player compression and compact session locks
+
+This update builds on the v7.0.5 stability changes. The DataStore record format remains **700**, and Compression stays at **v2.3.4 / codec 230**. OrderedDataStore data and serialization are unchanged.
+
+- **CompressionStrategy = "balanced" (default):** one binary-encoding pass, compared against raw JSON, buffer and Base64 representations.
+- **CompressionStrategy = "smallest":** test dictionary-enabled and dictionary-disabled packet encodings, then choose the smallest *serialized* byte count among raw tables, direct buffers and Base64. This doubles encoding attempts and costs more CPU on each write or lock heartbeat.
+- **CompressionMinBytes = 512 (default):** skip custom compression for tiny records. Set it to 0 to test every record for minimum serialized bytes.
+- **CompactSessionLocks = false (default):** optionally store each player lock as a four-element array [JobId, SessionId, HeartbeatAt, ExpiresAt] instead of repeating field names. The decoder restores the original named fields before applying existing ownership checks. The change is lossless.
+- **GetCompressionReport(profile):** the estimate now includes the active session lock, if one exists. This is an estimate for one modeled record, not a measured Roblox compressed-at-rest result.
+
+**Important deployment rule:** older versions of NexusDataStore cannot decode compact lock arrays. All servers that may read these keys must run v7.0.6+ BEFORE enabling CompactSessionLocks. Drain old servers first, enable the flag consistently, and do not roll back to old code until compact locks have been rewritten as legacy named locks. Keeping the flag false preserves old-reader compatibility.
+
+Roblox compresses DataStore values internally, so the smallest serialized representation may not be the smallest *at-rest* representation. Compare real loads, save latency, CPU and request budgets before enabling size-first encoding globally.
+
+~~~
+Compression = true
+CompressionStrategy = "smallest"
+CompressionMinBytes = 0
+CompressionTransport = "auto"
+CompactSessionLocks = false
+~~~
+
+---
 ## v7.0.5 — persistence acknowledgements, shutdown coordination, and compression efficiency
 
 This release preserves **record format 700**, **codec 230 / `buffer-v230`**, the existing DataStore names/keys, the public save/load API, and all v2.3.x packets. New records remain readable using the same decoder. New **Compression v2.3.4** is recommended; the codec number has **not** changed.
@@ -1002,7 +1026,7 @@ NexusDataStore applies every missing migration in order.
 
 # Compression
 
-NexusDataStore v7.0.3 is compatible with the **Compression v2.3.x** series using codec:
+NexusDataStore v7.0.6 is compatible with the **Compression v2.3.x** series using codec:
 
 ```text
 230
@@ -1011,7 +1035,7 @@ NexusDataStore v7.0.3 is compatible with the **Compression v2.3.x** series using
 The recommended module build is:
 
 ```text
-Compression v2.3.3
+Compression v2.3.4
 ```
 
 The packet format has a fixed 11-byte header containing the codec identity, flags, and checksum metadata.
@@ -1030,7 +1054,7 @@ Compression.Version()
 
 ## Supported Compression Types
 
-Compression v2.3.3 directly supports these Luau value types:
+Compression v2.3.4 directly supports these Luau value types:
 
 | Luau value | Supported | Encoding behavior |
 |---|---:|---|
@@ -1044,7 +1068,7 @@ Compression v2.3.3 directly supports these Luau value types:
 | nested tables | Yes | recursive |
 | circular tables | No | rejected |
 | `NaN` / `math.huge` | No | rejected |
-| `buffer` | No | rejected by Compression v2.3.3 |
+| `buffer` | No | rejected by Compression v2.3.4 |
 | `Vector2` | No | rejected |
 | `Vector3` | No | rejected |
 | `CFrame` | No | rejected |
@@ -1060,7 +1084,7 @@ The DataStore persistence validator is intentionally narrower than the standalon
 - mixed/sparse tables are rejected;
 - circular references are rejected;
 - non-finite numbers are rejected;
-- Roblox datatypes such as `Vector3`, `CFrame`, and `buffer` are not persistent values in this v7.0.3 codec path.
+- Roblox datatypes such as `Vector3`, `CFrame`, and `buffer` are not persistent values in this v7.0.6 codec path.
 
 ---
 
@@ -2419,6 +2443,9 @@ end
 | `DetectDirectChanges` | `true` | Detect direct edits to `profile.Data` |
 | `Compression` | `true` | Enable persistence compression selection |
 | `CompressionModule` | auto | Explicit Compression ModuleScript override |
+| `CompressionMinBytes` | `512` | Minimum JSON bytes before custom compression |
+| `CompressionStrategy` | `"balanced"` | One pass, or `"smallest"` to evaluate two dictionaries |
+| `CompactSessionLocks` | `false` | Opt-in compact player lock storage after all servers update |
 | `CompressionOptions` | `{}` | Compression v2.3.x options |
 | `CompressionReports` | `false` | Emit `CompressionReport` events |
 | `CompressionTransport` | `"auto"` | `"auto"`, `"buffer"`, or `"base64"` |
