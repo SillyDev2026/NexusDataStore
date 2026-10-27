@@ -3220,7 +3220,10 @@ function Session:Patch(changes: {{Path: Path, Value: any}}): (boolean, string?)
 		if typeof(patch) ~= "table" or patch.Path == nil then
 			return false, "INVALID_PATCH"
 		end
-		local ok, err = setAt(draft, patch.Path, clone(patch.Value))
+		local called, ok, err = pcall(setAt, draft, patch.Path, clone(patch.Value))
+		if not called then
+			return false, "INVALID_PATCH_PATH:" .. tostring(ok)
+		end
 		if not ok then
 			return false, err
 		end
