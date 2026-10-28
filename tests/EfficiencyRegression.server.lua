@@ -15,7 +15,7 @@ local store: any = DataStore.new({
 	SkipUnchangedMutations = true,
 	ProfileOperations = true,
 })
-assert(store:GetVersion() == "7.1.0")
+assert(store:GetVersion() == "7.2.0")
 local current: any = nil
 local updateCalls = 0
 store.DataStore = {
@@ -109,4 +109,4 @@ assert(legacy:CloseAsync())
 local released, releaseError = profile:ReleaseAsync()
 assert(released, tostring(releaseError))
 assert(store:CloseAsync())
-print("NexusDataStore v7.1.0 efficiency, coalescing and profiler regression PASS")
+print("NexusDataStore v7.2.0 efficiency, coalescing and profiler regression PASS")
