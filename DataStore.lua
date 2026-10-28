@@ -1880,7 +1880,7 @@ function NexusDataStore:_Commit(session: any, release: boolean, reason: string):
 	local commitDeadline = commitStartedAt + self.Config.SaveTimeout
 	local locked, lockErr = self:_AcquireCommitLock(session, commitDeadline)
 	if not locked then
-		self:_RecordPerformance("DataStoreCommit", self.Config.ProfileOperations and commitStartedAt or nil, false)
+		if self.Config.ProfileOperations then self:_RecordPerformance("DataStoreCommit", commitStartedAt, false) end
 		return false, lockErr
 	end
 	local protectedOK, commitOK, commitErr = pcall(function()
@@ -2036,7 +2036,7 @@ function NexusDataStore:_Commit(session: any, release: boolean, reason: string):
 		return true
 	end)
 	self:_ReleaseCommitLock(session)
-	self:_RecordPerformance("DataStoreCommit", self.Config.ProfileOperations and commitStartedAt or nil, protectedOK and commitOK == true)
+	if self.Config.ProfileOperations then self:_RecordPerformance("DataStoreCommit", commitStartedAt, protectedOK and commitOK == true) end
 	if not protectedOK then
 		self.Metrics.SaveFailed += 1
 		return false, tostring(commitOK)
@@ -3007,7 +3007,7 @@ function Session:_CommitDraft(draft: any, path: {PathKey}?, oldValue: any, newVa
 	if self.Store.Config.ValidateOnWrite then
 		local valid, err = self.Store:Validate(draft)
 		if not valid then
-			self.Store:_RecordPerformance("MutationDraft", profilerStarted, false)
+			if profilerStarted ~= nil then self.Store:_RecordPerformance("MutationDraft", profilerStarted, false) end
 			return false, "VALIDATION_FAILED:" .. tostring(err)
 		end
 	end
@@ -3027,7 +3027,7 @@ function Session:_CommitDraft(draft: any, path: {PathKey}?, oldValue: any, newVa
 			return clone(draft)
 		end)
 		if not cloned then
-			self.Store:_RecordPerformance("MutationDraft", profilerStarted, false)
+			if profilerStarted ~= nil then self.Store:_RecordPerformance("MutationDraft", profilerStarted, false) end
 			return false, "INVALID_OBSERVED_SNAPSHOT:" .. tostring(value)
 		end
 		observed = value
@@ -3039,7 +3039,7 @@ function Session:_CommitDraft(draft: any, path: {PathKey}?, oldValue: any, newVa
 	self.ObservedSnapshot = observed
 	self.Store.Metrics.Mutations += 1
 	self:_EmitChange(path, newValue, oldValue)
-	self.Store:_RecordPerformance("MutationDraft", profilerStarted, true)
+	if profilerStarted ~= nil then self.Store:_RecordPerformance("MutationDraft", profilerStarted, true) end
 	return true
 end
 
