@@ -389,10 +389,17 @@ local function normalizePath(path: Path): {PathKey}
 	if typeof(path) == "string" or typeof(path) == "number" then
 		return {validateKey(path)}
 	end
-	assert(typeof(path) == "table" and #path > 0, "Path must be a string, number, or non-empty array")
-	local output = table.create(#path)
-	for index, key in ipairs(path :: any) do
-		output[index] = validateKey(key)
+	assert(typeof(path) == "table", "Path must be a string, number, or non-empty array")
+	local count, maxIndex = 0, 0
+	for key in pairs(path) do
+		assert(typeof(key) == "number" and safeInteger(key) and key >= 1, "Path must be a dense array")
+		count += 1
+		if key > maxIndex then maxIndex = key end
+	end
+	assert(count > 0 and maxIndex == count, "Path must be a non-empty dense array")
+	local output = table.create(count)
+	for index = 1, count do
+		output[index] = validateKey(path[index])
 	end
 	return output
 end
@@ -1448,6 +1455,13 @@ function NexusDataStore:_ApplyMigrations(data: Data, fromVersion: number, key: s
 	return working
 end
 
+-- UpdateAsync otherwise drops key-associated user IDs and custom metadata.
+-- Preserve them when renewing locks, saving, or releasing existing records.
+local function persistWithKeyInfo(value: any, keyInfo: any)
+	if keyInfo == nil then return value end
+	return value, keyInfo:GetUserIds(), keyInfo:GetMetadata()
+end
+
 function NexusDataStore:_BuildNewRecord(data: Data): any
 	local stamp = unix()
 	return {
@@ -1609,7 +1623,7 @@ function NexusDataStore:OpenAsync(key: string | number, context: OpenContext?): 
 		local startTime = openStartedAt
 
 		local success, result = self:_Retry(function()
-			return self.DataStore:UpdateAsync(normalizedKey, function(raw)
+			return self.DataStore:UpdateAsync(normalizedKey, function(raw, keyInfo)
 				acquireError = nil
 				recordForSession = nil
 				encodeReport = nil
@@ -1662,7 +1676,7 @@ function NexusDataStore:OpenAsync(key: string | number, context: OpenContext?): 
 					return nil
 				end
 				encodeReport = currentReport
-				return encoded
+				return persistWithKeyInfo(encoded, keyInfo)
 			end)
 		end, REQUEST_STANDARD_UPDATE, openDeadline, "LOAD_TIMEOUT")
 
@@ -1891,7 +1905,7 @@ function NexusDataStore:_Commit(session: any, release: boolean, reason: string):
 		local encodeReport
 
 		local success, result = self:_Retry(function()
-			return self.DataStore:UpdateAsync(session.Key, function(raw)
+			return self.DataStore:UpdateAsync(session.Key, function(raw, keyInfo)
 				saveError = nil
 				encodeReport = nil
 				local record, decodeErr = self:_DecodeRecord(raw)
@@ -1907,7 +1921,7 @@ function NexusDataStore:_Commit(session: any, release: boolean, reason: string):
 						return nil
 					end
 					encodeReport = repeatedReport
-					return repeatedEncoded
+					return persistWithKeyInfo(repeatedEncoded, keyInfo)
 				end
 				if not self:_OwnsRecord(record, session) then
 					saveError = "SESSION_LOST"
@@ -1943,7 +1957,7 @@ function NexusDataStore:_Commit(session: any, release: boolean, reason: string):
 					return nil
 				end
 				encodeReport = currentReport
-				return encoded
+				return persistWithKeyInfo(encoded, keyInfo)
 			end)
 		end, REQUEST_STANDARD_UPDATE, commitDeadline, "SAVE_TIMEOUT")
 
@@ -3275,7 +3289,19 @@ function Session:Restore(snapshot: Snapshot<Data>): (boolean, string?)
 	if typeof(snapshot) ~= "table" or typeof(snapshot.Data) ~= "table" then
 		return false, "INVALID_SNAPSHOT"
 	end
-	local draft = clone(snapshot.Data) :: Data
+	-- Only restore a snapshot retained by this session; do not accept a
+	-- foreign profile or caller-mutated snapshot as authoritative saved data.
+	local ownedSnapshot = nil
+	for _, saved in ipairs(self.Snapshots) do
+		if saved.Id == snapshot.Id and saved.Revision == snapshot.Revision then
+			ownedSnapshot = saved
+			break
+		end
+	end
+	if ownedSnapshot == nil then
+		return false, "SNAPSHOT_NOT_OWNED"
+	end
+	local draft = clone(ownedSnapshot.Data) :: Data
 	local valid, err = self.Store:Validate(draft)
 	if not valid then
 		return false, "SNAPSHOT_VALIDATION_FAILED:" .. tostring(err)
