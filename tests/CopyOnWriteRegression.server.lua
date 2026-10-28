@@ -47,6 +47,17 @@ for _, direct in ipairs({true, false}) do
 	assert(watcherCount == 1 and lastBefore == 0 and lastAfter == 99, "Watcher values changed")
 	watching:Disconnect()
 
+	-- Incremental observation must still notice a direct edit to another branch.
+	if direct then
+		local previousDirectEvents = store.Metrics.DirectChanges
+		profile.Data.Nested.Other.Score = 26
+		assert(profile:Set({"Nested", "Branch", "Score"}, 100))
+		assert(profile.ObservedSnapshot.Nested.Other.Score == 25, "Untracked sibling was incorrectly accepted as observed")
+		store:_DetectDirectChanges(profile)
+		assert(store.Metrics.DirectChanges == previousDirectEvents + 1, "Direct sibling edit was not detected")
+		assert(profile.ObservedSnapshot.Nested.Other.Score == 26, "Observation snapshot was not refreshed")
+	end
+
 	local passed, failure = profile:Set({"Nested", "Unknown", "Score"}, 3)
 	assert(not passed and string.find(tostring(failure), "PATH_PARENT_MISSING", 1, true), "Invalid ancestor should fail")
 	assert(profile.Data.Nested.Other.Score == 25, "Failed update damaged sibling")
