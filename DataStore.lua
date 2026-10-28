@@ -2989,9 +2989,13 @@ function Session:_CommitDraft(draft: any, path: {PathKey}?, oldValue: any, newVa
 	if not mutable then
 		return false, mutableErr
 	end
+	local profilerStarted = self.Store.Config.ProfileOperations and now() or nil
 	if self.Store.Config.ValidateOnWrite then
 		local valid, err = self.Store:Validate(draft)
-		if not valid then return false, "VALIDATION_FAILED:" .. tostring(err) end
+		if not valid then
+			self.Store:_RecordPerformance("MutationDraft", profilerStarted, false)
+			return false, "VALIDATION_FAILED:" .. tostring(err)
+		end
 	end
 	-- Incrementally update the independent direct-change baseline for a known
 	-- path instead of cloning every unrelated inventory/map on each mutation.
@@ -3008,7 +3012,10 @@ function Session:_CommitDraft(draft: any, path: {PathKey}?, oldValue: any, newVa
 			end
 			return clone(draft)
 		end)
-		if not cloned then return false, "INVALID_OBSERVED_SNAPSHOT:" .. tostring(value) end
+		if not cloned then
+			self.Store:_RecordPerformance("MutationDraft", profilerStarted, false)
+			return false, "INVALID_OBSERVED_SNAPSHOT:" .. tostring(value)
+		end
 		observed = value
 	end
 	-- Nothing observable changes until all validation and snapshot work succeeds.
@@ -3018,6 +3025,7 @@ function Session:_CommitDraft(draft: any, path: {PathKey}?, oldValue: any, newVa
 	self.ObservedSnapshot = observed
 	self.Store.Metrics.Mutations += 1
 	self:_EmitChange(path, newValue, oldValue)
+	self.Store:_RecordPerformance("MutationDraft", profilerStarted, true)
 	return true
 end
 
@@ -3043,6 +3051,11 @@ function Session:Set(path: Path, value: any): (boolean, string?)
 	if not mutable then return false, mutableErr end
 	local valid, keys = pcall(normalizePath, path)
 	if not valid then return false, "INVALID_PATH:" .. tostring(keys) end
+	-- Keep existing notification behavior unless this optimization is explicitly enabled.
+	if self.Store.Config.SkipUnchangedMutations and deepEqual(getAt(self.Data, keys), value) then
+		self.Store.Metrics.NoopMutations += 1
+		return true
+	end
 	local draft, parent, previous, err = draftAt(self.Data, keys)
 	if draft == nil then return false, err end
 	local nextValue = clone(value)
@@ -3055,6 +3068,10 @@ function Session:Delete(path: Path): (boolean, string?)
 	if not mutable then return false, mutableErr end
 	local valid, keys = pcall(normalizePath, path)
 	if not valid then return false, "INVALID_PATH:" .. tostring(keys) end
+	if self.Store.Config.SkipUnchangedMutations and getAt(self.Data, keys) == nil then
+		self.Store.Metrics.NoopMutations += 1
+		return true
+	end
 	local draft, parent, previous, err = draftAt(self.Data, keys)
 	if draft == nil then return false, err end
 	parent[keys[#keys]] = nil
@@ -3236,6 +3253,10 @@ function Session:Mutate(callback: (draft: Data, session: Session<Data>) -> any):
 	if result == false then
 		return true, nil, "CANCELLED"
 	end
+	if self.Store.Config.SkipUnchangedMutations and deepEqual(draft, self.Data) then
+		self.Store.Metrics.NoopMutations += 1
+		return true, result
+	end
 	local before = self.Data
 	local committed, commitErr = self:_CommitDraft(draft, nil, before, draft)
 	if not committed then
@@ -3254,14 +3275,27 @@ function Session:Patch(changes: {{Path: Path, Value: any}}): (boolean, string?)
 	if not isArray then return false, "PATCH_MUST_BE_DENSE_ARRAY" end
 	if count == 0 then return true end
 	local draft: any = self.Data
+	local changed = false
 	for _, patch in ipairs(changes) do
 		if typeof(patch) ~= "table" or patch.Path == nil then return false, "INVALID_PATCH" end
 		local valid, keys = pcall(normalizePath, patch.Path)
 		if not valid then return false, "INVALID_PATCH_PATH:" .. tostring(keys) end
-		local nextDraft, parent, _, err = draftAt(draft, keys)
-		if nextDraft == nil then return false, err end
-		parent[keys[#keys]] = clone(patch.Value)
-		draft = nextDraft
+		local previous = getAt(draft, keys)
+		if self.Store.Config.SkipUnchangedMutations and deepEqual(previous, patch.Value) then
+			-- Validate each supplied path, but do not allocate another draft.
+			local _, _, _, pathError = draftAt(draft, keys)
+			if pathError ~= nil then return false, pathError end
+		else
+			local nextDraft, parent, _, err = draftAt(draft, keys)
+			if nextDraft == nil then return false, err end
+			parent[keys[#keys]] = clone(patch.Value)
+			draft = nextDraft
+			changed = true
+		end
+	end
+	if not changed then
+		self.Store.Metrics.NoopMutations += 1
+		return true
 	end
 	return self:_CommitDraft(draft, nil, self.Data, draft)
 end
