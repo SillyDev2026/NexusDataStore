@@ -38,7 +38,7 @@ local template = store:GetTemplate()
 records.peek = store:_BuildNewRecord(template)
 local sessionRecord = store:_BuildNewRecord(template)
 store:_LockRecord(sessionRecord, "mock-session")
-records.local = sessionRecord
+records["local"] = sessionRecord
 local profile: any = store:_CreateSession("local", sessionRecord, "mock-session", {})
 local ordered: any = store:GetOrderedStore("Score")
 assert(ordered ~= nil)
@@ -99,7 +99,7 @@ benchmark("SaveAsync", function(i)
 	local dirty = profile:Set("Coins", i)
 	if not dirty then return false end
 	local saved = profile:SaveAsync("critical")
-	return saved and records.local ~= nil and profile.Revision == i
+	return saved and records["local"] ~= nil and profile.Revision == i
 end)
 benchmark("FlushAsync", function()
 	local ok = store:FlushAsync(5)
