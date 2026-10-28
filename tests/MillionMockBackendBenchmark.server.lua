@@ -81,7 +81,7 @@ local function benchmark(name: string, callback: (number) -> boolean, callsPerIt
 		local stopIndex = math.min(ITERATIONS, startIndex + BATCH_SIZE - 1)
 		local begin = os.clock()
 		for i = startIndex, stopIndex do
-			assert(callback(i), name .. " failed at " .. tostring(i))
+			if not callback(i) then error(name .. " failed at " .. tostring(i)) end
 		end
 		elapsed += os.clock() - begin
 		task.wait()
