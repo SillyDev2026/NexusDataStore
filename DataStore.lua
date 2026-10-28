@@ -449,6 +449,20 @@ end
 -- Copy only the tables along a mutated path. The live profile remains untouched
 -- until _CommitDraft validates and swaps the candidate into the session.
 -- This avoids deep-copying unrelated inventory and progression trees on each edit.
+-- Check parent paths without allocating copy-on-write drafts.
+local function validatePathParent(root: any, keys: {PathKey}): (boolean, string?)
+	local cursor = root
+	for index = 1, #keys - 1 do
+		if typeof(cursor) ~= "table" then return false, "PATH_PARENT_NOT_TABLE:" .. pathDisplay(keys) end
+		local nextValue = cursor[keys[index]]
+		if nextValue == nil then return false, "PATH_PARENT_MISSING:" .. pathDisplay(keys) end
+		if typeof(nextValue) ~= "table" then return false, "PATH_PARENT_NOT_TABLE:" .. pathDisplay(keys) end
+		cursor = nextValue
+	end
+	if typeof(cursor) ~= "table" then return false, "PATH_PARENT_NOT_TABLE:" .. pathDisplay(keys) end
+	return true
+end
+
 local function draftAt(root: any, keys: {PathKey}): (any?, any?, any?, string?)
 	local draft = table.clone(root)
 	local parent: any = draft
@@ -3053,6 +3067,8 @@ function Session:Set(path: Path, value: any): (boolean, string?)
 	if not valid then return false, "INVALID_PATH:" .. tostring(keys) end
 	-- Keep existing notification behavior unless this optimization is explicitly enabled.
 	if self.Store.Config.SkipUnchangedMutations and deepEqual(getAt(self.Data, keys), value) then
+		local validParent, parentError = validatePathParent(self.Data, keys)
+		if not validParent then return false, parentError end
 		self.Store.Metrics.NoopMutations += 1
 		return true
 	end
@@ -3069,6 +3085,8 @@ function Session:Delete(path: Path): (boolean, string?)
 	local valid, keys = pcall(normalizePath, path)
 	if not valid then return false, "INVALID_PATH:" .. tostring(keys) end
 	if self.Store.Config.SkipUnchangedMutations and getAt(self.Data, keys) == nil then
+		local validParent, parentError = validatePathParent(self.Data, keys)
+		if not validParent then return false, parentError end
 		self.Store.Metrics.NoopMutations += 1
 		return true
 	end
@@ -3283,8 +3301,8 @@ function Session:Patch(changes: {{Path: Path, Value: any}}): (boolean, string?)
 		local previous = getAt(draft, keys)
 		if self.Store.Config.SkipUnchangedMutations and deepEqual(previous, patch.Value) then
 			-- Validate each supplied path, but do not allocate another draft.
-			local _, _, _, pathError = draftAt(draft, keys)
-			if pathError ~= nil then return false, pathError end
+			local validParent, pathError = validatePathParent(draft, keys)
+			if not validParent then return false, pathError end
 		else
 			local nextDraft, parent, _, err = draftAt(draft, keys)
 			if nextDraft == nil then return false, err end
