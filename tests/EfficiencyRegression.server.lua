@@ -90,6 +90,22 @@ assert(report.Operations.MutationDraft.TotalMs >= 0 and report.Operations.DataSt
 report.Operations.MutationDraft.Count = -999
 assert(store:GetPerformanceReport().Operations.MutationDraft.Count == 1)
 
+-- Backward-compatible defaults: no-op detection and profiling must remain opt-in.
+local legacy: any = DataStore.new({
+	Name = "NexusEfficiencyLegacy",
+	Template = {Coins = 0},
+	Compression = false, AutoSave = false, AutoPlayerLifecycle = false, BudgetAware = false,
+})
+local legacyProfile: any = legacy:_CreateSession("legacy", legacy:_BuildNewRecord({Coins = 0}), "legacy-session", {})
+local before = legacyProfile.MutationId
+assert(legacyProfile:Set("Coins", 0), "Legacy same-value mutation failed")
+assert(legacyProfile.MutationId == before + 1 and legacyProfile:IsDirty(), "Default notification/mutation semantics changed")
+local legacyReport = legacy:GetPerformanceReport()
+assert(not legacyReport.Enabled and next(legacyReport.Operations) == nil and legacyReport.NoopMutations == 0)
+legacyProfile.Active = false
+legacy:_UnregisterSession(legacyProfile)
+assert(legacy:CloseAsync())
+
 local released, releaseError = profile:ReleaseAsync()
 assert(released, tostring(releaseError))
 assert(store:CloseAsync())
