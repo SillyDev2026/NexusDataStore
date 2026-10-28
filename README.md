@@ -2,14 +2,14 @@
 
 **Typed, session-aware data persistence for Roblox.**
 
-![Version](https://img.shields.io/badge/NexusDataStore-7.0.6-2563eb)
+![Version](https://img.shields.io/badge/NexusDataStore-7.0.7-2563eb)
 ![Codec](https://img.shields.io/badge/Compression-2.3.4-0f766e)
 ![Luau](https://img.shields.io/badge/language-Luau-00a2ff)
 ![Platform](https://img.shields.io/badge/platform-Roblox-222222)
 
 NexusDataStore brings standard Roblox DataStore persistence, session ownership, typed player profiles, validation, migrations, snapshots, adaptive compression, and numeric leaderboards into one server-side library.
 
-**Current version:** `7.0.6` · **Compression:** `2.3.4` / codec `230` · **Record format:** `700`
+**Current version:** `7.0.7` · **Compression:** `2.3.4` / codec `230` · **Record format:** `700`
 
 > [!IMPORTANT]
 > This documentation describes the current source on `main`. Regression scripts are included, but production reliability and performance have not been certified by live-server load testing. Use a separate test universe before deploying changes to existing player data.
@@ -36,6 +36,17 @@ NexusDataStore brings standard Roblox DataStore persistence, session ownership, 
 ---
 
 ## Overview
+
+### Reliability update — v7.0.7
+
+This patch strengthens existing save and session behavior without changing record format `700`, compression codec `230`, or the OrderedDataStore interface.
+
+- **Metadata preservation:** `UpdateAsync` commits now return existing Roblox key-associated user IDs and custom metadata when supplied by `DataStoreKeyInfo`, including lock acquisition, saves, retries, and release.
+- **Safer rollback:** `profile:Restore(snapshot)` only accepts snapshots still retained by that specific session; caller-modified snapshot tables cannot overwrite the internally retained snapshot. Rejected snapshots return `SNAPSHOT_NOT_OWNED`.
+- **Path and mutation validation:** Sparse/mixed path arrays are rejected. `Set` and `Delete` now return `INVALID_PATH` errors for malformed paths and refuse edits during session release.
+- **Regression expansion:** New Studio scripts cover metadata, snapshots, migrations, core profile methods, corruption guards, and numeric leaderboard operations alongside the existing codec and shutdown tests.
+
+> These regression scripts require Roblox Studio. They have **not** been executed by this GitHub update, so use the test suite in a separate universe before deploying to production.
 
 ### Capabilities
 
@@ -450,7 +461,7 @@ local restored, err = profile:Restore(checkpoint)
 if not restored then warn(err) end
 ~~~
 
-Snapshots are kept **in server memory** and are subject to `MaxSnapshots`. They are not permanent Roblox DataStore backups or historical DataStore versions.
+Snapshots are kept **in server memory** and are subject to `MaxSnapshots`. `Restore` requires a snapshot still owned by the same session, and always restores its internally retained data rather than a caller-modified copy. It returns `SNAPSHOT_NOT_OWNED` for foreign or evicted snapshots. These are not permanent Roblox DataStore backups or historical DataStore versions.
 
 ## Saving, releasing, and reading
 
@@ -725,7 +736,7 @@ Set `RemoveWhenNil = true` if a missing projected path should remove the corresp
 
 ## Configuration reference
 
-The following are the defaults in **v7.0.6**. Every option goes inside `NexusDataStore.new({...})` unless otherwise stated.
+The following are the defaults in **v7.0.7**. Every option goes inside `NexusDataStore.new({...})` unless otherwise stated.
 
 ### Store identity and data model
 
@@ -868,6 +879,8 @@ Metrics describe this **server process** and are not a permanent analytics wareh
 | `SESSION_LOST` / `REVISION_CONFLICT` | Ownership or revision changed; stop modifying that session |
 | `LOAD_VALIDATION_FAILED` / `SAVE_VALIDATION_FAILED` | Data failed validation; inspect field types/limits |
 | `MIGRATION_MISSING` / `MIGRATION_FAILED` | Missing/broken migration; repair code, do not reset data |
+| `SNAPSHOT_NOT_OWNED` | A snapshot belongs to another session or has been evicted; choose a retained snapshot |
+| `INVALID_PATH` | A path is empty, sparse, or otherwise invalid; use a dense key array |
 | `COMPRESSED_DECODE_FAILED` / `INVALID_COMPRESSED_ENVELOPE` | Record could not be decoded; preserve stored data for investigation |
 | `DEFERRED` | Normal save was postponed, **not** durably confirmed |
 | `SAVE_TIMEOUT` / `LOAD_TIMEOUT` | Backend deadline exceeded; treat persistence as uncertain |
@@ -904,11 +917,11 @@ Suggested pre-release test matrix:
 | Release during in-flight load | Session is not silently stranded |
 | Schema is upgraded | Migration runs before validation |
 | Compressed payload is corrupted | Decoder reports failure, never resets data |
-| Normal and compact locks | v7.0.6 can read both |
+| Normal and compact locks | v7.0.7 can read both |
 | Leaderboard sync fails | Standard profile save and ordered error are handled separately |
 
 For DataStore fundamentals and limits, consult [Roblox Data Stores](https://create.roblox.com/docs/cloud-services/data-stores), [best practices](https://create.roblox.com/docs/cloud-services/data-stores/best-practices), and [error codes and limits](https://create.roblox.com/docs/cloud-services/data-stores/error-codes-and-limits).
 
 ---
 
-**Version 7.0.6** · [Source](./DataStore.lua) · [Compression](./Compression.lua) · [Tests](./tests)
+**Version 7.0.7** · [Source](./DataStore.lua) · [Compression](./Compression.lua) · [Tests](./tests)
