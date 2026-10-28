@@ -39,9 +39,11 @@ methods = [
     "NexusDataStore:SaveAsync", "NexusDataStore:ReleaseAsync",
     "NexusDataStore:_Commit", "NexusDataStore:GetMetrics",
     "NexusDataStore:GetPerformanceReport", "NexusDataStore:GetHealth",
+    "NexusDataStore:PreviewMigration", "NexusDataStore:GetStorageForecast",
     "Session:Get", "Session:Set", "Session:Delete", "Session:Patch",
     "Session:Mutate", "Session:Append", "Session:RemoveAt",
     "Session:Snapshot", "Session:Restore", "Session:SaveAsync",
+    "Session:GetChangeJournal", "Session:ClearChangeJournal",
     "Session:ReleaseAsync", "OrderedStore:GetAsync",
     "OrderedStore:SetAsync", "OrderedStore:UpdateAsync",
     "OrderedStore:GetTopAsync", "OrderedStore:GetRankAsync",
@@ -52,9 +54,12 @@ check("critical APIs have unique definitions", all(
 ))
 check("README reference retained", "## Configuration reference" in readme and "## API reference" in readme)
 check("new features documented", "GetPerformanceReport()" in readme and "SkipUnchangedMutations" in readme)
+check("v7.2 tool documentation present", "PreviewMigration(data, fromVersion" in readme and "GetStorageForecast(dataOrSession" in readme and "ChangeJournalLimit" in readme)
+check("bounded journal defaults off", "ChangeJournalLimit = configNumber(config.ChangeJournalLimit, 0, 0" in data)
 test_dir = ROOT / "tests"
 required = (
     "EfficiencyRegression.server.lua", "CopyOnWriteRegression.server.lua",
+    "DeveloperToolsRegression.server.lua",
     "MutationSafetyRegression.server.lua", "PersistenceRecoveryRegression.server.lua",
     "SchemaMigrationRegression.server.lua", "CompressionRegression.server.lua",
     "MillionLocalBenchmark.server.lua", "MillionMockBackendBenchmark.server.lua",
