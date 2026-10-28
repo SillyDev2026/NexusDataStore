@@ -84,6 +84,7 @@ export type StoreConfig<T> = {
 	DetectDirectChanges: boolean?,
 	SkipUnchangedMutations: boolean?,
 	ProfileOperations: boolean?,
+	ChangeJournalLimit: number?,
 	Compression: boolean?,
 	CompressionModule: ModuleScript?,
 	CompressionOptions: CompressionOptions?,
@@ -172,6 +173,8 @@ export type Session<T> = {
 	ReleaseAsync: (self: Session<T>) -> (boolean, string?),
 	GetStatus: (self: Session<T>) -> {[string]: any},
 	GetStats: (self: Session<T>) -> {[string]: any},
+	GetChangeJournal: (self: Session<T>, limit: number?) -> {any},
+	ClearChangeJournal: (self: Session<T>) -> number,
 }
 
 export type OrderedEntry = {
@@ -223,6 +226,8 @@ export type Store<T> = {
 	Validate: (self: Store<T>, data: T) -> (boolean, string?),
 	GetTemplate: (self: Store<T>) -> T,
 	GetSchema: (self: Store<T>) -> {[string]: SchemaRule}?,
+	PreviewMigration: (self: Store<T>, data: T, fromVersion: number, key: string?) -> (any?, string?),
+	GetStorageForecast: (self: Store<T>, dataOrSession: any, warningRatio: number?) -> (any?, string?),
 	GetVersion: (self: Store<T>) -> string,
 	EncodeCompressed: (self: Store<T>, data: any) -> (buffer?, any),
 	DecodeCompressed: (self: Store<T>, raw: buffer) -> (any?, string?),
@@ -269,7 +274,7 @@ local EncodingService = game:GetService("EncodingService")
 
 local NexusDataStore: any = {}
 NexusDataStore.__index = NexusDataStore
-NexusDataStore.Version = "7.1.0"
+NexusDataStore.Version = "7.2.0"
 NexusDataStore.RecordFormat = 700
 NexusDataStore.RequiredCompressionVersion = "2.3.0"
 
@@ -1566,6 +1571,7 @@ function NexusDataStore:_CreateSession(key: string, record: any, sessionId: stri
 		LastPersistedSnapshot = persistedSnapshot :: Data,
 		ObservedSnapshot = self.Config.DetectDirectChanges and persistedSnapshot or nil,
 		Snapshots = {},
+		ChangeJournal = {},
 		Watchers = {},
 		CommitBusy = false,
 		Releasing = false,
@@ -2430,6 +2436,49 @@ function NexusDataStore:GetSchema()
 	return clone(self.Schema)
 end
 
+-- Preview migration and reconciliation entirely in memory. This never opens, locks,
+-- or writes a DataStore key. Migration callbacks should not perform external actions.
+function NexusDataStore:PreviewMigration(data: Data, fromVersion: number, key: string?): (any?, string?)
+	if typeof(data) ~= "table" then return nil, "ROOT_DATA_MUST_BE_TABLE" end
+	if not safeInteger(fromVersion) or fromVersion < 1 then return nil, "INVALID_SCHEMA_VERSION" end
+	if key ~= nil and (typeof(key) ~= "string" or #key == 0) then return nil, "INVALID_PREVIEW_KEY" end
+	local cloned, source = pcall(clone, data)
+	if not cloned then return nil, "INVALID_PREVIEW_DATA:" .. tostring(source) end
+	local migrated, migrationError = self:_ApplyMigrations(clone(source), fromVersion, key or "preview")
+	if not migrated then return nil, migrationError end
+	local reconciled, reconcileError = self:_Reconcile(migrated)
+	if not reconciled then return nil, "RECONCILE_FAILED:" .. tostring(reconcileError) end
+	local valid, validationError = self:Validate(reconciled)
+	if not valid then return nil, "PREVIEW_VALIDATION_FAILED:" .. tostring(validationError) end
+	local changes: {Change} = {}
+	diffValues(source, reconciled, {}, changes, {})
+	return {FromVersion = fromVersion, ToVersion = self.SchemaVersion, Data = clone(reconciled), Changes = changes, Changed = #changes > 0}
+end
+
+-- Estimate the actual stored-record envelope with the current codec and lock
+-- options. Neither the supplied profile nor a backend key is modified.
+function NexusDataStore:GetStorageForecast(dataOrSession: any, warningRatio: number?): (any?, string?)
+	local ratio = warningRatio == nil and 0.8 or warningRatio
+	if not finiteNumber(ratio) or ratio < 0 or ratio > 1 then return nil, "INVALID_WARNING_RATIO" end
+	local sessionReport = typeof(dataOrSession) == "table" and dataOrSession.Store == self and typeof(dataOrSession.IsActive) == "function" and dataOrSession:IsActive()
+	local data = sessionReport and dataOrSession.Data or dataOrSession
+	local valid, err = self:Validate(data)
+	if not valid then return nil, err end
+	local record = self:_BuildNewRecord(clone(data))
+	if sessionReport then
+		record.Revision = dataOrSession.Revision
+		self:_LockRecord(record, dataOrSession.SessionId)
+	end
+	local encoded, encodeError, report = self:_EncodeRecord(record)
+	if encoded == nil then return nil, encodeError end
+	local used = report.StorageBytes
+	local capacity = self.Config.MaxStoredBytes
+	local utilization = used / capacity
+	return {StorageBytes = used, CapacityBytes = capacity, RemainingBytes = math.max(0, capacity - used),
+		Utilization = utilization, WarningRatio = ratio, NearLimit = utilization >= ratio,
+		Transport = report.Transport, IncludesSessionLock = sessionReport, RawStorageEstimate = report.RawStorageEstimate}
+end
+
 function NexusDataStore:GetVersion(): string
 	return NexusDataStore.Version
 end
@@ -3038,6 +3087,12 @@ function Session:_CommitDraft(draft: any, path: {PathKey}?, oldValue: any, newVa
 	self.MutationId += 1
 	self.ObservedSnapshot = observed
 	self.Store.Metrics.Mutations += 1
+	local journalLimit = self.Store.Config.ChangeJournalLimit
+	if journalLimit > 0 then
+		local journal = self.ChangeJournal
+		journal[#journal + 1] = {At = unix(), MutationId = self.MutationId, Path = path and table.clone(path) or nil}
+		if #journal > journalLimit then table.remove(journal, 1) end
+	end
 	self:_EmitChange(path, newValue, oldValue)
 	if profilerStarted ~= nil then self.Store:_RecordPerformance("MutationDraft", profilerStarted, true) end
 	return true
@@ -3401,6 +3456,21 @@ function Session:ReleaseAsync(): (boolean, string?)
 	return self.Store:ReleaseAsync(self)
 end
 
+function Session:GetChangeJournal(limit: number?): {any}
+	local available = #self.ChangeJournal
+	local maxEntries = limit == nil and available or limit
+	assert(safeInteger(maxEntries) and maxEntries >= 0, "Journal limit must be a non-negative safe integer")
+	local output = {}
+	for index = math.max(1, available - maxEntries + 1), available do output[#output + 1] = clone(self.ChangeJournal[index]) end
+	return output
+end
+
+function Session:ClearChangeJournal(): number
+	local count = #self.ChangeJournal
+	self.ChangeJournal = {}
+	return count
+end
+
 function Session:GetStatus()
 	return {
 		Key = self.Key,
@@ -3483,6 +3553,7 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 		DetectDirectChanges = config.DetectDirectChanges ~= false,
 		SkipUnchangedMutations = config.SkipUnchangedMutations == true,
 		ProfileOperations = config.ProfileOperations == true,
+		ChangeJournalLimit = configNumber(config.ChangeJournalLimit, 0, 0, "ChangeJournalLimit", true, 1000),
 		Compression = config.Compression ~= false,
 		CompressionModule = config.CompressionModule,
 		CompressionOptions = clone(config.CompressionOptions or {}),
