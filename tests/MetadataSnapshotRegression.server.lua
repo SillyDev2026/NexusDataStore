@@ -72,6 +72,19 @@ for _, invalid in ipairs(invalidPaths) do
     assert(not ok and string.find(tostring(reason), "INVALID_PATCH_PATH", 1, true) == 1, "Invalid patch path was not safely rejected")
     assert(profile.Data.Coins == 20, "Invalid path changed profile data")
 end
+local setInvalid, setInvalidError = profile:Set({[2] = "Coins"}, 99)
+assert(not setInvalid and string.find(tostring(setInvalidError), "INVALID_PATH", 1, true) == 1, "Set must return invalid path error")
+local deleteInvalid, deleteInvalidError = profile:Delete({[2] = "Coins"})
+assert(not deleteInvalid and string.find(tostring(deleteInvalidError), "INVALID_PATH", 1, true) == 1, "Delete must return invalid path error")
+
+profile.Releasing = true
+local releasedSet, releasedSetError = profile:Set("Coins", 123)
+local releasedDelete, releasedDeleteError = profile:Delete("Coins")
+profile.Releasing = false
+assert(not releasedSet and releasedSetError == "SESSION_RELEASING", "Set must reject releasing session")
+assert(not releasedDelete and releasedDeleteError == "SESSION_RELEASING", "Delete must reject releasing session")
+assert(profile.Data.Coins == 20, "Releasing session was mutated")
+
 assert(profile:Set({"Inventory", 1}, "SuperPotion"), "Valid nested path rejected")
 assert(profile:Get({"Inventory", 1}) == "SuperPotion", "Valid nested path returned wrong value")
 
