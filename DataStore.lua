@@ -2952,14 +2952,31 @@ function Session:_CommitDraft(draft: any, path: {PathKey}?, oldValue: any, newVa
 	end
 	if self.Store.Config.ValidateOnWrite then
 		local valid, err = self.Store:Validate(draft)
-		if not valid then
-			return false, "VALIDATION_FAILED:" .. tostring(err)
-		end
+		if not valid then return false, "VALIDATION_FAILED:" .. tostring(err) end
 	end
+	-- Incrementally update the independent direct-change baseline for a known
+	-- path instead of cloning every unrelated inventory/map on each mutation.
+	-- For whole-profile transactions, or a stale/missing parent, clone fully.
+	local observed: any = nil
+	if self.Store.Config.DetectDirectChanges then
+		local cloned, value = pcall(function()
+			if path ~= nil and self.ObservedSnapshot ~= nil then
+				local tracked, parent = draftAt(self.ObservedSnapshot, path)
+				if tracked ~= nil then
+					parent[path[#path]] = clone(newValue)
+					return tracked
+				end
+			end
+			return clone(draft)
+		end)
+		if not cloned then return false, "INVALID_OBSERVED_SNAPSHOT:" .. tostring(value) end
+		observed = value
+	end
+	-- Nothing observable changes until all validation and snapshot work succeeds.
 	self.Data = draft
 	self.Dirty = true
 	self.MutationId += 1
-	self.ObservedSnapshot = self.Store.Config.DetectDirectChanges and clone(draft) or nil
+	self.ObservedSnapshot = observed
 	self.Store.Metrics.Mutations += 1
 	self:_EmitChange(path, newValue, oldValue)
 	return true
