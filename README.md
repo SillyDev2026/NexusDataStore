@@ -2,14 +2,14 @@
 
 **Typed, session-aware data persistence for Roblox.**
 
-![Version](https://img.shields.io/badge/NexusDataStore-7.0.8-2563eb)
+![Version](https://img.shields.io/badge/NexusDataStore-7.1.0-2563eb)
 ![Codec](https://img.shields.io/badge/Compression-2.3.4-0f766e)
 ![Luau](https://img.shields.io/badge/language-Luau-00a2ff)
 ![Platform](https://img.shields.io/badge/platform-Roblox-222222)
 
 NexusDataStore brings standard Roblox DataStore persistence, session ownership, typed player profiles, validation, migrations, snapshots, adaptive compression, and numeric leaderboards into one server-side library.
 
-**Current version:** `7.0.8` · **Compression:** `2.3.4` / codec `230` · **Record format:** `700`
+**Current version:** `7.1.0` · **Compression:** `2.3.4` / codec `230` · **Record format:** `700`
 
 > [!IMPORTANT]
 > This documentation describes the current source on `main`. Regression scripts are included, but production reliability and performance have not been certified by live-server load testing. Use a separate test universe before deploying changes to existing player data.
@@ -37,9 +37,9 @@ NexusDataStore brings standard Roblox DataStore persistence, session ownership, 
 
 ## Overview
 
-### Cleaner hot paths — v7.0.8
+### Efficiency and observability — v7.1.0
 
-This update refactors the in-memory mutation hot paths while preserving the public API, strict Luau profile types, record format `700`, and Compression `2.3.4` / codec `230`. It does not require a data migration.
+This release builds on path-level copy-on-write with three targeted improvements: optional zero-change suppression, duplicate-save coalescing, and opt-in performance diagnostics. It preserves the existing API, strict Luau profile types, record format `700`, and Compression `2.3.4` / codec `230`. No saved-data migration is required.
 
 - **Path-level copy-on-write:** `Set`, `Delete`, `Append`, `RemoveAt`, and multi-field `Patch` copy only affected table branches before validating and committing, rather than deep-cloning unrelated profile trees for each edit.
 - **Incremental direct-change baseline:** Controlled path mutations update their independent observation snapshot by path when possible. Whole-profile changes and uncertain paths retain the full-clone fallback.
@@ -49,6 +49,42 @@ This update refactors the in-memory mutation hot paths while preserving the publ
 - **One-million-call test harnesses:** `MillionLocalBenchmark.server.lua` and `MillionMockBackendBenchmark.server.lua` provide 1,000,000 iterations per selected case and show observed timings in Studio. They are not recorded benchmark results.
 
 > **Required verification:** The new regression and million-iteration scripts require Roblox Studio. No Luau runtime, actual one-million-call run, benchmark speedup, or live DataStore reliability result is claimed by these source changes. Run the relevant suites, compare before/after timings, and test real cross-server ownership before production rollout.
+
+### Why these features were chosen
+
+| Feature | Why it matters | Compatibility |
+| --- | --- | --- |
+| **Zero-change suppression** | Avoid unnecessary validation, profile copies and watcher dispatch when an operation would not change the value. | Set `SkipUnchangedMutations = true` to opt in; defaults to `false` to preserve existing watcher behavior. |
+| **Queued save coalescing** | If another save already persisted the same session while a request waited for the commit lock, the duplicate request can succeed without a second `UpdateAsync`. | Always enabled; never skips release or lock-renewal heartbeats. |
+| **Operation profiler** | Diagnose which work is expensive before optimizing or adjusting settings. | Set `ProfileOperations = true` to opt in; defaults to `false`. |
+| **Focused regression** | Explicitly checks no-op correctness, watcher behavior, coalesced writes, profiler reporting, and legacy defaults. | In `tests/EfficiencyRegression.server.lua`; requires Roblox Studio execution. |
+
+#### Recommended performance options
+
+~~~lua
+local Store = NexusDataStore.new({
+    Name = "PlayerData",
+    Template = PlayersData,
+    SkipUnchangedMutations = true,
+    ProfileOperations = true, -- enable temporarily to measure workloads
+    AutoSave = true,
+    BudgetAware = true,
+})
+~~~
+
+`SkipUnchangedMutations` skips unchanged `Set`, `Delete`, `Mutate`, and `Patch` calls. It preserves the current dirty flag and does not emit new mutation events for those no-ops. It still validates the **path structure**, so missing parent keys remain errors. `Increment`, `Toggle`, and `UpdatePath` naturally benefit when they delegate to `Set`. Actual changes still pass schema validation and the existing snapshot/commit logic.
+
+~~~lua
+local report = Store:GetPerformanceReport()
+print("Profiler enabled:", report.Enabled)
+print("No-op mutations avoided:", report.NoopMutations)
+print("Duplicate saves avoided:", report.SavesCoalesced)
+for operation, sample in pairs(report.Operations) do
+    print(operation, sample.Count, sample.AverageMs, sample.MaxMs, sample.Failures)
+end
+~~~
+
+The profiler currently records `MutationDraft` (validation, snapshot preparation and change dispatch) and `DataStoreCommit` (commit-lock wait and commit operation). Times are per-server measurements, not a distributed dashboard. The profiler is for development diagnostics; compare equivalent workloads before claiming speedups.
 
 ### Capabilities
 
@@ -738,7 +774,7 @@ Set `RemoveWhenNil = true` if a missing projected path should remove the corresp
 
 ## Configuration reference
 
-The following are the defaults in **v7.0.8**. Every option goes inside `NexusDataStore.new({...})` unless otherwise stated.
+The following are the defaults in **v7.1.0**. Every option goes inside `NexusDataStore.new({...})` unless otherwise stated.
 
 ### Store identity and data model
 
@@ -755,6 +791,7 @@ The following are the defaults in **v7.0.8**. Every option goes inside `NexusDat
 | `EnforceTemplateTypes` | `true` | Validate template-compatible shapes |
 | `ValidateOnWrite` | `true` | Validate controlled mutations |
 | `DetectDirectChanges` | `true` | Detect direct edits to `profile.Data` |
+| `SkipUnchangedMutations` | `false` | Opt-in suppression of identical controlled mutations and their events |
 | `KeyPrefix` | `""` | Prefix for standard-store keys |
 | `PlayerKey` | `nil` | Optional custom player-key function |
 
@@ -802,6 +839,7 @@ The following are the defaults in **v7.0.8**. Every option goes inside `NexusDat
 | `EnableCrossServerEvents` | `false` | Publish/subscribe optional MessagingService events |
 | `CrossServerTopic` | Derived | MessagingService topic |
 | `Debug` | `false` | Debug logging |
+| `ProfileOperations` | `false` | Opt-in per-server operation time/count profiling |
 
 The codec's `CompressionOptions` include `StringDictionary`, `DictionaryMinLength`, `DictionaryMinUses`, `DictionaryMaxEntries`, `DictionaryMaxCandidates`, `DeterministicMaps`, `MaxDepth`, `MaxNodes`, `PreallocateLimit`, and `AllowExpansion`. Tune only with representative profile benchmarks.
 
@@ -821,7 +859,7 @@ The codec's `CompressionOptions` include `StringDictionary`, `DictionaryMinLengt
 | `EncodeCompressed(data)` / `DecodeCompressed(buffer)` | Codec convenience methods |
 | `GetCompressionReport(dataOrProfile)` | Modeled compression report |
 | `GetOrderedStore(alias)` / `SyncOrderedAsync(profile, alias?)` / `SyncAllOrderedAsync(alias?)` | Leaderboard access/synchronization |
-| `GetMetrics()` / `GetHealth()` / `GetVersion()` | Operational diagnostics |
+| `GetMetrics()` / `GetHealth()` / `GetVersion()` / `GetPerformanceReport()` | Operational diagnostics and opt-in timing report |
 | `On(name, callback)` / `Once(name, callback)` | Event subscriptions |
 
 ### Profile methods
@@ -905,11 +943,11 @@ These are examples, not the complete error-code list. Check returned values and 
 
 ## Testing and troubleshooting
 
-The [`tests/` directory](./tests) contains Roblox Studio regression scripts for codec correctness, malformed payloads, copy-on-write isolation, compact locks, ambiguous acknowledgements, and load/close races. Place test Scripts with the required ModuleScripts as directed by their headers; do **not** run them against production player keys.
+The [`tests/` directory](./tests) contains Roblox Studio regression scripts for codec correctness, malformed payloads, copy-on-write isolation, **zero-change suppression, coalesced saves and profiling** (see [EfficiencyRegression.server.lua](./tests/EfficiencyRegression.server.lua)), compact locks, ambiguous acknowledgements, and load/close races. Place test Scripts with the required ModuleScripts as directed by their headers; do **not** run them against production player keys.
 
 ### One-million-iteration performance and correctness suites
 
-These scripts are **executable Studio test harnesses**, not benchmark results. For every selected case, the script attempts `1_000_000` iterations, checking each result and printing actual microseconds per iteration:
+These scripts are **executable Studio test harnesses**, not benchmark results. The new efficiency features have their own focused regression and must also be run in Studio. For every selected case, the script attempts `1_000_000` iterations, checking each result and printing actual microseconds per iteration:
 
 | Script | Coverage | Backend |
 | --- | --- | --- |
@@ -943,11 +981,11 @@ Suggested pre-release test matrix:
 | Release during in-flight load | Session is not silently stranded |
 | Schema is upgraded | Migration runs before validation |
 | Compressed payload is corrupted | Decoder reports failure, never resets data |
-| Normal and compact locks | v7.0.8 can read both |
+| Normal and compact locks | v7.1.0 can read both |
 | Leaderboard sync fails | Standard profile save and ordered error are handled separately |
 
 For DataStore fundamentals and limits, consult [Roblox Data Stores](https://create.roblox.com/docs/cloud-services/data-stores), [best practices](https://create.roblox.com/docs/cloud-services/data-stores/best-practices), and [error codes and limits](https://create.roblox.com/docs/cloud-services/data-stores/error-codes-and-limits).
 
 ---
 
-**Version 7.0.8** · [Source](./DataStore.lua) · [Compression](./Compression.lua) · [Tests](./tests)
+**Version 7.1.0** · [Source](./DataStore.lua) · [Compression](./Compression.lua) · [Tests](./tests)
