@@ -92,6 +92,7 @@ benchmark("Award", function()
 	local ok, value = profile:Award("Coins", 1)
 	return ok and value == old + 1
 end)
+if SUITE == "Spend" then assert(profile:Set("Coins", 2_000_000)) end
 benchmark("Spend", function()
 	local old = profile.Data.Coins
 	local ok, value = profile:Spend("Coins", 1)
