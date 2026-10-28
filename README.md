@@ -44,6 +44,7 @@ This update refactors the in-memory mutation hot paths while preserving the publ
 - **Path-level copy-on-write:** `Set`, `Delete`, `Append`, `RemoveAt`, and multi-field `Patch` copy only affected table branches before validating and committing, rather than deep-cloning unrelated profile trees for each edit.
 - **Incremental direct-change baseline:** Controlled path mutations update their independent observation snapshot by path when possible. Whole-profile changes and uncertain paths retain the full-clone fallback.
 - **Same data semantics:** Session locks, validation, migrations, compression, OrderedDataStore interfaces, snapshot ownership, and saved keys remain unchanged.
+- **Type checking:** The DataStore module now declares `--!strict` while retaining its `PlayersData.Data`, `Store<T>`, and `Session<T>` APIs. Run Roblox Studio Script Analysis; adding a directive does not constitute a completed analyzer run.
 - **Expanded regression suite:** `CopyOnWriteRegression.server.lua` checks nested paths, old-reference isolation, watchers, rollback, and full-record validation with direct-change detection enabled and disabled.
 - **One-million-call test harnesses:** `MillionLocalBenchmark.server.lua` and `MillionMockBackendBenchmark.server.lua` provide 1,000,000 iterations per selected case and show observed timings in Studio. They are not recorded benchmark results.
 
