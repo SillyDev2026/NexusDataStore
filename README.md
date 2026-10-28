@@ -2,14 +2,14 @@
 
 **Typed, session-aware data persistence for Roblox.**
 
-![Version](https://img.shields.io/badge/NexusDataStore-7.0.7-2563eb)
+![Version](https://img.shields.io/badge/NexusDataStore-7.0.8-2563eb)
 ![Codec](https://img.shields.io/badge/Compression-2.3.4-0f766e)
 ![Luau](https://img.shields.io/badge/language-Luau-00a2ff)
 ![Platform](https://img.shields.io/badge/platform-Roblox-222222)
 
 NexusDataStore brings standard Roblox DataStore persistence, session ownership, typed player profiles, validation, migrations, snapshots, adaptive compression, and numeric leaderboards into one server-side library.
 
-**Current version:** `7.0.7` · **Compression:** `2.3.4` / codec `230` · **Record format:** `700`
+**Current version:** `7.0.8` · **Compression:** `2.3.4` / codec `230` · **Record format:** `700`
 
 > [!IMPORTANT]
 > This documentation describes the current source on `main`. Regression scripts are included, but production reliability and performance have not been certified by live-server load testing. Use a separate test universe before deploying changes to existing player data.
@@ -37,16 +37,17 @@ NexusDataStore brings standard Roblox DataStore persistence, session ownership, 
 
 ## Overview
 
-### Reliability update — v7.0.7
+### Cleaner hot paths — v7.0.8
 
-This patch strengthens existing save and session behavior without changing record format `700`, compression codec `230`, or the OrderedDataStore interface.
+This update refactors the in-memory mutation hot paths while preserving the public API, strict Luau profile types, record format `700`, and Compression `2.3.4` / codec `230`. It does not require a data migration.
 
-- **Metadata preservation:** `UpdateAsync` commits now return existing Roblox key-associated user IDs and custom metadata when supplied by `DataStoreKeyInfo`, including lock acquisition, saves, retries, and release.
-- **Safer rollback:** `profile:Restore(snapshot)` only accepts snapshots still retained by that specific session; caller-modified snapshot tables cannot overwrite the internally retained snapshot. Rejected snapshots return `SNAPSHOT_NOT_OWNED`.
-- **Path and mutation validation:** Sparse/mixed path arrays are rejected. `Set` and `Delete` now return `INVALID_PATH` errors for malformed paths and refuse edits during session release.
-- **Regression expansion:** New Studio scripts cover metadata, snapshots, migrations, core profile methods, corruption guards, and numeric leaderboard operations alongside the existing codec and shutdown tests.
+- **Path-level copy-on-write:** `Set`, `Delete`, `Append`, `RemoveAt`, and multi-field `Patch` copy only affected table branches before validating and committing, rather than deep-cloning unrelated profile trees for each edit.
+- **Incremental direct-change baseline:** Controlled path mutations update their independent observation snapshot by path when possible. Whole-profile changes and uncertain paths retain the full-clone fallback.
+- **Same data semantics:** Session locks, validation, migrations, compression, OrderedDataStore interfaces, snapshot ownership, and saved keys remain unchanged.
+- **Expanded regression suite:** `CopyOnWriteRegression.server.lua` checks nested paths, old-reference isolation, watchers, rollback, and full-record validation with direct-change detection enabled and disabled.
+- **One-million-call test harnesses:** `MillionLocalBenchmark.server.lua` and `MillionMockBackendBenchmark.server.lua` provide 1,000,000 iterations per selected case and show observed timings in Studio. They are not recorded benchmark results.
 
-> These regression scripts require Roblox Studio. They have **not** been executed by this GitHub update, so use the test suite in a separate universe before deploying to production.
+> **Required verification:** The new regression and million-iteration scripts require Roblox Studio. No Luau runtime, actual one-million-call run, benchmark speedup, or live DataStore reliability result is claimed by these source changes. Run the relevant suites, compare before/after timings, and test real cross-server ownership before production rollout.
 
 ### Capabilities
 
@@ -736,7 +737,7 @@ Set `RemoveWhenNil = true` if a missing projected path should remove the corresp
 
 ## Configuration reference
 
-The following are the defaults in **v7.0.7**. Every option goes inside `NexusDataStore.new({...})` unless otherwise stated.
+The following are the defaults in **v7.0.8**. Every option goes inside `NexusDataStore.new({...})` unless otherwise stated.
 
 ### Store identity and data model
 
@@ -903,7 +904,31 @@ These are examples, not the complete error-code list. Check returned values and 
 
 ## Testing and troubleshooting
 
-The [`tests/` directory](./tests) contains Roblox Studio regression scripts for codec correctness, malformed payloads, compact locks, ambiguous acknowledgements, and load/close races. Place test Scripts with the required ModuleScripts as directed by their headers; do **not** run them against production player keys.
+The [`tests/` directory](./tests) contains Roblox Studio regression scripts for codec correctness, malformed payloads, copy-on-write isolation, compact locks, ambiguous acknowledgements, and load/close races. Place test Scripts with the required ModuleScripts as directed by their headers; do **not** run them against production player keys.
+
+### One-million-iteration performance and correctness suites
+
+These scripts are **executable Studio test harnesses**, not benchmark results. For every selected case, the script attempts `1_000_000` iterations, checking each result and printing actual microseconds per iteration:
+
+| Script | Coverage | Backend |
+| --- | --- | --- |
+| [MillionLocalBenchmark.server.lua](./tests/MillionLocalBenchmark.server.lua) | Profile reads/writes, counters, transactions, snapshots, validation, compression, watcher APIs | Fabricated in-memory session |
+| [MillionMockBackendBenchmark.server.lua](./tests/MillionMockBackendBenchmark.server.lua) | Open/release, persistence, OrderedDataStore reads, writes, ranking and synchronization | In-memory mocked DataStores |
+
+To run: create a server **Script** beside the `DataStore` and `Compression` ModuleScripts (with `PlayersData` under `DataStore`), copy one benchmark file into that Script, and run in Roblox Studio. At the top of the script, set:
+
+~~~lua
+local ITERATIONS = 1_000_000
+local BATCH_SIZE = 1000
+local SUITE = "Set" -- or "all"; backend suite uses names such as "OrderedGetAsync"
+~~~
+
+- Select an individual case first. Running `"all"` requests tens of millions of iterations and can be slow even with batches/yields.
+- The local `Append+RemoveAt` case calls **both** methods once per iteration and reports combined time.
+- CPU timings exclude batch yields, but include correctness assertions. Compare against the **same** profile shape, Studio/device and options on the previous release before claiming a speedup.
+- The mocked suite exercises actual library methods with fake backend instances. It does **not** issue one million Roblox DataStore requests, exercise cross-server contention, or establish real-world latency/budget safety.
+- Some lifecycle operations need live Player objects and real servers, and are **not** eligible for million-call local benchmarks. Test them with targeted integration scenarios instead.
+- Record measured counts, completion/errors, allocation behavior and CPU timings; only treat a suite as passed if its `PASS`/summary output appears without assertion errors.
 
 Suggested pre-release test matrix:
 
@@ -917,11 +942,11 @@ Suggested pre-release test matrix:
 | Release during in-flight load | Session is not silently stranded |
 | Schema is upgraded | Migration runs before validation |
 | Compressed payload is corrupted | Decoder reports failure, never resets data |
-| Normal and compact locks | v7.0.7 can read both |
+| Normal and compact locks | v7.0.8 can read both |
 | Leaderboard sync fails | Standard profile save and ordered error are handled separately |
 
 For DataStore fundamentals and limits, consult [Roblox Data Stores](https://create.roblox.com/docs/cloud-services/data-stores), [best practices](https://create.roblox.com/docs/cloud-services/data-stores/best-practices), and [error codes and limits](https://create.roblox.com/docs/cloud-services/data-stores/error-codes-and-limits).
 
 ---
 
-**Version 7.0.7** · [Source](./DataStore.lua) · [Compression](./Compression.lua) · [Tests](./tests)
+**Version 7.0.8** · [Source](./DataStore.lua) · [Compression](./Compression.lua) · [Tests](./tests)
