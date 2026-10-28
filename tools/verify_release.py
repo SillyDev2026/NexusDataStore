@@ -19,6 +19,12 @@ check("version defined", version is not None)
 check("README and source versions match", version is not None and ("**Current version:** `" + version + "`") in readme)
 check("README badge matches", version is not None and ("NexusDataStore-" + version + "-") in readme)
 check("strict Luau directive", data.startswith("--!strict\n"))
+local_declaration_pattern = re.compile(r"^[ \\t]*local[ \\t]+[A-Za-z_][A-Za-z0-9_]*(?:[ \\t]*,[ \\t]*[A-Za-z_][A-Za-z0-9_]*)*[ \\t]*(?::[^=\\n]+)?[ \\t]*=[ \\t]*$", re.MULTILINE)
+luau_files = [ROOT / "DataStore.lua", ROOT / "Compression.lua", *(ROOT / "tests").glob("*.lua")]
+split_locals = [str(path.relative_to(ROOT)) for path in luau_files if local_declaration_pattern.search(path.read_text(encoding="utf-8"))]
+check("Luau local assignments keep the RHS on the same line", len(split_locals) == 0)
+if split_locals:
+    print("Split local assignments found in:", ", ".join(split_locals))
 check("typed public API retained", "export type Data = PlayersData.Data" in data and "export type Store<T>" in data and "export type Session<T>" in data)
 check("record format compatible", "local RECORD_FORMAT = 700" in data)
 check("compression codec compatible", "Compression.CodecVersion = 230" in codec and 'return "2.3.4"' in codec)
