@@ -44,7 +44,7 @@ local function benchmark(name: string, callback: (number) -> boolean)
 		local lastIndex = math.min(ITERATIONS, startIndex + BATCH_SIZE - 1)
 		local started = os.clock()
 		for i = startIndex, lastIndex do
-			assert(callback(i), name .. " failed at iteration " .. tostring(i))
+			if not callback(i) then error(name .. " failed at iteration " .. tostring(i)) end
 		end
 		cpu += os.clock() - started
 		task.wait() -- Keep Studio responsive; waiting time is excluded.
