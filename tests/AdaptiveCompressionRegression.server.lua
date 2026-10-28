@@ -24,7 +24,7 @@ local function newStore(name: string, extra: {[string]: any}): any
 end
 local balanced = newStore("NexusBalancedRegression", {CompressionStrategy = "balanced"})
 local smallest = newStore("NexusSmallestRegression", {CompressionStrategy = "smallest"})
-assert(balanced:GetVersion() == "7.0.8")
+assert(balanced:GetVersion() == "7.1.0")
 assert(Compression.CodecVersion == 230 and Compression.Version() == "2.3.4")
 
 local lock = {JobId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", SessionId = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", HeartbeatAt = 1000, ExpiresAt = 1120}
@@ -77,4 +77,4 @@ local packet = Compression.CompressTablePacket(record)
 local restoredPacket = Compression.DecompressTable(packet)
 assert(restoredPacket.Lock.SessionId == lock.SessionId, "Existing codec cannot read legacy lock")
 for _, store in ipairs({balanced, smallest, compact, noCodec}) do assert(store:CloseAsync()) end
-print(("NexusDataStore v7.0.8 adaptive compression PASS: lock %d -> %d JSON bytes"):format(oldRawBytes, newRawBytes))
+print(("NexusDataStore v7.1.0 adaptive compression PASS: lock %d -> %d JSON bytes"):format(oldRawBytes, newRawBytes))

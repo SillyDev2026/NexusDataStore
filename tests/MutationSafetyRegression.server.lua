@@ -93,4 +93,4 @@ assert(profile.Data.Coins == 55, "Canceled UpdatePath should not mutate")
 profile.Active = false
 store:_UnregisterSession(profile)
 assert(store:CloseAsync())
-print("NexusDataStore v7.0.8 session mutation safety regression PASS")
+print("NexusDataStore v7.1.0 session mutation safety regression PASS")
