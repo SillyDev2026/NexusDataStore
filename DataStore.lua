@@ -82,6 +82,8 @@ export type StoreConfig<T> = {
 	EnforceTemplateTypes: boolean?,
 	ValidateOnWrite: boolean?,
 	DetectDirectChanges: boolean?,
+	SkipUnchangedMutations: boolean?,
+	ProfileOperations: boolean?,
 	Compression: boolean?,
 	CompressionModule: ModuleScript?,
 	CompressionOptions: CompressionOptions?,
@@ -229,6 +231,7 @@ export type Store<T> = {
 	SyncOrderedAsync: (self: Store<T>, session: Session<T>, alias: string?) -> (boolean, string?),
 	SyncAllOrderedAsync: (self: Store<T>, alias: string?) -> (boolean, string?),
 	GetMetrics: (self: Store<T>) -> {[string]: any},
+	GetPerformanceReport: (self: Store<T>) -> {[string]: any},
 	GetHealth: (self: Store<T>) -> {[string]: any},
 	AttachPlayerLifecycle: (self: Store<T>) -> (),
 	BindToClose: (self: Store<T>) -> (),
@@ -266,7 +269,7 @@ local EncodingService = game:GetService("EncodingService")
 
 local NexusDataStore: any = {}
 NexusDataStore.__index = NexusDataStore
-NexusDataStore.Version = "7.0.8"
+NexusDataStore.Version = "7.1.0"
 NexusDataStore.RecordFormat = 700
 NexusDataStore.RequiredCompressionVersion = "2.3.0"
 
@@ -1863,9 +1866,19 @@ function NexusDataStore:_Commit(session: any, release: boolean, reason: string):
 	local commitDeadline = commitStartedAt + self.Config.SaveTimeout
 	local locked, lockErr = self:_AcquireCommitLock(session, commitDeadline)
 	if not locked then
+		self:_RecordPerformance("DataStoreCommit", self.Config.ProfileOperations and commitStartedAt or nil, false)
 		return false, lockErr
 	end
 	local protectedOK, commitOK, commitErr = pcall(function()
+		-- A queued save may have been fully persisted by the earlier writer.
+		-- Recheck after acquiring the per-session lock to avoid a duplicate UpdateAsync.
+		if not release and reason ~= "heartbeat" and not session.Dirty then
+			self:_DetectDirectChanges(session)
+			if not session.Dirty then
+				self.Metrics.SavesCoalesced += 1
+				return true
+			end
+		end
 		local persistData = reason ~= "heartbeat"
 		local snapshot: any = nil
 		-- Heartbeats only renew ownership; they must not pay for a full direct-change
@@ -2009,6 +2022,7 @@ function NexusDataStore:_Commit(session: any, release: boolean, reason: string):
 		return true
 	end)
 	self:_ReleaseCommitLock(session)
+	self:_RecordPerformance("DataStoreCommit", self.Config.ProfileOperations and commitStartedAt or nil, protectedOK and commitOK == true)
 	if not protectedOK then
 		self.Metrics.SaveFailed += 1
 		return false, tostring(commitOK)
@@ -2321,6 +2335,30 @@ function NexusDataStore:CloseAsync(timeout: number?): (boolean, string?)
 	self.Closing = false
 	self:_Fire("Closed", firstError)
 	return firstError == nil, firstError
+end
+
+-- Optional timings are disabled by default to avoid clock reads on hot paths.
+function NexusDataStore:_RecordPerformance(operation: string, startedAt: number?, success: boolean)
+	if startedAt == nil then return end
+	local elapsedMs = math.max(0, (now() - startedAt) * 1000)
+	local entry = self.Performance[operation]
+	if not entry then
+		entry = {Count = 0, Failures = 0, TotalMs = 0, MaxMs = 0}
+		self.Performance[operation] = entry
+	end
+	entry.Count += 1
+	entry.TotalMs += elapsedMs
+	entry.MaxMs = math.max(entry.MaxMs, elapsedMs)
+	if not success then entry.Failures += 1 end
+end
+
+function NexusDataStore:GetPerformanceReport(): {[string]: any}
+	local operations = clone(self.Performance)
+	for _, entry in pairs(operations) do
+		entry.AverageMs = entry.Count > 0 and entry.TotalMs / entry.Count or 0
+	end
+	return {Enabled = self.Config.ProfileOperations, Operations = operations,
+		NoopMutations = self.Metrics.NoopMutations, SavesCoalesced = self.Metrics.SavesCoalesced}
 end
 
 function NexusDataStore:GetMetrics()
@@ -3361,6 +3399,8 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 	assert(config.CompressionTransport == nil or config.CompressionTransport == "auto" or config.CompressionTransport == "buffer" or config.CompressionTransport == "base64", "CompressionTransport must be auto, buffer, or base64")
 	assert(config.CompressionStrategy == nil or config.CompressionStrategy == "balanced" or config.CompressionStrategy == "smallest", "CompressionStrategy must be balanced or smallest")
 	assert(config.CompactSessionLocks == nil or typeof(config.CompactSessionLocks) == "boolean", "CompactSessionLocks must be a boolean")
+	assert(config.SkipUnchangedMutations == nil or typeof(config.SkipUnchangedMutations) == "boolean", "SkipUnchangedMutations must be a boolean")
+	assert(config.ProfileOperations == nil or typeof(config.ProfileOperations) == "boolean", "ProfileOperations must be a boolean")
 	assert(config.OrderedDataStores == nil or typeof(config.OrderedDataStores) == "table", "OrderedDataStores must be a table")
 	assert(config.PlayerKey == nil or typeof(config.PlayerKey) == "function", "PlayerKey must be a function")
 	assert(config.KeyPrefix == nil or typeof(config.KeyPrefix) == "string", "KeyPrefix must be a string")
@@ -3389,6 +3429,8 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 		EnforceTemplateTypes = config.EnforceTemplateTypes ~= false,
 		ValidateOnWrite = config.ValidateOnWrite ~= false,
 		DetectDirectChanges = config.DetectDirectChanges ~= false,
+		SkipUnchangedMutations = config.SkipUnchangedMutations == true,
+		ProfileOperations = config.ProfileOperations == true,
 		Compression = config.Compression ~= false,
 		CompressionModule = config.CompressionModule,
 		CompressionOptions = clone(config.CompressionOptions or {}),
@@ -3443,6 +3485,7 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 	self.OpenLocks = {}
 	self.OpenInFlight = 0
 	self.Events = {}
+	self.Performance = {}
 	self.OrderedStores = {}
 	self.Closed = false
 	self.Closing = false
@@ -3456,6 +3499,8 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 		SaveFailed = 0,
 		Retries = 0,
 		Mutations = 0,
+		NoopMutations = 0,
+		SavesCoalesced = 0,
 		Transactions = 0,
 		Rollbacks = 0,
 		Heartbeats = 0,
