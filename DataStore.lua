@@ -1003,7 +1003,7 @@ end
 
 function NexusDataStore:_Debug(...)
 	if self.Config.Debug then
-		print("[NexusDataStore v7.0.2]", ...)
+		print("[NexusDataStore v" .. NexusDataStore.Version .. "]", ...)
 	end
 end
 
