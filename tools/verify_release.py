@@ -19,6 +19,12 @@ check("version defined", version is not None)
 check("README and source versions match", version is not None and ("**Current version:** `" + version + "`") in readme)
 check("README badge matches", version is not None and ("NexusDataStore-" + version + "-") in readme)
 check("strict Luau directive", data.startswith("--!strict\n"))
+local_declaration_pattern = re.compile(r"^[ \t]*local[ \t]+[^=\n]+=[ \t]*$", re.MULTILINE)
+luau_files = [ROOT / "DataStore.lua", ROOT / "Compression.lua", *(ROOT / "tests").glob("*.lua")]
+split_locals = [str(path.relative_to(ROOT)) for path in luau_files if local_declaration_pattern.search(path.read_text(encoding="utf-8"))]
+check("Luau local assignments keep the RHS on the same line", len(split_locals) == 0)
+if split_locals:
+    print("Split local assignments found in:", ", ".join(split_locals))
 check("typed public API retained", "export type Data = PlayersData.Data" in data and "export type Store<T>" in data and "export type Session<T>" in data)
 check("record format compatible", "local RECORD_FORMAT = 700" in data)
 check("compression codec compatible", "Compression.CodecVersion = 230" in codec and 'return "2.3.4"' in codec)
@@ -33,9 +39,11 @@ methods = [
     "NexusDataStore:SaveAsync", "NexusDataStore:ReleaseAsync",
     "NexusDataStore:_Commit", "NexusDataStore:GetMetrics",
     "NexusDataStore:GetPerformanceReport", "NexusDataStore:GetHealth",
+    "NexusDataStore:PreviewMigration", "NexusDataStore:GetStorageForecast",
     "Session:Get", "Session:Set", "Session:Delete", "Session:Patch",
     "Session:Mutate", "Session:Append", "Session:RemoveAt",
     "Session:Snapshot", "Session:Restore", "Session:SaveAsync",
+    "Session:GetChangeJournal", "Session:ClearChangeJournal",
     "Session:ReleaseAsync", "OrderedStore:GetAsync",
     "OrderedStore:SetAsync", "OrderedStore:UpdateAsync",
     "OrderedStore:GetTopAsync", "OrderedStore:GetRankAsync",
@@ -46,9 +54,12 @@ check("critical APIs have unique definitions", all(
 ))
 check("README reference retained", "## Configuration reference" in readme and "## API reference" in readme)
 check("new features documented", "GetPerformanceReport()" in readme and "SkipUnchangedMutations" in readme)
+check("v7.2 tool documentation present", "PreviewMigration(data, fromVersion" in readme and "GetStorageForecast(dataOrSession" in readme and "ChangeJournalLimit" in readme)
+check("bounded journal defaults off", "ChangeJournalLimit = configNumber(config.ChangeJournalLimit, 0, 0" in data)
 test_dir = ROOT / "tests"
 required = (
     "EfficiencyRegression.server.lua", "CopyOnWriteRegression.server.lua",
+    "DeveloperToolsRegression.server.lua",
     "MutationSafetyRegression.server.lua", "PersistenceRecoveryRegression.server.lua",
     "SchemaMigrationRegression.server.lua", "CompressionRegression.server.lua",
     "MillionLocalBenchmark.server.lua", "MillionMockBackendBenchmark.server.lua",

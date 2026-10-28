@@ -2,14 +2,14 @@
 
 **Typed, session-aware data persistence for Roblox.**
 
-![Version](https://img.shields.io/badge/NexusDataStore-7.1.0-2563eb)
+![Version](https://img.shields.io/badge/NexusDataStore-7.2.0-2563eb)
 ![Codec](https://img.shields.io/badge/Compression-2.3.4-0f766e)
 ![Luau](https://img.shields.io/badge/language-Luau-00a2ff)
 ![Platform](https://img.shields.io/badge/platform-Roblox-222222)
 
 NexusDataStore brings standard Roblox DataStore persistence, session ownership, typed player profiles, validation, migrations, snapshots, adaptive compression, and numeric leaderboards into one server-side library.
 
-**Current version:** `7.1.0` · **Compression:** `2.3.4` / codec `230` · **Record format:** `700`
+**Current version:** `7.2.0` · **Compression:** `2.3.4` / codec `230` · **Record format:** `700`
 
 > [!IMPORTANT]
 > This documentation describes the current source on `main`. Regression scripts are included, but production reliability and performance have not been certified by live-server load testing. Use a separate test universe before deploying changes to existing player data.
@@ -37,9 +37,9 @@ NexusDataStore brings standard Roblox DataStore persistence, session ownership, 
 
 ## Overview
 
-### Efficiency and observability — v7.1.0
+### Developer tooling and clean Luau — v7.2.0
 
-This release builds on path-level copy-on-write with three targeted improvements: optional zero-change suppression, duplicate-save coalescing, and opt-in performance diagnostics. It preserves the existing API, strict Luau profile types, record format `700`, and Compression `2.3.4` / codec `230`. No saved-data migration is required.
+This release adds three developer-facing safety features and a consistent source style while preserving the existing API, strict Luau profile types, record format `700`, and Compression `2.3.4` / codec `230`. No saved-data migration is required. Existing v7.1 optimizations remain available.
 
 - **Path-level copy-on-write:** `Set`, `Delete`, `Append`, `RemoveAt`, and multi-field `Patch` copy only affected table branches before validating and committing, rather than deep-cloning unrelated profile trees for each edit.
 - **Incremental direct-change baseline:** Controlled path mutations update their independent observation snapshot by path when possible. Whole-profile changes and uncertain paths retain the full-clone fallback.
@@ -49,6 +49,66 @@ This release builds on path-level copy-on-write with three targeted improvements
 - **One-million-call test harnesses:** `MillionLocalBenchmark.server.lua` and `MillionMockBackendBenchmark.server.lua` provide 1,000,000 iterations per selected case and show observed timings in Studio. They are not recorded benchmark results.
 
 > **Required verification:** The new regression and million-iteration scripts require Roblox Studio. No Luau runtime, actual one-million-call run, benchmark speedup, or live DataStore reliability result is claimed by these source changes. Run the relevant suites, compare before/after timings, and test real cross-server ownership before production rollout.
+
+### New v7.2.0 features
+
+| Feature | Benefit | Persistence impact |
+| --- | --- | --- |
+| **Migration preview** | Inspect schema migrations and reconciled data before deploying; includes a field-level diff and full schema validation. | None; only operates on a clone in memory. |
+| **Storage forecast** | Estimate the current record's encoded storage size, capacity usage, warning threshold, transport, and remaining space. | None; encodes locally without writing to Roblox DataStore. |
+| **Bounded change journal** | Keep the last N committed mutation paths and timestamps to debug unexpected updates. | None; the journal is memory-only and disabled by default. |
+| **Consistent Luau style** | Keep local assignments on one line, preserve strict typing, standardize indentation, and run a formatting guard in CI. | No record-format changes. |
+
+### Developer tool API examples
+
+**Preview a migration** without loading, locking, or saving a player key:
+
+~~~lua
+local preview, err = Store:PreviewMigration(oldData, 1, "ExampleKey")
+if preview then
+    print("Upgraded schema:", preview.ToVersion)
+    print("Changes:", #preview.Changes)
+    -- preview.Data is an independent table; only store it after review.
+else
+    warn("Migration failed:", err)
+end
+~~~
+
+Migration callbacks are invoked by the preview; they should be deterministic and must not independently perform remote writes or irreversible side effects. Failure returns an error instead of replacing saved data.
+
+**Check size before a large update:**
+
+~~~lua
+local forecast, err = Store:GetStorageForecast(profile, 0.8)
+if forecast then
+    print("Stored bytes:", forecast.StorageBytes)
+    print("Remaining bytes:", forecast.RemainingBytes)
+    print("Capacity ratio:", forecast.Utilization)
+    if forecast.NearLimit then warn("Profile is approaching its size limit") end
+else
+    warn("Storage estimate failed:", err)
+end
+~~~
+
+The forecast uses the record encoding selection, with an estimated session lock where applicable. It does not predict Roblox request budgets or actual network latency.
+
+**Capture a bounded local mutation audit:**
+
+~~~lua
+local Store = NexusDataStore.new({
+    Name = "PlayerData",
+    Template = PlayersData,
+    ChangeJournalLimit = 50,
+})
+
+local entries = profile:GetChangeJournal(10)
+for _, entry in ipairs(entries) do
+    print(entry.MutationId, entry.At, entry.Path)
+end
+profile:ClearChangeJournal()
+~~~
+
+Entries contain timestamps, mutation IDs, and changed paths (not full values, credentials, or player snapshots). Whole-profile operations use a `nil` path. Journals expire when the session ends, do not persist across servers, and are limited to `0–1000` entries per session.
 
 ### Why these features were chosen
 
@@ -774,7 +834,7 @@ Set `RemoveWhenNil = true` if a missing projected path should remove the corresp
 
 ## Configuration reference
 
-The following are the defaults in **v7.1.0**. Every option goes inside `NexusDataStore.new({...})` unless otherwise stated.
+The following are the defaults in **v7.2.0**. Every option goes inside `NexusDataStore.new({...})` unless otherwise stated.
 
 ### Store identity and data model
 
@@ -791,6 +851,7 @@ The following are the defaults in **v7.1.0**. Every option goes inside `NexusDat
 | `EnforceTemplateTypes` | `true` | Validate template-compatible shapes |
 | `ValidateOnWrite` | `true` | Validate controlled mutations |
 | `DetectDirectChanges` | `true` | Detect direct edits to `profile.Data` |
+| `ChangeJournalLimit` | `0` | Keep up to 1000 recent in-memory mutation summaries; 0 disables the journal |
 | `SkipUnchangedMutations` | `false` | Opt-in suppression of identical controlled mutations and their events |
 | `KeyPrefix` | `""` | Prefix for standard-store keys |
 | `PlayerKey` | `nil` | Optional custom player-key function |
@@ -856,6 +917,8 @@ The codec's `CompressionOptions` include `StringDictionary`, `DictionaryMinLengt
 | `FlushAsync(timeout?)` / `ReleaseAllAsync()` / `CloseAsync(timeout?)` | Bulk persistence and shutdown |
 | `AttachPlayerLifecycle()` / `BindToClose()` | Player events and server shutdown |
 | `Validate(data)` / `GetTemplate()` / `GetSchema()` | Data validation and schema |
+| `PreviewMigration(data, fromVersion, key?)` | Non-persisting migration and reconcile preview with diff |
+| `GetStorageForecast(dataOrSession, warningRatio?)` | Current-format stored-byte estimate and limit warnings |
 | `EncodeCompressed(data)` / `DecodeCompressed(buffer)` | Codec convenience methods |
 | `GetCompressionReport(dataOrProfile)` | Modeled compression report |
 | `GetOrderedStore(alias)` / `SyncOrderedAsync(profile, alias?)` / `SyncAllOrderedAsync(alias?)` | Leaderboard access/synchronization |
@@ -870,7 +933,7 @@ The codec's `CompressionOptions` include `StringDictionary`, `DictionaryMinLengt
 | Write | `Set`, `Delete`, `Patch`, `UpdatePath`, `Mutate` |
 | Counters | `Increment`, `IncrementClamped`, `Award`, `Spend` |
 | Containers | `Append`, `RemoveAt`, `Toggle` |
-| History | `Snapshot`, `Restore`, `DiffFromPersisted` |
+| History | `Snapshot`, `Restore`, `DiffFromPersisted`, `GetChangeJournal`, `ClearChangeJournal` |
 | Observability | `Watch`, `GetStatus`, `GetStats`, `IsDirty`, `IsActive` |
 | Persistence | `SaveAsync`, `ReleaseAsync` |
 
@@ -909,7 +972,7 @@ print("Library version:", health.Version)
 print("Compression engine:", health.CompressionVersion)
 ~~~
 
-Metrics describe this **server process** and are not a permanent analytics warehouse.
+Metrics describe this **server process** and are not a permanent analytics warehouse. `ChangeJournalLimit` stores debug summaries in server memory only and does not affect record encoding or the persistent data schema.
 
 ### What to do with an error
 
@@ -943,7 +1006,7 @@ These are examples, not the complete error-code list. Check returned values and 
 
 ## Testing and troubleshooting
 
-The [`tests/` directory](./tests) contains Roblox Studio regression scripts for codec correctness, malformed payloads, copy-on-write isolation, **zero-change suppression, coalesced saves and profiling** (see [EfficiencyRegression.server.lua](./tests/EfficiencyRegression.server.lua)), compact locks, ambiguous acknowledgements, and load/close races. Place test Scripts with the required ModuleScripts as directed by their headers; do **not** run them against production player keys.
+The [`tests/` directory](./tests) contains [DeveloperToolsRegression.server.lua](./tests/DeveloperToolsRegression.server.lua) for migration previews, storage forecasts, and bounded journals, plus Roblox Studio regression scripts for codec correctness, malformed payloads, copy-on-write isolation, **zero-change suppression, coalesced saves and profiling** (see [EfficiencyRegression.server.lua](./tests/EfficiencyRegression.server.lua)), compact locks, ambiguous acknowledgements, and load/close races. Place test Scripts with the required ModuleScripts as directed by their headers; do **not** run them against production player keys.
 
 ### One-million-iteration performance and correctness suites
 
@@ -981,11 +1044,11 @@ Suggested pre-release test matrix:
 | Release during in-flight load | Session is not silently stranded |
 | Schema is upgraded | Migration runs before validation |
 | Compressed payload is corrupted | Decoder reports failure, never resets data |
-| Normal and compact locks | v7.1.0 can read both |
+| Normal and compact locks | v7.2.0 can read both |
 | Leaderboard sync fails | Standard profile save and ordered error are handled separately |
 
 For DataStore fundamentals and limits, consult [Roblox Data Stores](https://create.roblox.com/docs/cloud-services/data-stores), [best practices](https://create.roblox.com/docs/cloud-services/data-stores/best-practices), and [error codes and limits](https://create.roblox.com/docs/cloud-services/data-stores/error-codes-and-limits).
 
 ---
 
-**Version 7.1.0** · [Source](./DataStore.lua) · [Compression](./Compression.lua) · [Tests](./tests)
+**Version 7.2.0** · [Source](./DataStore.lua) · [Compression](./Compression.lua) · [Tests](./tests)

@@ -22,7 +22,7 @@ local store: any = DataStore.new({
 		Score = {Name = "NexusMillionOrderedMock", Path = "Coins", Mode = "set", AutoSync = false, Integer = true},
 	},
 })
-assert(store:GetVersion() == "7.1.0")
+assert(store:GetVersion() == "7.2.0")
 local records: {[string]: any} = {}
 store.DataStore = {
 	UpdateAsync = function(_self, key: string, transform)
@@ -107,7 +107,7 @@ benchmark("FlushAsync", function()
 end)
 benchmark("GetHealth", function()
 	local health = store:GetHealth()
-	return health.Version == "7.1.0"
+	return health.Version == "7.2.0"
 end)
 benchmark("GetOrderedStore", function()
 	return store:GetOrderedStore("Score") == ordered

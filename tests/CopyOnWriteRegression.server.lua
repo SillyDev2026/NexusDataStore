@@ -1,5 +1,5 @@
 --!strict
--- In-memory regression for v7.1.0 path-level copy-on-write.
+-- In-memory regression for v7.2.0 path-level copy-on-write.
 -- Place beside DataStore ModuleScript (with PlayersData child); NO live DataStore calls.
 local DataStore = require(script.Parent:WaitForChild("DataStore"))
 
@@ -26,7 +26,7 @@ end
 
 for _, direct in ipairs({true, false}) do
 	local store, profile = createFixture(direct)
-	assert(store:GetVersion() == "7.1.0")
+	assert(store:GetVersion() == "7.2.0")
 	local initial = profile.Data
 	local initialBranch = initial.Nested.Branch
 	local initialOther = initial.Nested.Other
@@ -107,4 +107,4 @@ for _, direct in ipairs({true, false}) do
 	assert(store:CloseAsync(), "Fixture did not close")
 end
 
-print("NexusDataStore v7.1.0 copy-on-write correctness regression PASS (direct-change tracking on/off)")
+print("NexusDataStore v7.2.0 copy-on-write correctness regression PASS (direct-change tracking on/off)")
