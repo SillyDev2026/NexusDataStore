@@ -2998,30 +2998,26 @@ end
 
 -- Replaces one value through the validated copy-on-write mutation path.
 function Session:Set(path: Path, value: any): (boolean, string?)
-	if not self:IsActive() then
-		return false, "SESSION_INACTIVE"
-	end
-	local keys = normalizePath(path)
+	local mutable, mutableErr = self:_CanMutate()
+	if not mutable then return false, mutableErr end
+	local validPath, keys = pcall(normalizePath, path)
+	if not validPath then return false, "INVALID_PATH:" .. tostring(keys) end
 	local draft = clone(self.Data)
 	local oldValue = clone(getAt(draft, keys))
-	local ok, err = setAt(draft, keys, clone(value))
-	if not ok then
-		return false, err
-	end
+	local changed, err = setAt(draft, keys, clone(value))
+	if not changed then return false, err end
 	return self:_CommitDraft(draft, keys, oldValue, clone(value))
 end
 
 function Session:Delete(path: Path): (boolean, string?)
-	if not self:IsActive() then
-		return false, "SESSION_INACTIVE"
-	end
-	local keys = normalizePath(path)
+	local mutable, mutableErr = self:_CanMutate()
+	if not mutable then return false, mutableErr end
+	local validPath, keys = pcall(normalizePath, path)
+	if not validPath then return false, "INVALID_PATH:" .. tostring(keys) end
 	local draft = clone(self.Data)
 	local oldValue = clone(getAt(draft, keys))
-	local ok, err = deleteAt(draft, keys)
-	if not ok then
-		return false, err
-	end
+	local removed, err = deleteAt(draft, keys)
+	if not removed then return false, err end
 	return self:_CommitDraft(draft, keys, oldValue, nil)
 end
 
