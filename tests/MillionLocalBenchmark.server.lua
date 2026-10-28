@@ -1,5 +1,5 @@
 --!strict
--- NexusDataStore v7.0.8: ONE MILLION iterations per selected in-memory function.
+-- NexusDataStore v7.1.0: ONE MILLION iterations per selected in-memory function.
 -- Roblox Studio SERVER Script, placed beside DataStore and Compression ModuleScripts.
 -- Requires DataStore.PlayersData. Does NOT call the live DataStore service.
 --
@@ -27,7 +27,7 @@ local store: any = DataStore.new({
 	ValidateOnWrite = true,
 	MaxSnapshots = 1,
 })
-assert(store:GetVersion() == "7.0.8", "Benchmark targets the wrong library version")
+assert(store:GetVersion() == "7.1.0", "Benchmark targets the wrong library version")
 local record = store:_BuildNewRecord(store:GetTemplate())
 local profile: any = store:_CreateSession("local", record, "local-session", {})
 local packet = store:EncodeCompressed(store:GetTemplate())
@@ -63,7 +63,7 @@ benchmark("IsDirty", function() return typeof(profile:IsDirty()) == "boolean" en
 benchmark("GetStatus", function() return profile:GetStatus().Active == true end)
 benchmark("GetSession", function() return store:GetSession("local") == profile end)
 benchmark("WaitForSession", function() return store:WaitForSession("local", 0) == profile end)
-benchmark("GetVersion", function() return store:GetVersion() == "7.0.8" end)
+benchmark("GetVersion", function() return store:GetVersion() == "7.1.0" end)
 benchmark("GetTemplate", function() return typeof(store:GetTemplate().Coins) == "number" end)
 benchmark("GetSchema", function() return store:GetSchema() == nil end)
 benchmark("Validate", function() return store:Validate(profile.Data) == true end)
