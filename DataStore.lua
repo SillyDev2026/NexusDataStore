@@ -1,3 +1,4 @@
+--!strict
 --!native
 --!optimize 2
 
@@ -265,7 +266,7 @@ local EncodingService = game:GetService("EncodingService")
 
 local NexusDataStore: any = {}
 NexusDataStore.__index = NexusDataStore
-NexusDataStore.Version = "7.0.7"
+NexusDataStore.Version = "7.0.8"
 NexusDataStore.RecordFormat = 700
 NexusDataStore.RequiredCompressionVersion = "2.3.0"
 
@@ -442,42 +443,27 @@ local function getAt(root: any, path: Path): any
 	return cursor
 end
 
-local function setAt(root: any, path: Path, value: any): (boolean, string?)
-	local keys = normalizePath(path)
-	local cursor = root
+-- Copy only the tables along a mutated path. The live profile remains untouched
+-- until _CommitDraft validates and swaps the candidate into the session.
+-- This avoids deep-copying unrelated inventory and progression trees on each edit.
+local function draftAt(root: any, keys: {PathKey}): (any?, any?, any?, string?)
+	local draft = table.clone(root)
+	local parent: any = draft
+	local source: any = root
 	for index = 1, #keys - 1 do
-		local key = keys[index]
-		if typeof(cursor) ~= "table" then
-			return false, "PATH_PARENT_NOT_TABLE:" .. pathDisplay(keys)
+		local child = source[keys[index]]
+		if child == nil then
+			return nil, nil, nil, "PATH_PARENT_MISSING:" .. pathDisplay(keys)
 		end
-		local nextValue = cursor[key]
-		if nextValue == nil then
-			return false, "PATH_PARENT_MISSING:" .. pathDisplay(keys)
+		if typeof(child) ~= "table" then
+			return nil, nil, nil, "PATH_PARENT_NOT_TABLE:" .. pathDisplay(keys)
 		end
-		if typeof(nextValue) ~= "table" then
-			return false, "PATH_PARENT_NOT_TABLE:" .. pathDisplay(keys)
-		end
-		cursor = nextValue
+		local copy = table.clone(child)
+		parent[keys[index]] = copy
+		parent = copy
+		source = child
 	end
-	if typeof(cursor) ~= "table" then
-		return false, "PATH_PARENT_NOT_TABLE:" .. pathDisplay(keys)
-	end
-	cursor[keys[#keys]] = value
-	return true
-end
-
-local function deleteAt(root: any, path: Path): (boolean, string?)
-	local keys = normalizePath(path)
-	local cursor = root
-	for index = 1, #keys - 1 do
-		local nextValue = cursor[keys[index]]
-		if typeof(nextValue) ~= "table" then
-			return false, "PATH_PARENT_MISSING:" .. pathDisplay(keys)
-		end
-		cursor = nextValue
-	end
-	cursor[keys[#keys]] = nil
-	return true
+	return draft, parent, source[keys[#keys]], nil
 end
 
 local function normalizeDataKey(key: string | number, prefix: string): string
@@ -2967,14 +2953,31 @@ function Session:_CommitDraft(draft: any, path: {PathKey}?, oldValue: any, newVa
 	end
 	if self.Store.Config.ValidateOnWrite then
 		local valid, err = self.Store:Validate(draft)
-		if not valid then
-			return false, "VALIDATION_FAILED:" .. tostring(err)
-		end
+		if not valid then return false, "VALIDATION_FAILED:" .. tostring(err) end
 	end
+	-- Incrementally update the independent direct-change baseline for a known
+	-- path instead of cloning every unrelated inventory/map on each mutation.
+	-- For whole-profile transactions, or a stale/missing parent, clone fully.
+	local observed: any = nil
+	if self.Store.Config.DetectDirectChanges then
+		local cloned, value = pcall(function()
+			if path ~= nil and self.ObservedSnapshot ~= nil then
+				local tracked, parent = draftAt(self.ObservedSnapshot, path)
+				if tracked ~= nil then
+					parent[path[#path]] = clone(newValue)
+					return tracked
+				end
+			end
+			return clone(draft)
+		end)
+		if not cloned then return false, "INVALID_OBSERVED_SNAPSHOT:" .. tostring(value) end
+		observed = value
+	end
+	-- Nothing observable changes until all validation and snapshot work succeeds.
 	self.Data = draft
 	self.Dirty = true
 	self.MutationId += 1
-	self.ObservedSnapshot = self.Store.Config.DetectDirectChanges and clone(draft) or nil
+	self.ObservedSnapshot = observed
 	self.Store.Metrics.Mutations += 1
 	self:_EmitChange(path, newValue, oldValue)
 	return true
@@ -3000,25 +3003,24 @@ end
 function Session:Set(path: Path, value: any): (boolean, string?)
 	local mutable, mutableErr = self:_CanMutate()
 	if not mutable then return false, mutableErr end
-	local validPath, keys = pcall(normalizePath, path)
-	if not validPath then return false, "INVALID_PATH:" .. tostring(keys) end
-	local draft = clone(self.Data)
-	local oldValue = clone(getAt(draft, keys))
-	local changed, err = setAt(draft, keys, clone(value))
-	if not changed then return false, err end
-	return self:_CommitDraft(draft, keys, oldValue, clone(value))
+	local valid, keys = pcall(normalizePath, path)
+	if not valid then return false, "INVALID_PATH:" .. tostring(keys) end
+	local draft, parent, previous, err = draftAt(self.Data, keys)
+	if draft == nil then return false, err end
+	local nextValue = clone(value)
+	parent[keys[#keys]] = nextValue
+	return self:_CommitDraft(draft, keys, previous, nextValue)
 end
 
 function Session:Delete(path: Path): (boolean, string?)
 	local mutable, mutableErr = self:_CanMutate()
 	if not mutable then return false, mutableErr end
-	local validPath, keys = pcall(normalizePath, path)
-	if not validPath then return false, "INVALID_PATH:" .. tostring(keys) end
-	local draft = clone(self.Data)
-	local oldValue = clone(getAt(draft, keys))
-	local removed, err = deleteAt(draft, keys)
-	if not removed then return false, err end
-	return self:_CommitDraft(draft, keys, oldValue, nil)
+	local valid, keys = pcall(normalizePath, path)
+	if not valid then return false, "INVALID_PATH:" .. tostring(keys) end
+	local draft, parent, previous, err = draftAt(self.Data, keys)
+	if draft == nil then return false, err end
+	parent[keys[#keys]] = nil
+	return self:_CommitDraft(draft, keys, previous, nil)
 end
 
 function Session:Increment(path: Path, amount: number?): (boolean, any)
@@ -3081,45 +3083,41 @@ function Session:Toggle(path: Path): (boolean, any)
 end
 
 function Session:Append(path: Path, value: any): (boolean, any)
-	if value == nil then
-		return false, "INVALID_APPEND_VALUE"
-	end
-	local current = getAt(self.Data, path)
-	if typeof(current) ~= "table" then
-		return false, "NOT_ARRAY"
-	end
+	if value == nil then return false, "INVALID_APPEND_VALUE" end
+	local mutable, mutableErr = self:_CanMutate()
+	if not mutable then return false, mutableErr end
+	local valid, keys = pcall(normalizePath, path)
+	if not valid then return false, "INVALID_PATH:" .. tostring(keys) end
+	local current = getAt(self.Data, keys)
+	if typeof(current) ~= "table" then return false, "NOT_ARRAY" end
 	local isArray = inspectTable(current)
-	if not isArray then
-		return false, "NOT_ARRAY"
-	end
-	local draft = clone(self.Data)
-	local target = getAt(draft, path)
-	table.insert(target, clone(value))
-	local keys = normalizePath(path)
-	local ok, err = self:_CommitDraft(draft, keys, clone(current), clone(target))
-	return ok, ok and #target or err
+	if not isArray then return false, "NOT_ARRAY" end
+	local draft, parent, _, err = draftAt(self.Data, keys)
+	if draft == nil then return false, err end
+	local nextArray = table.clone(current)
+	table.insert(nextArray, clone(value))
+	parent[keys[#keys]] = nextArray
+	local ok, commitErr = self:_CommitDraft(draft, keys, current, nextArray)
+	return ok, ok and #nextArray or commitErr
 end
 
 function Session:RemoveAt(path: Path, index: number): (boolean, any)
-	if not safeInteger(index) or index < 1 then
-		return false, "INVALID_INDEX"
-	end
-	local current = getAt(self.Data, path)
-	if typeof(current) ~= "table" then
-		return false, "NOT_ARRAY"
-	end
+	if not safeInteger(index) or index < 1 then return false, "INVALID_INDEX" end
+	local mutable, mutableErr = self:_CanMutate()
+	if not mutable then return false, mutableErr end
+	local valid, keys = pcall(normalizePath, path)
+	if not valid then return false, "INVALID_PATH:" .. tostring(keys) end
+	local current = getAt(self.Data, keys)
+	if typeof(current) ~= "table" then return false, "NOT_ARRAY" end
 	local isArray, count = inspectTable(current)
-	if not isArray or index > count then
-		return false, "INDEX_OUT_OF_RANGE"
-	end
-	local draft = clone(self.Data)
-	local target = getAt(draft, path)
-	local removed = table.remove(target, index)
-	local keys = normalizePath(path)
-	local ok, err = self:_CommitDraft(draft, keys, clone(current), clone(target))
-	if not ok then
-		return false, err
-	end
+	if not isArray or index > count then return false, "INDEX_OUT_OF_RANGE" end
+	local draft, parent, _, err = draftAt(self.Data, keys)
+	if draft == nil then return false, err end
+	local nextArray = table.clone(current)
+	local removed = table.remove(nextArray, index)
+	parent[keys[#keys]] = nextArray
+	local ok, commitErr = self:_CommitDraft(draft, keys, current, nextArray)
+	if not ok then return false, commitErr end
 	return true, clone(removed)
 end
 
@@ -3212,34 +3210,22 @@ end
 -- Applies multiple path changes as one validated mutation.
 function Session:Patch(changes: {{Path: Path, Value: any}}): (boolean, string?)
 	local mutable, mutableErr = self:_CanMutate()
-	if not mutable then
-		return false, mutableErr
-	end
-	if typeof(changes) ~= "table" then
-		return false, "PATCH_TABLE_REQUIRED"
-	end
+	if not mutable then return false, mutableErr end
+	if typeof(changes) ~= "table" then return false, "PATCH_TABLE_REQUIRED" end
 	local isArray, count = inspectTable(changes)
-	if not isArray then
-		return false, "PATCH_MUST_BE_DENSE_ARRAY"
-	end
-	if count == 0 then
-		return true
-	end
-	local draft = clone(self.Data)
+	if not isArray then return false, "PATCH_MUST_BE_DENSE_ARRAY" end
+	if count == 0 then return true end
+	local draft: any = self.Data
 	for _, patch in ipairs(changes) do
-		if typeof(patch) ~= "table" or patch.Path == nil then
-			return false, "INVALID_PATCH"
-		end
-		local called, ok, err = pcall(setAt, draft, patch.Path, clone(patch.Value))
-		if not called then
-			return false, "INVALID_PATCH_PATH:" .. tostring(ok)
-		end
-		if not ok then
-			return false, err
-		end
+		if typeof(patch) ~= "table" or patch.Path == nil then return false, "INVALID_PATCH" end
+		local valid, keys = pcall(normalizePath, patch.Path)
+		if not valid then return false, "INVALID_PATCH_PATH:" .. tostring(keys) end
+		local nextDraft, parent, _, err = draftAt(draft, keys)
+		if nextDraft == nil then return false, err end
+		parent[keys[#keys]] = clone(patch.Value)
+		draft = nextDraft
 	end
-	local before = self.Data
-	return self:_CommitDraft(draft, nil, before, draft)
+	return self:_CommitDraft(draft, nil, self.Data, draft)
 end
 
 function Session:Watch(path: Path?, callback)
