@@ -19,7 +19,7 @@ check("version defined", version is not None)
 check("README and source versions match", version is not None and ("**Current version:** `" + version + "`") in readme)
 check("README badge matches", version is not None and ("NexusDataStore-" + version + "-") in readme)
 check("strict Luau directive", data.startswith("--!strict\n"))
-local_declaration_pattern = re.compile(r"^[ \\t]*local[ \\t]+[A-Za-z_][A-Za-z0-9_]*(?:[ \\t]*,[ \\t]*[A-Za-z_][A-Za-z0-9_]*)*[ \\t]*(?::[^=\\n]+)?[ \\t]*=[ \\t]*$", re.MULTILINE)
+local_declaration_pattern = re.compile(r"^[ \t]*local[ \t]+[^=\n]+=[ \t]*$", re.MULTILINE)
 luau_files = [ROOT / "DataStore.lua", ROOT / "Compression.lua", *(ROOT / "tests").glob("*.lua")]
 split_locals = [str(path.relative_to(ROOT)) for path in luau_files if local_declaration_pattern.search(path.read_text(encoding="utf-8"))]
 check("Luau local assignments keep the RHS on the same line", len(split_locals) == 0)
