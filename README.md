@@ -698,6 +698,49 @@ CompressionOptions = {
 
 The library also evaluates raw storage for fallback according to its size/expansion options. Encoded packets retain codec `230` and checksum checks.
 
+### Opt-in forced buffer storage
+
+When you need every **written standard player record** to use a buffer payload, opt into `ForceCompressedBuffer = true`. The setting overrides the minimum-size threshold and disables the raw-table fallback; it uses the existing codec and record envelope, so the persisted value is still a table containing `Payload = buffer`, **not a naked buffer**.
+
+~~~lua
+local Store = NexusDataStore.new({
+    Name = "PlayerData",
+    Template = PlayersData,
+    Compression = true,
+    ForceCompressedBuffer = true,
+    CompressionStrategy = "smallest",
+    CompressionTransport = "buffer",
+    CompressionMinBytes = 0,
+    CompressionReports = true,
+    CompressionOptions = {
+        StringDictionary = true,
+        DictionaryMinLength = 4,
+        DictionaryMinUses = 2,
+        AllowExpansion = false,
+    },
+})
+~~~
+
+- Existing raw records and v230 Base64/buffer envelopes remain readable; the next successful write can migrate them to buffer storage.
+- Forced mode requires compression enabled and `CompressionTransport` omitted or set to `"buffer"`. Explicit `"auto"`/`"base64"` is rejected to avoid silent behavior changes.
+- It **does not guarantee fewer bytes**. Small profiles (for example `{Coins = 0, Collected = 0}`) can grow due to the codec header and storage envelope. Use normal `"smallest"` mode without forcing for actual smallest *measured* persisted records.
+- An oversized forced compressed record fails with `STORED_BYTES_EXCEEDED`; it will **not** be silently stored raw. The caller must handle save failures.
+- When `CompressionReports = true`, the `CompressionReport` event now includes raw decisions as well as compressed ones. Inspect `PersistedCompressed`, `StorageBytes`, `RawStorageEstimate`, `Transport`, and `SelectionReason`. Possible reasons include `forced-buffer`, `compressed-smaller`, `raw-smaller-or-equal`, `below-minimum-bytes`, `compressed-exceeds-limit`, and `compression-disabled`.
+- Do not deploy exclusively buffer-writing servers while any incompatible old readers are in production. Test with copied player records in Roblox Studio before enabling in a live game.
+
+~~~lua
+local report, err = Store:GetCompressionReport(PlayersData)
+if report then
+    print("Stored transport:", report.Transport, "Compressed:", report.PersistedCompressed)
+    print("Bytes:", report.RawStorageEstimate, "->", report.StorageBytes)
+    print("Reason:", report.SelectionReason)
+else
+    warn("Compression forecast failed:", err)
+end
+~~~
+
+`GetCompressionReport` **predicts** the current write selection; it does not read or certify a previously saved record. The Studio-only `tests/ForcedBufferRegression.server.lua` verifies raw/buffer roundtrips and mocked persistence.
+
 ### Standalone codec API
 
 `Compression` can also encode supported Luau values outside the persistence API:
@@ -882,10 +925,11 @@ The following are the defaults in **v7.2.0**. Every option goes inside `NexusDat
 | `CompressionModule` | Auto-resolved | Override codec ModuleScript |
 | `CompressionOptions` | `{}` | Codec-specific options |
 | `CompressionStrategy` | `"balanced"` | `"balanced"` or `"smallest"` |
-| `CompressionMinBytes` | `512` | Compression threshold |
+| `CompressionMinBytes` | `512` | Compression threshold (ignored for forced buffer writes) |
+| `ForceCompressedBuffer` | `false` | Opt-in mandatory compressed buffer envelope; may increase bytes |
 | `CompressionTransport` | `"auto"` | `"auto"` / `"buffer"` / `"base64"` |
 | `CompactSessionLocks` | `false` | Opt-in compact lock representation |
-| `CompressionReports` | `false` | Emit compression-report events |
+| `CompressionReports` | `false` | Emit compression-selection events for compressed and raw writes |
 | `MaxDataNodes` | `50000` | Data node limit |
 | `MaxDataBytes` | `3900000` | Approximate raw data limit |
 | `MaxStoredBytes` | `3900000` | Measured final storage limit |
@@ -1002,7 +1046,7 @@ These are examples, not the complete error-code list. Check returned values and 
 7. **Roll out migrations safely.** Use test universes and copied records; keep `SchemaVersion` changes deliberate.
 8. **Roll out compact locks in stages.** Keep them disabled while any older reader is active.
 9. **Handle shutdown failures.** A successful `BindToClose` callback cannot guarantee persistence during abnormal server termination.
-10. **Measure compression.** Compare compression-on/off and balanced/smallest using real profile sizes, CPU use, and observed save latency.
+10. **Measure compression.** Compare compression-on/off, balanced/smallest, and forced buffer mode using real profile sizes, CPU use, and observed save latency.
 
 ## Testing and troubleshooting
 

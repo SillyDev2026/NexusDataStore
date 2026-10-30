@@ -90,6 +90,7 @@ export type StoreConfig<T> = {
 	CompressionOptions: CompressionOptions?,
 	CompressionReports: boolean?,
 	CompressionMinBytes: number?,
+	ForceCompressedBuffer: boolean?,
 	CompressionStrategy: ("balanced" | "smallest")?,
 	CompactSessionLocks: boolean?,
 	CompressionTransport: CompressionTransport?,
@@ -1151,7 +1152,7 @@ function NexusDataStore:_RecordEncoding(report: any?)
 	if finiteNumber(report.StorageBytes) and report.StorageBytes >= 0 then
 		self.Metrics.BytesEncoded += report.StorageBytes
 	end
-	if self.Config.CompressionReports and report.EngineVersion ~= nil then
+	if self.Config.CompressionReports then
 		self:_Fire("CompressionReport", report)
 	end
 end
@@ -1175,18 +1176,19 @@ function NexusDataStore:_EncodeRecord(record: any): (any?, string?, any?)
 	if rawBytes == nil then
 		return nil, rawMeasureErr
 	end
-	local rawReport = {StorageBytes = rawBytes, RawStorageEstimate = rawBytes, Transport = "raw-table", PersistedCompressed = false, CompactLock = hasCompactLock}
+	local rawReport = {StorageBytes = rawBytes, RawStorageEstimate = rawBytes, Transport = "raw-table", PersistedCompressed = false, CompactLock = hasCompactLock, SelectionReason = "compression-disabled"}
 	if not self.Config.Compression then
 		if rawBytes > self.Config.MaxStoredBytes then
 			return nil, ("STORED_BYTES_EXCEEDED:%d>%d"):format(rawBytes, self.Config.MaxStoredBytes)
 		end
 		return storageRecord, nil, rawReport
 	end
-	if rawBytes < self.Config.CompressionMinBytes then
+	if not self.Config.ForceCompressedBuffer and rawBytes < self.Config.CompressionMinBytes then
 		if rawBytes > self.Config.MaxStoredBytes then
 			return nil, ("STORED_BYTES_EXCEEDED:%d>%d"):format(rawBytes, self.Config.MaxStoredBytes)
 		end
 		rawReport.SkippedCompression = true
+		rawReport.SelectionReason = "below-minimum-bytes"
 		return storageRecord, nil, rawReport
 	end
 	if not self.CompressionEngine then
@@ -1254,20 +1256,24 @@ function NexusDataStore:_EncodeRecord(record: any): (any?, string?, any?)
 	-- The size-first strategy always selects the smallest JSON representation.
 	-- Balanced maintains the legacy AllowExpansion behaviour.
 	local forceEncode = self.Config.CompressionStrategy == "balanced" and self.Config.CompressionOptions.AllowExpansion == true
-	if rawBytes <= self.Config.MaxStoredBytes and not forceEncode and bestBytes >= rawBytes then
+	if not self.Config.ForceCompressedBuffer and rawBytes <= self.Config.MaxStoredBytes and not forceEncode and bestBytes >= rawBytes then
 		rawReport.DictionaryEnabled = bestReport.DictionaryEnabled
 		rawReport.AlternativeCodecCandidates = #variants
+		rawReport.SelectionReason = "raw-smaller-or-equal"
 		return storageRecord, nil, rawReport
 	end
 	if bestBytes > self.Config.MaxStoredBytes then
-		if rawBytes <= self.Config.MaxStoredBytes then
+		if not self.Config.ForceCompressedBuffer and rawBytes <= self.Config.MaxStoredBytes then
+			rawReport.SelectionReason = "compressed-exceeds-limit"
 			return storageRecord, nil, rawReport
 		end
-		return nil, ("STORED_BYTES_EXCEEDED:%d>%d"):format(math.min(rawBytes, bestBytes), self.Config.MaxStoredBytes)
+		return nil, ("STORED_BYTES_EXCEEDED:%d>%d"):format(self.Config.ForceCompressedBuffer and bestBytes or math.min(rawBytes, bestBytes), self.Config.MaxStoredBytes)
 	end
 	bestReport.StorageBytes = bestBytes
 	bestReport.Transport = bestTransport
 	bestReport.PersistedCompressed = true
+	bestReport.ForcedBuffer = self.Config.ForceCompressedBuffer
+	bestReport.SelectionReason = self.Config.ForceCompressedBuffer and "forced-buffer" or "compressed-smaller"
 	return bestEnvelope, nil, bestReport
 end
 
@@ -3517,6 +3523,9 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 	assert(config.CompressionTransport == nil or config.CompressionTransport == "auto" or config.CompressionTransport == "buffer" or config.CompressionTransport == "base64", "CompressionTransport must be auto, buffer, or base64")
 	assert(config.CompressionStrategy == nil or config.CompressionStrategy == "balanced" or config.CompressionStrategy == "smallest", "CompressionStrategy must be balanced or smallest")
 	assert(config.CompactSessionLocks == nil or typeof(config.CompactSessionLocks) == "boolean", "CompactSessionLocks must be a boolean")
+	assert(config.ForceCompressedBuffer == nil or typeof(config.ForceCompressedBuffer) == "boolean", "ForceCompressedBuffer must be a boolean")
+	assert(config.ForceCompressedBuffer ~= true or config.Compression ~= false, "ForceCompressedBuffer requires Compression = true")
+	assert(config.ForceCompressedBuffer ~= true or config.CompressionTransport == nil or config.CompressionTransport == "buffer", "ForceCompressedBuffer requires CompressionTransport = buffer")
 	assert(config.SkipUnchangedMutations == nil or typeof(config.SkipUnchangedMutations) == "boolean", "SkipUnchangedMutations must be a boolean")
 	assert(config.ProfileOperations == nil or typeof(config.ProfileOperations) == "boolean", "ProfileOperations must be a boolean")
 	assert(config.OrderedDataStores == nil or typeof(config.OrderedDataStores) == "table", "OrderedDataStores must be a table")
@@ -3555,9 +3564,10 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 		CompressionOptions = clone(config.CompressionOptions or {}),
 		CompressionReports = config.CompressionReports == true,
 		CompressionMinBytes = configNumber(config.CompressionMinBytes, 512, 0, "CompressionMinBytes", true),
+		ForceCompressedBuffer = config.ForceCompressedBuffer == true,
 		CompressionStrategy = config.CompressionStrategy or "balanced",
 		CompactSessionLocks = config.CompactSessionLocks == true,
-		CompressionTransport = config.CompressionTransport or "auto",
+		CompressionTransport = config.ForceCompressedBuffer == true and "buffer" or (config.CompressionTransport or "auto"),
 		AutoSave = config.AutoSave ~= false,
 		AutoSaveInterval = configNumber(config.AutoSaveInterval, 30, 10, "AutoSaveInterval"),
 		LockTimeout = lockTimeout,

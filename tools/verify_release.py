@@ -29,6 +29,12 @@ check("typed public API retained", "export type Data = PlayersData.Data" in data
 check("record format compatible", "local RECORD_FORMAT = 700" in data)
 check("compression codec compatible", "Compression.CodecVersion = 230" in codec and 'return "2.3.4"' in codec)
 check("compact locks default disabled", "CompactSessionLocks = config.CompactSessionLocks == true" in data)
+check("forced buffer mode defaults off and remains opt-in", "ForceCompressedBuffer = config.ForceCompressedBuffer == true" in data)
+check("forced buffer option is typed", "ForceCompressedBuffer: boolean?" in data)
+check("forced buffer requires buffer transport", "ForceCompressedBuffer requires CompressionTransport = buffer" in data)
+check("forced buffer never silently falls back to raw", "if not self.Config.ForceCompressedBuffer and rawBytes <= self.Config.MaxStoredBytes" in data)
+check("forced buffer ignores threshold safely", "if not self.Config.ForceCompressedBuffer and rawBytes < self.Config.CompressionMinBytes" in data)
+check("both compressed and raw reports can be emitted", "if self.Config.CompressionReports then" in data and "SelectionReason" in data)
 check("no-op suppression opt-in", "SkipUnchangedMutations = config.SkipUnchangedMutations == true" in data)
 check("profiling opt-in", "ProfileOperations = config.ProfileOperations == true" in data)
 check("coalesced save metric present", "SavesCoalesced += 1" in data)
@@ -53,6 +59,7 @@ check("critical APIs have unique definitions", all(
     for method in methods
 ))
 check("README reference retained", "## Configuration reference" in readme and "## API reference" in readme)
+check("forced buffer documented with caveats", "### Opt-in forced buffer storage" in readme and "does not guarantee fewer bytes" in readme)
 check("new features documented", "GetPerformanceReport()" in readme and "SkipUnchangedMutations" in readme)
 check("v7.2 tool documentation present", "PreviewMigration(data, fromVersion" in readme and "GetStorageForecast(dataOrSession" in readme and "ChangeJournalLimit" in readme)
 check("bounded journal defaults off", "ChangeJournalLimit = configNumber(config.ChangeJournalLimit, 0, 0" in data)
@@ -62,9 +69,13 @@ required = (
     "DeveloperToolsRegression.server.lua",
     "MutationSafetyRegression.server.lua", "PersistenceRecoveryRegression.server.lua",
     "SchemaMigrationRegression.server.lua", "CompressionRegression.server.lua",
+    "ForcedBufferRegression.server.lua",
     "MillionLocalBenchmark.server.lua", "MillionMockBackendBenchmark.server.lua",
 )
 check("core regression and benchmark scripts exist", all((test_dir / name).is_file() for name in required))
+forced_test = (test_dir / "ForcedBufferRegression.server.lua").read_text(encoding="utf-8")
+check("forced buffer mock-backed save test present", all(token in forced_test for token in ("ForceCompressedBuffer", "OpenAsync", "SaveAsync", "ReleaseAsync", "STORED_BYTES_EXCEEDED")))
+check("forced buffer legacy-compatibility test present", "legacyDecoded" in forced_test and "crossDecoded" in forced_test)
 for filename, required_count in (
     ("MillionLocalBenchmark.server.lua", 32),
     ("MillionMockBackendBenchmark.server.lua", 21),
