@@ -3563,7 +3563,7 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 		CompressionModule = config.CompressionModule,
 		CompressionOptions = clone(config.CompressionOptions or {}),
 		CompressionReports = config.CompressionReports == true,
-		CompressionMinBytes = config.ForceCompressedBuffer == true and 0 or configNumber(config.CompressionMinBytes, 512, 0, "CompressionMinBytes", true),
+		CompressionMinBytes = configNumber(config.CompressionMinBytes, 512, 0, "CompressionMinBytes", true),
 		ForceCompressedBuffer = config.ForceCompressedBuffer == true,
 		CompressionStrategy = config.CompressionStrategy or "balanced",
 		CompactSessionLocks = config.CompactSessionLocks == true,
