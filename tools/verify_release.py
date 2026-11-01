@@ -50,7 +50,7 @@ check("handoff wait state cleaned up", "self.HandoffWakeGeneration[normalizedKey
 check("handoff messages are independent of general events", "or self.Config.EnableSessionHandoff then" in data)
 check("handoff release notification present", 'eventName == "Released"' in data)
 check("handoff documented with service limits", "MessagingService is **best effort**" in readme)
-check("session contention documented", "## New in 7.4.0" in readme and "SessionLockRetryInterval" in readme)
+check("session contention documented", "## Previously in 7.4.0" in readme and "SessionLockRetryInterval" in readme)
 check("snapshot protection retained", '"SNAPSHOT_NOT_OWNED"' in data)
 check("key metadata preservation retained", "persistWithKeyInfo(encoded, keyInfo)" in data)
 methods = [
