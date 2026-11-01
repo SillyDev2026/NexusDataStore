@@ -173,7 +173,7 @@ assertRejected(makePacket({0, 10, 7, 1, 0}, 232), "INVALID_PACKED_ARRAY_COUNT")
 passed += 1
 assertRejected(makePacket({0, 10, 8, 1}, 232), "COMPRESSION_TRUNCATED")
 passed += 1
-assertRejected(makePacket({0, 10, 8, 1, 255}, 232), "NONZERO_PACKED_INTEGER_PADDING")
+assertRejected(makePacket({0, 10, 9, 1, 0, 2}, 232), "NONZERO_PACKED_INTEGER_PADDING")
 passed += 1
 assertRejected(makePacket({0, 10, 8, 4, 0, 0, 0, 0}, 232), "NON_CANONICAL_PACKED_INTEGER_WIDTH")
 passed += 1
