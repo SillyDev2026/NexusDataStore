@@ -54,9 +54,9 @@ Record format `700`, compression codec `230`, and existing configuration default
 
 ## Overview
 
-### Developer tooling and clean Luau — v7.2.0
+### Session safety and developer tooling
 
-This release adds three developer-facing safety features and a consistent source style while preserving the existing API, strict Luau profile types, record format `700`, and Compression `2.3.4` / codec `230`. No saved-data migration is required. Existing v7.1 optimizations remain available.
+Version 7.3.0 combines safer callback mutations and convenient profile helpers with migration previews, storage forecasts, bounded journals, and copy-on-write updates. It preserves the existing API, strict Luau profile types, record format `700`, and Compression `2.3.4` / codec `230`. No saved-data migration is required for this library update.
 
 - **Path-level copy-on-write:** `Set`, `Delete`, `Append`, `RemoveAt`, and multi-field `Patch` copy only affected table branches before validating and committing, rather than deep-cloning unrelated profile trees for each edit.
 - **Incremental direct-change baseline:** Controlled path mutations update their independent observation snapshot by path when possible. Whole-profile changes and uncertain paths retain the full-clone fallback.
@@ -65,9 +65,9 @@ This release adds three developer-facing safety features and a consistent source
 - **Expanded regression suite:** `CopyOnWriteRegression.server.lua` checks nested paths, old-reference isolation, watchers, rollback, and full-record validation with direct-change detection enabled and disabled.
 - **One-million-call test harnesses:** `MillionLocalBenchmark.server.lua` and `MillionMockBackendBenchmark.server.lua` provide 1,000,000 iterations per selected case and show observed timings in Studio. They are not recorded benchmark results.
 
-> **Required verification:** The new regression and million-iteration scripts require Roblox Studio. No Luau runtime, actual one-million-call run, benchmark speedup, or live DataStore reliability result is claimed by these source changes. Run the relevant suites, compare before/after timings, and test real cross-server ownership before production rollout.
+> **Verification scope:** Portable session and codec tests have run in the official Luau CLI. Studio integration suites, million-iteration benchmarks, live DataStore reliability, and Roblox-aware type analysis remain unverified. See [validation results](./docs/VALIDATION-7.3.0.md) and [testing instructions](#testing-and-troubleshooting).
 
-### New v7.2.0 features
+### Developer tools
 
 | Feature | Benefit | Persistence impact |
 | --- | --- | --- |
@@ -894,7 +894,7 @@ Set `RemoveWhenNil = true` if a missing projected path should remove the corresp
 
 ## Configuration reference
 
-The following are the defaults in **v7.2.0**. Every option goes inside `NexusDataStore.new({...})` unless otherwise stated.
+The following are the defaults in **v7.3.0**. Every option goes inside `NexusDataStore.new({...})` unless otherwise stated.
 
 ### Store identity and data model
 
@@ -990,13 +990,38 @@ The codec's `CompressionOptions` include `StringDictionary`, `DictionaryMinLengt
 
 | Category | Methods |
 | --- | --- |
-| Read | `Get`, `GetOr`, `Has` |
-| Write | `Set`, `Delete`, `Patch`, `UpdatePath`, `Mutate` |
+| Read | `Get`, `GetOr`, `Has`, `GetDataSnapshot` |
+| Write | `Set`, `SetDefault`, `Delete`, `Patch`, `UpdatePath`, `Mutate` |
 | Counters | `Increment`, `IncrementClamped`, `Award`, `Spend` |
 | Containers | `Append`, `RemoveAt`, `Toggle` |
 | History | `Snapshot`, `Restore`, `DiffFromPersisted`, `GetChangeJournal`, `ClearChangeJournal` |
 | Observability | `Watch`, `GetStatus`, `GetStats`, `IsDirty`, `IsActive` |
 | Persistence | `SaveAsync`, `ReleaseAsync` |
+
+#### Defaults and detached reads
+
+| Method | Returns | Behavior |
+| --- | --- | --- |
+| `SetDefault(path, value)` | `true, value, inserted` or `false, error` | Inserts only when the path's value is nil; existing false and zero are preserved. Tables returned to the caller are independent copies. |
+| `GetDataSnapshot()` | Independent data table | Copies the whole profile without marking it dirty, firing change events, or consuming a retained restore slot. |
+
+`SetDefault` requires an active, non-releasing session. Missing fields require a non-nil default; invalid paths, circular defaults, invalid parents, and validation failures are rejected. Existing values are returned without applying the fallback or incrementing the mutation counter. A successful insertion changes local session data; autosave or `SaveAsync` performs persistence.
+
+~~~lua
+local ok, value, inserted = profile:SetDefault({"Settings", "Music"}, true)
+if not ok then
+    warn("Default failed:", value)
+elseif inserted then
+    print("Initialized music setting:", value)
+end
+
+local displayData = profile:GetDataSnapshot()
+displayData.Coins = 0 -- does not modify profile.Data.Coins
+~~~
+
+The parent `Settings` table must already exist for this nested-path example. Use `Snapshot(label)` when you need an owned token for `Restore`; `GetDataSnapshot()` is only a read helper.
+
+`Mutate` commits a detached copy of its callback draft. Retaining that draft or returning one of its nested tables cannot change committed data afterward. Successful transactions incur an additional whole-profile copy; prefer path setters for frequent small changes. `UpdatePath` captures its path before running the callback, so later edits to the caller's path array cannot redirect the write. Both methods recheck session activity after callbacks, including cancellation and no-op paths.
 
 The library also exports `Data`, `Profile`, `PlayerProfile`, `PlayerStore`, and the generic `Session<T>`/`Store<T>` type aliases for strict Luau.
 
@@ -1069,6 +1094,18 @@ These are examples, not the complete error-code list. Check returned values and 
 
 The [`tests/` directory](./tests) contains [DeveloperToolsRegression.server.lua](./tests/DeveloperToolsRegression.server.lua) for migration previews, storage forecasts, and bounded journals, plus Roblox Studio regression scripts for codec correctness, malformed payloads, copy-on-write isolation, **zero-change suppression, coalesced saves and profiling** (see [EfficiencyRegression.server.lua](./tests/EfficiencyRegression.server.lua)), compact locks, ambiguous acknowledgements, and load/close races. Place test Scripts with the required ModuleScripts as directed by their headers; do **not** run them against production player keys.
 
+### Recorded v7.3.0 validation
+
+| Check | Recorded result |
+| --- | --- |
+| Portable session regressions | 17 passed, including a 10,000-operation mixed-operation sequence |
+| Compression regressions | 22 passed |
+| Static compatibility checks | 33 passed |
+| Luau compilation | All root modules and regression/benchmark scripts compiled |
+| Independent code review | No blocking regression found |
+
+These are the local results for the v7.3.0 implementation, not a live production certification. See the [validation report](./docs/VALIDATION-7.3.0.md) for exact scope and the [GitHub Actions runs](https://github.com/SillyDev2026/NexusDataStore/actions/workflows/source-compatibility.yml) for current CI status.
+
 ### Portable behavioral checks
 
 With the official Luau CLI installed:
@@ -1116,11 +1153,11 @@ Suggested pre-release test matrix:
 | Release during in-flight load | Session is not silently stranded |
 | Schema is upgraded | Migration runs before validation |
 | Compressed payload is corrupted | Decoder reports failure, never resets data |
-| Normal and compact locks | v7.2.0 can read both |
+| Normal and compact locks | v7.3.0 can read both |
 | Leaderboard sync fails | Standard profile save and ordered error are handled separately |
 
 For DataStore fundamentals and limits, consult [Roblox Data Stores](https://create.roblox.com/docs/cloud-services/data-stores), [best practices](https://create.roblox.com/docs/cloud-services/data-stores/best-practices), and [error codes and limits](https://create.roblox.com/docs/cloud-services/data-stores/error-codes-and-limits).
 
 ---
 
-**Version 7.2.0** · [Source](./DataStore.lua) · [Compression](./Compression.lua) · [Tests](./tests)
+**Version 7.3.0** · [Source](./DataStore.lua) · [Compression](./Compression.lua) · [Tests](./tests)
