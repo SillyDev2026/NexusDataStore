@@ -12,7 +12,7 @@ local cases = {
     {Name = "fractional", Data = {Money = 0.000123, Power = 3.141592653589793, Large = 9007199254740991}},
 }
 local bytes = {}
-for i = 1, 320 do bytes[i] = string.char((i * 73 + i * i * 11) % 256) end
+for i = 1, 320 do bytes[i] = string.char(33 + (i * 73 + i * i * 11) % 90) end
 cases[5].Data.Text = table.concat(bytes)
 
 local function makeStore(name: string, extra: {[string]: any}): any
