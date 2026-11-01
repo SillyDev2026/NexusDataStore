@@ -209,7 +209,7 @@ test("Released notifications wake waiters without changing ownership", function(
     store.Config.KeyPrefix = ""
     store.Config.EnableSessionHandoff = true
     store.JobId = "waiting-job"
-    store.HandoffWakeGeneration = {}
+    store.HandoffWakeGeneration = {test = 0}
     store.Metrics.HandoffWakeups = 0
     local good = {Store = "HandoffTest", Scope = "Global", KeyPrefix = "", JobId = "owner-job", Event = "Released", At = os.time(), Payload = {Key = "test"}}
     store:_HandleHandoffPacket(good)
