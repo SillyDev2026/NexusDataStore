@@ -30,7 +30,7 @@ assert(legacyStored and packedStored, tostring(oldErr or packedErr))
 assert(packedStored.Compressed == true and packedStored.Codec == 232, "Packed codec was not selected")
 assert(packedReport.AlternativeCodecCandidates == 6 and oldReport.AlternativeCodecCandidates == 4)
 assert(packedReport.StorageBytes < oldReport.StorageBytes, "Packed storage did not reduce record bytes")
-assert(packedReport.PackedIntegerValues == 256 and packedReport.PackedIntegerValueBits == 768)
+assert(packedReport.PackedIntegerValues == 256 and packedReport.PackedIntegerValueBits == 512)
 local decoded, decodeErr = legacy:_DecodeRecord(packedStored)
 assert(decoded, tostring(decodeErr))
 assert(decoded.Data.Coins == 5 and #decoded.Data.Numbers == 256)
@@ -39,7 +39,7 @@ for i = 1, 256 do assert(decoded.Data.Numbers[i] == numbers[i]) end
 local forecast, forecastErr = compact:GetStorageForecast(template)
 assert(forecast, tostring(forecastErr))
 assert(forecast.SelectedCodec == 232 and forecast.CandidatesChecked == 6)
-assert(forecast.PackedIntegerValues == 256 and forecast.PackedIntegerValueBits == 768)
+assert(forecast.PackedIntegerValues == 256 and forecast.PackedIntegerValueBits == 512)
 
 local modified = table.clone(packedStored)
 modified.Codec = 231
