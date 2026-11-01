@@ -40,6 +40,7 @@ local owner = createStore("OwnerServer")
 local follower = createStore("FollowerServer")
 local emitted = 0
 local released = 0
+follower._Publish = function() end
 
 owner._Publish = function(_self, event, payload)
     if event ~= "Released" then return end
