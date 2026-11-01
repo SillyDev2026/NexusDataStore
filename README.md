@@ -2,19 +2,58 @@
 
 **Typed, session-aware data persistence for Roblox.**
 
-![Version](https://img.shields.io/badge/NexusDataStore-7.7.0-2563eb)
-![Codec](https://img.shields.io/badge/Compression-2.4.0-0f766e)
+![Version](https://img.shields.io/badge/NexusDataStore-7.8.0-2563eb)
+![Codec](https://img.shields.io/badge/Compression-2.5.0-0f766e)
 ![Luau](https://img.shields.io/badge/language-Luau-00a2ff)
 ![Platform](https://img.shields.io/badge/platform-Roblox-222222)
 
 NexusDataStore brings standard Roblox DataStore persistence, session ownership, typed player profiles, validation, migrations, snapshots, adaptive compression, and numeric leaderboards into one server-side library.
 
-**Current version:** `7.7.0` · **Compression:** `2.4.0` / legacy codec `230` + compact codec `231` · **Record format:** `700`
+**Current version:** `7.8.0` · **Compression:** `2.5.0` / codecs `230`, `231`, `232` · **Record format:** `700`
 
 > [!IMPORTANT]
 > This documentation describes the current source on `main`. Regression scripts are included, but production reliability and performance have not been certified by live-server load testing. Use a separate test universe before deploying changes to existing player data.
 
-## New in 7.7.0 — Always compress the complete record
+## New in 7.8.0 — Minimal-width integer bitpacking and storage diagnostics
+
+**Compression v2.5.0** adds an optional lossless **codec 232** for dense arrays of signed integers. Where a v231 array stores each small number with its own byte or tag, v232 packs consecutive integer values into one bitstream using the smallest number of bits needed for the array after zigzag encoding.
+
+- A 256-entry array containing values from `-2` through `1` needs **2 bits per value**, or **512 value bits / 64 bytes**, before its array tag and header. Previous compact encoding needed at least 256 bytes for those values.
+- The encoder uses packed arrays only when the complete array representation is smaller than the ordinary compact representation. It supports eligible integers `-32768` through `32767`; other numbers, strings, tables, and Booleans continue using the existing lossless representations.
+- The decoder rejects invalid bit widths, short arrays, truncation, nonzero unused padding bits, and noncanonical widths. Checksums, depth/node limits, and the existing session/revision protections remain in place.
+- Legacy **codec 230 and codec 231 remain readable**. Codecs 230/231 are still the default write choices. New codec 232 is **opt-in**, so existing saved profiles do not require conversion.
+
+### Enable packed integers safely
+
+Keep the v7.7 full-compression configuration, then add `BitPackedIntegers = true` to its `CompressionOptions`:
+
+~~~lua
+local Store = NexusDataStore.new({
+    Name = "PlayerData",
+    Template = PlayersData,
+    Compression = true,
+    CompressionPolicy = "always-smallest",
+    CompressionTransport = "auto",
+    CompressionOptions = {
+        StringDictionary = true,
+        BitPackedIntegers = true,
+    },
+    AutoSave = true,
+    BudgetAware = true,
+})
+~~~
+
+With `BitPackedIntegers = true` and `CompressionPolicy = "always-smallest"`, the store evaluates **six** candidates: codecs 230, 231 and 232 with dictionaries on/off. The smallest measured compressed envelope wins. Without this option it retains the previous four-candidate behavior.
+
+**Safe rollout:** First deploy DataStore v7.8.0 with Compression v2.5.0 to **all** servers while leaving `BitPackedIntegers = false`. After old servers drain, enable it. Older codec libraries cannot read records encoded as v232; downgrading readers without migrating those records back is unsafe.
+
+### Better save and load diagnostics
+
+`GetStorageForecast(profile)` now includes the selected codec, whether compression was used, the selection reason, number of candidates checked, estimated bytes saved or expanded, and the packed-integer count and exact value bits. The existing `GetCompressionReport(profile)` also includes `PackedIntegerArrays`, `PackedIntegerValues` and `PackedIntegerValueBits`.
+
+This is **lossless bit-width optimization, not removal of player information**. No compressor can shrink every arbitrary input. Real Roblox Studio multi-server persistence and stress tests are still required before describing the update as production-certified.
+
+## Previously in 7.7.0 — Always compress the complete record
 
 **`CompressionPolicy = "always-smallest"`** guarantees that every successfully written NexusDataStore record uses a **compressed packet envelope**, regardless of data shape, size, threshold or whether raw JSON would be smaller. The policy applies to records written during load acquisition, saves, heartbeats and release.
 
@@ -1124,7 +1163,7 @@ The following are the defaults in **v7.3.0**. Every option goes inside `NexusDat
 | `Debug` | `false` | Debug logging |
 | `ProfileOperations` | `false` | Opt-in per-server operation time/count profiling |
 
-The codec's `CompressionOptions` include opt-in `CompactEncoding` (v231, defaults off), `StringDictionary`, `DictionaryMinLength`, `DictionaryMinUses`, `DictionaryMaxEntries`, `DictionaryMaxCandidates`, `DeterministicMaps`, `MaxDepth`, `MaxNodes`, `PreallocateLimit`, and `AllowExpansion`. Tune only with representative profile benchmarks.
+The codec's `CompressionOptions` include opt-in `CompactEncoding` (v231, defaults off) and `BitPackedIntegers` (v232, defaults off), `StringDictionary`, `DictionaryMinLength`, `DictionaryMinUses`, `DictionaryMaxEntries`, `DictionaryMaxCandidates`, `DeterministicMaps`, `MaxDepth`, `MaxNodes`, `PreallocateLimit`, and `AllowExpansion`. Tune only with representative profile benchmarks.
 
 ## API reference
 
@@ -1326,4 +1365,4 @@ For DataStore fundamentals and limits, consult [Roblox Data Stores](https://crea
 
 ---
 
-**Version 7.7.0** · [Source](./DataStore.lua) · [Compression](./Compression.lua) · [Tests](./tests)
+**Version 7.8.0** · [Source](./DataStore.lua) · [Compression](./Compression.lua) · [Tests](./tests)
