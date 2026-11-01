@@ -109,8 +109,8 @@ for _, fixture in ipairs(compactFixtures) do
     end
 end
 
-local oldFlags = Compression.CompressTablePacket({Flags = bits}, {StringDictionary = false})
-local compactFlags = Compression.CompressTablePacket({Flags = bits}, {CompactEncoding = true, StringDictionary = false})
+local oldFlags = Compression.CompressTablePacket({Flag = bits}, {StringDictionary = false})
+local compactFlags = Compression.CompressTablePacket({Flag = bits}, {CompactEncoding = true, StringDictionary = false})
 assert(buffer.len(oldFlags) >= 80, "Legacy test packet unexpectedly small")
 assert(buffer.len(compactFlags) <= 30, "Compact Boolean packet exceeds 30 bytes")
 assert(equals(Compression.DecompressTable(oldFlags), Compression.DecompressTable(compactFlags)), "Legacy compact mismatch")
