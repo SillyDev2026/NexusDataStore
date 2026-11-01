@@ -53,6 +53,7 @@ export type CompressionOptions = {
 	DeterministicMaps: boolean?,
 	PreallocateLimit: number?,
 	AllowExpansion: boolean?,
+	CompactEncoding: boolean?,
 }
 
 export type OrderedDataStoreConfig<T> = {
@@ -279,7 +280,7 @@ local EncodingService = game:GetService("EncodingService")
 
 local NexusDataStore: any = {}
 NexusDataStore.__index = NexusDataStore
-NexusDataStore.Version = "7.5.0"
+NexusDataStore.Version = "7.6.0"
 NexusDataStore.RecordFormat = 700
 NexusDataStore.RequiredCompressionVersion = "2.3.0"
 
@@ -973,7 +974,7 @@ local function compressionVersionCompatible(version: string): boolean
 	if majorText == nil or minorText == nil then
 		return false
 	end
-	return tonumber(majorText) == 2 and tonumber(minorText) == 3
+	return tonumber(majorText) == 2 and (tonumber(minorText) == 3 or tonumber(minorText) == 4)
 end
 
 local function compressionResolve(configured: ModuleScript?): (any?, string?)
@@ -998,7 +999,7 @@ local function compressionResolve(configured: ModuleScript?): (any?, string?)
 		or typeof(engine.Version) ~= "function"
 		or typeof(engine.CompressTablePacket) ~= "function"
 		or typeof(engine.DecompressTable) ~= "function" then
-		return nil, "Compression module does not expose the v2.3.x codec API"
+		return nil, "Compression module does not expose a compatible codec API"
 	end
 	local versionOK, version = pcall(engine.Version)
 	if not versionOK then
@@ -1006,7 +1007,7 @@ local function compressionResolve(configured: ModuleScript?): (any?, string?)
 	end
 	version = tostring(version)
 	if not compressionVersionCompatible(version) then
-		return nil, ("Compression v2.3.x required, got v%s"):format(version)
+		return nil, ("Compression v2.3.x or v2.4.x required, got v%s"):format(version)
 	end
 	if tonumber(engine.CodecVersion) ~= 230 then
 		return nil, "Compression codec 230 required"
@@ -1223,9 +1224,12 @@ function NexusDataStore:_EncodeRecord(record: any): (any?, string?, any?)
 		if typeof(report) ~= "table" then
 			report = {EngineVersion = self.CompressionEngineVersion, EncodedBytes = buffer.len(encoded)}
 		end
+		local selectedCodec = tonumber(report.CodecVersion) or codec
+		if selectedCodec ~= 230 and selectedCodec ~= 231 then return nil, "UNSUPPORTED_COMPRESSION_CODEC:" .. tostring(selectedCodec) end
+		if selectedCodec == 231 and tonumber(self.CompressionEngine.CompactCodecVersion) ~= 231 then return nil, "COMPACT_COMPRESSION_UNAVAILABLE" end
 		local candidate, candidateBytes, candidateTransport = nil, math.huge, nil
 		if transport == "auto" or transport == "buffer" then
-			local envelope = {Format = RECORD_FORMAT, Codec = codec, Compressed = true, Encoding = "buffer", Payload = encoded}
+			local envelope = {Format = RECORD_FORMAT, Codec = selectedCodec, Compressed = true, Encoding = "buffer", Payload = encoded}
 			local bytes, sizeError = self:_MeasureStoredValue(envelope)
 			if bytes ~= nil then
 				candidate, candidateBytes, candidateTransport = envelope, bytes, "buffer"
@@ -1243,7 +1247,7 @@ function NexusDataStore:_EncodeRecord(record: any): (any?, string?, any?)
 				local payload = buffer.tostring(base64Buffer)
 				local size = self.CompressedEnvelopeBaseBytes + #payload
 				if size < candidateBytes then
-					candidate = {Format = RECORD_FORMAT, Codec = codec, Compressed = true, Encoding = "base64", Payload = payload}
+					candidate = {Format = RECORD_FORMAT, Codec = selectedCodec, Compressed = true, Encoding = "base64", Payload = payload}
 					candidateBytes, candidateTransport = size, "base64"
 				end
 			end
@@ -1300,7 +1304,8 @@ function NexusDataStore:_DecodeRecord(raw: any): (any?, string?)
 			return nil, "COMPRESSION_ENGINE_UNAVAILABLE:" .. tostring(self.CompressionEngineError)
 		end
 		local codec = tonumber(self.CompressionEngine.CodecVersion)
-		if raw.Codec ~= nil and tonumber(raw.Codec) ~= codec then
+		local declaredCodec = tonumber(raw.Codec)
+		if raw.Codec ~= nil and declaredCodec ~= codec and declaredCodec ~= tonumber(self.CompressionEngine.CompactCodecVersion) then
 			return nil, "UNSUPPORTED_COMPRESSION_CODEC:" .. tostring(raw.Codec)
 		end
 
@@ -1317,6 +1322,9 @@ function NexusDataStore:_DecodeRecord(raw: any): (any?, string?)
 			return nil, "INVALID_COMPRESSED_ENVELOPE"
 		end
 
+		if declaredCodec ~= nil and buffer.len(decodedBuffer) >= 6 and buffer.readu16(decodedBuffer, 4) ~= declaredCodec then
+			return nil, "COMPRESSED_ENVELOPE_CODEC_MISMATCH"
+		end
 		local ok, decoded = pcall(self.CompressionEngine.DecompressTable, decodedBuffer, self.Config.CompressionOptions)
 		if not ok then
 			return nil, "COMPRESSED_DECODE_FAILED:" .. tostring(decoded)
@@ -3812,7 +3820,8 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 	end
 	self.CompressionEngineVersion = versionOK and compressionVersion ~= nil and tostring(compressionVersion) or nil
 	if self.Config.Compression then
-		assert(compressionEngine ~= nil, "NexusDataStore v7 compression is enabled but Compression v2.3.x (codec 230) could not be loaded: " .. tostring(compressionError))
+		assert(compressionEngine ~= nil, "NexusDataStore compression requires compatible v2.3.x/v2.4.x engine (codec 230): " .. tostring(compressionError))
+		if self.Config.CompressionOptions.CompactEncoding then assert(tonumber(compressionEngine.CompactCodecVersion) == 231, "CompactEncoding requires Compression v2.4.0 (codec 231)") end
 	end
 
 	-- Cache the JSON overhead for the compressed envelope once. Base64 payload
@@ -3872,7 +3881,8 @@ NexusDataStore.OrderedDataStore = table.freeze({
 
 NexusDataStore.Compression = table.freeze({
 	RequiredVersion = REQUIRED_COMPRESSION_VERSION,
-	CompatibleSeries = "2.3.x",
+	CompatibleSeries = "2.3.x or 2.4.x",
+	CompactCodecVersion = 231,
 	CodecVersion = 230,
 	RecordFormat = RECORD_FORMAT,
 })

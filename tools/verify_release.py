@@ -27,7 +27,12 @@ if split_locals:
     print("Split local assignments found in:", ", ".join(split_locals))
 check("typed public API retained", "export type Data = PlayersData.Data" in data and "export type Store<T>" in data and "export type Session<T>" in data)
 check("record format compatible", "local RECORD_FORMAT = 700" in data)
-check("compression codec compatible", "Compression.CodecVersion = 230" in codec and 'return "2.3.4"' in codec)
+check("compression legacy and compact codecs declared", 'Compression.CodecVersion = 230' in codec and 'Compression.CompactCodecVersion = 231' in codec and 'return "2.4.0"' in codec)
+check("legacy codec is the default encoder", 'CompactEncoding = source.CompactEncoding == true' in codec and 'Compression.CodecVersion = 230' in codec)
+check("compact Boolean arrays pack eight values per byte", 'TAG_BOOLEAN_BITS = 9' in codec and 'index % 8 == 0' in codec)
+check("compact small integers and decoding are bounded", 'TAG_SMALL_INTEGER_LAST = 39' in codec and 'NONZERO_BOOLEAN_PADDING' in codec)
+check("store envelope carries selected packet codec", 'Codec = selectedCodec' in data and 'COMPRESSED_ENVELOPE_CODEC_MISMATCH' in data)
+check("compact setting documented with staged rollout", '## New in 7.6.0' in readme and 'CompactEncoding = true' in readme and 'Safe deployment order' in readme)
 check("compact locks default disabled", "CompactSessionLocks = config.CompactSessionLocks == true" in data)
 check("forced buffer mode defaults off and remains opt-in", "ForceCompressedBuffer = config.ForceCompressedBuffer == true" in data)
 check("forced buffer option is typed", "ForceCompressedBuffer: boolean?" in data)
@@ -83,6 +88,7 @@ required = (
     "MutationSafetyRegression.server.lua", "PersistenceRecoveryRegression.server.lua",
     "SchemaMigrationRegression.server.lua", "CompressionRegression.server.lua",
     "ForcedBufferRegression.server.lua", "SessionLockWaitRegression.server.lua", "SessionHandoffRegression.server.lua",
+    "CompactCodecRegression.server.lua",
     "MillionLocalBenchmark.server.lua", "MillionMockBackendBenchmark.server.lua",
 )
 check("core regression and benchmark scripts exist", all((test_dir / name).is_file() for name in required))
@@ -93,6 +99,8 @@ lock_wait_test = (test_dir / "SessionLockWaitRegression.server.lua").read_text(e
 check("contention regression covers ownership, timeout, shutdown and context guards", all(token in lock_wait_test for token in ("SESSION_LOCKED", "ReleaseAsync", "SESSION_CONTEXT_CONFLICT", "SESSION_LOCK_WAIT_TIMEOUT", "CloseAsync")))
 handoff_test = (test_dir / "SessionHandoffRegression.server.lua").read_text(encoding="utf-8")
 check("mock handoff and crash recovery coverage present", all(token in handoff_test for token in ("_HandleHandoffPacket", "_PublishHandoffRequest", "HandoffWakeups", "SESSION_LOST", "ExpiresAt")))
+compact_test = (test_dir / "CompactCodecRegression.server.lua").read_text(encoding="utf-8")
+check("v230/v231 cross-format record regression present", all(token in compact_test for token in ("COMPRESSED_ENVELOPE_CODEC_MISMATCH", "Codec == 230", "Codec == 231", "StorageBytes")))
 for filename, required_count in (
     ("MillionLocalBenchmark.server.lua", 32),
     ("MillionMockBackendBenchmark.server.lua", 21),

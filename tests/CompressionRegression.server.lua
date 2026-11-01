@@ -1,5 +1,5 @@
 --!strict
--- Roblox Studio server regression tests for Compression v2.3.4 (codec 230).
+-- Roblox Studio server regression tests for Compression v2.4.0 (legacy 230, compact 231).
 -- Place this Script beside a ModuleScript named Compression and run Play/Run.
 local Compression = require(script.Parent:WaitForChild("Compression"))
 
@@ -23,10 +23,10 @@ end
 
 -- Construct checksum-correct hostile packets to test the decoder rather than
 -- simply triggering the checksum guard.
-local function makePacket(payload: {number}): buffer
+local function makePacket(payload: {number}, codec: number?): buffer
     local packet = buffer.create(11 + #payload)
     buffer.writeu32(packet, 0, Compression.Magic)
-    buffer.writeu16(packet, 4, Compression.CodecVersion)
+    buffer.writeu16(packet, 4, codec or Compression.CodecVersion)
     buffer.writeu8(packet, 6, 0)
     local a = 1
     local b = 0
@@ -39,9 +39,9 @@ local function makePacket(payload: {number}): buffer
     return packet
 end
 
-assert(Compression.Version() == "2.3.4", "Unexpected compression version")
-assert(Compression.CodecVersion == 230, "Persistent codec must remain v230")
-assert(Compression.TableMode({}) == "buffer-v230", "Packet format changed")
+assert(Compression.Version() == "2.4.0", "Unexpected compression version")
+assert(Compression.CodecVersion == 230 and Compression.CompactCodecVersion == 231, "Legacy/compact codecs changed")
+assert(Compression.TableMode({}) == "buffer-v230" and Compression.TableMode({}, {CompactEncoding = true}) == "buffer-v231", "Packet modes changed")
 
 local fixtures = {
     {Name = "empty table", Value = {}},
@@ -88,4 +88,55 @@ passed += 1
 assertRejected(makePacket({0, 3, 128, 128, 128, 128, 128, 128, 128, 16}), "VARUINT_UNSAFE_INTEGER")
 passed += 1
 
-print(("Compression v2.3.4 codec230 regression PASS: %d cases"):format(passed))
+
+-- Compact v231 preserves every bit of legacy values but packs small integers
+-- and Boolean arrays without per-value tags.
+local bits = {}
+for index = 1, 64 do bits[index] = index % 3 == 0 end
+local compactFixtures = {
+    {Name = "64 Boolean flags", Value = {Flags = bits}},
+    {Name = "small signed integers", Value = {A = -8, B = -1, C = 0, D = 15, E = 16, F = -9}},
+    {Name = "Boolean boundaries", Value = {Four = {true, false, true, true}, Nine = {false, true, false, true, false, true, false, true, true}}},
+    {Name = "nested flag arrays", Value = {Flags = bits, Nested = {Flags = bits, Level = 3}}},
+}
+for _, fixture in ipairs(compactFixtures) do
+    for _, useDictionary in ipairs({true, false}) do
+        local encoded, report = Compression.CompressTablePacket(fixture.Value, {CompactEncoding = true, StringDictionary = useDictionary, DeterministicMaps = true})
+        assert(buffer.readu16(encoded, 4) == 231 and report.CodecVersion == 231, "Compact version mismatch")
+        local decoded = Compression.DecompressTable(encoded)
+        assert(equals(fixture.Value, decoded), "Compact roundtrip failed: " .. fixture.Name)
+        passed += 1
+    end
+end
+
+local oldFlags = Compression.CompressTablePacket({Flag = bits}, {StringDictionary = false})
+local compactFlags = Compression.CompressTablePacket({Flag = bits}, {CompactEncoding = true, StringDictionary = false})
+assert(buffer.len(oldFlags) >= 80, "Legacy test packet unexpectedly small")
+assert(buffer.len(compactFlags) <= 30, "Compact Boolean packet exceeds 30 bytes")
+assert(equals(Compression.DecompressTable(oldFlags), Compression.DecompressTable(compactFlags)), "Legacy compact mismatch")
+print(("Packed Boolean packet: %d -> %d bytes"):format(buffer.len(oldFlags), buffer.len(compactFlags)))
+passed += 1
+
+-- Exercise all bitset boundary lengths and small-integer transitions with
+-- deterministic fixtures (no live backend or nondeterministic RNG).
+for count = 0, 255 do
+    local values = {}
+    for index = 1, count do values[index] = (index * 17 + count) % 7 <= 2 end
+    local fixture = {Flags = values, Delta = count % 32 - 16, Index = count}
+    local packet = Compression.CompressTablePacket(fixture, {CompactEncoding = true, StringDictionary = count % 2 == 0})
+    local restored = Compression.DecompressTable(packet)
+    assert(equals(fixture, restored), "Boundary roundtrip failed for length " .. tostring(count))
+    passed += 1
+end
+
+-- Construct checksum-correct hostile v231 packets to test canonical padding.
+assertRejected(makePacket({0, 9, 4, 16}, 231), "NONZERO_BOOLEAN_PADDING")
+passed += 1
+assertRejected(makePacket({0, 9, 3, 7}, 231), "INVALID_BOOLEAN_ARRAY_COUNT")
+passed += 1
+assertRejected(makePacket({0, 9, 8}, 231), "COMPRESSION_TRUNCATED")
+passed += 1
+assertRejected(makePacket({0, 16}, 230), "UNKNOWN_TAG")
+passed += 1
+
+print(("Compression v2.4.0 codec230/231 regression PASS: %d cases"):format(passed))

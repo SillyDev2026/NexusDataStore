@@ -2,19 +2,68 @@
 
 **Typed, session-aware data persistence for Roblox.**
 
-![Version](https://img.shields.io/badge/NexusDataStore-7.5.0-2563eb)
-![Codec](https://img.shields.io/badge/Compression-2.3.4-0f766e)
+![Version](https://img.shields.io/badge/NexusDataStore-7.6.0-2563eb)
+![Codec](https://img.shields.io/badge/Compression-2.4.0-0f766e)
 ![Luau](https://img.shields.io/badge/language-Luau-00a2ff)
 ![Platform](https://img.shields.io/badge/platform-Roblox-222222)
 
 NexusDataStore brings standard Roblox DataStore persistence, session ownership, typed player profiles, validation, migrations, snapshots, adaptive compression, and numeric leaderboards into one server-side library.
 
-**Current version:** `7.5.0` · **Compression:** `2.3.4` / codec `230` · **Record format:** `700`
+**Current version:** `7.6.0` · **Compression:** `2.4.0` / legacy codec `230` + compact codec `231` · **Record format:** `700`
 
 > [!IMPORTANT]
 > This documentation describes the current source on `main`. Regression scripts are included, but production reliability and performance have not been certified by live-server load testing. Use a separate test universe before deploying changes to existing player data.
 
-## New in 7.5.0
+## New in 7.6.0 — Compact binary codec
+
+The new **Compression v2.4.0** retains legacy packet codec `230` by default and adds an opt-in compact packet codec `231`. The compact encoding removes redundant per-value tags where they are unnecessary:
+
+- **Boolean array bit-packing:** eight Booleans per byte. Arrays with at least four Boolean elements use tag `9` plus a canonical bitset; unused trailing bits must be zero.
+- **Small signed integer tags:** integers from `-8` through `15` use one byte instead of a tag plus a variable-length integer. Larger numbers and fractions preserve the original lossless encodings.
+- **Version-aware decoding:** new decoders understand both v230 and v231. The encoder writes v230 unless `CompressionOptions.CompactEncoding = true`.
+- **No data loss:** decoding validates packet magic, version, checksum, canonical varints, array sizes, and padding. The opt-in changes encoding, not data values or record schema.
+- **Envelope checks:** compressed record metadata now checks the declared codec against the packet codec before decoding.
+- **Same record format:** player record format `700` remains unchanged. Transport selection, session locks, and raw fallback remain available.
+
+### Exact 80+ byte to 30 byte example
+
+For `{Flag = {<64 Boolean values>}}`, the codec regression checks that the legacy v230 packet is at least **80 bytes** and the compact v231 packet is **30 bytes or less**, and verifies the round-trip. These are **packet bytes**, not complete Roblox DataStore record bytes. Other data compress less; irreducible data cannot be shrunk losslessly.
+
+### Enable the new compact encoding
+
+~~~lua
+local Store = NexusDataStore.new({
+    Name = "PlayerData",
+    Template = PlayersData,
+    Compression = true,
+    CompressionStrategy = "smallest",
+    CompressionTransport = "auto",
+    CompressionMinBytes = 0,
+    CompressionOptions = {
+        CompactEncoding = true,
+        StringDictionary = true,
+        AllowExpansion = false,
+    },
+})
+~~~
+
+Keep existing settings in the same store constructor. `CompactEncoding` requires Compression v2.4.0; a legacy 2.3.x codec cannot write compact packets.
+
+**Safe deployment order:** First distribute v7.6.0 + Compression v2.4.0 to every server with `CompactEncoding = false` (legacy writes, both codecs readable). Let all old servers drain, then opt into 231 writes. Older v2.3.x readers **cannot decode v231**, and may fail to load players during mixed-version deployment. Do not roll back to the old decoder until v231 records have been safely rewritten to v230 or raw format.
+
+To measure a representative packet:
+
+~~~lua
+local Compression = require(script.Parent.NexusDataStore.Compression)
+local legacy = Compression.CompressTablePacket(myData, {CompactEncoding = false})
+local compact = Compression.CompressTablePacket(myData, {CompactEncoding = true})
+print("Legacy bytes:", buffer.len(legacy), "Compact bytes:", buffer.len(compact))
+assert(Compression.DecompressTable(compact).Flags ~= nil)
+~~~
+
+This optimization is strongest for Boolean arrays and small integers. Full player profiles require representative benchmarks and live Roblox verification.
+
+## Previously in 7.5.0
 
 **Opt-in MessagingService-assisted session handoff** reduces time spent waiting for an old server to release a player's profile without bypassing the authoritative `UpdateAsync` lock.
 
@@ -87,7 +136,7 @@ if not ok then warn(settings) end
 local view = profile:GetDataSnapshot()
 ```
 
-Record format `700`, compression codec `230`, and existing configuration defaults remain unchanged. Replace `DataStore.lua`; the codec stays at `2.3.4`.
+Historical v7.3 note: record format `700`, compression codec `230`, and defaults were unchanged at that time. Version 7.6 now recommends Compression `2.4.0` to support optional v231 packets.
 
 ## Contents
 
@@ -114,7 +163,7 @@ Record format `700`, compression codec `230`, and existing configuration default
 
 ### Session safety and developer tooling
 
-Version 7.5.0 builds on 7.3.0's safer callback mutations and convenient profile helpers with migration previews, storage forecasts, bounded journals, and copy-on-write updates. It preserves the existing API, strict Luau profile types, record format `700`, and Compression `2.3.4` / codec `230`. No saved-data migration is required for this library update.
+Version 7.6.0 builds on 7.3.0's safer callback mutations and convenient profile helpers with migration previews, storage forecasts, bounded journals, and copy-on-write updates. It preserves the existing API, strict Luau profile types, and record format `700`; Compression `2.4.0` reads codecs `230` and `231` while defaulting to legacy `230` writes. No record schema migration is required, but enabling v231 must follow the staged rollout above.
 
 - **Path-level copy-on-write:** `Set`, `Delete`, `Append`, `RemoveAt`, and multi-field `Patch` copy only affected table branches before validating and committing, rather than deep-cloning unrelated profile trees for each edit.
 - **Incremental direct-change baseline:** Controlled path mutations update their independent observation snapshot by path when possible. Whole-profile changes and uncertain paths retain the full-clone fallback.
@@ -262,7 +311,7 @@ ServerScriptService
 
 - The source in `DataStore.lua` must be inside the `NexusDataStore` ModuleScript.
 - `PlayersData` is a **required direct child** of `NexusDataStore`; the library reads `require(script.PlayersData)`.
-- Place `Compression` beneath `NexusDataStore`, next to it, or provide it through `CompressionModule`. The required codec is `230` from the `2.3.x` series.
+- Place `Compression` beneath `NexusDataStore`, next to it, or supply `CompressionModule`. **Compression v2.4.0 is recommended and required for compact encoding**; 2.3.x remains usable for legacy v230-only installations.
 - All persistence code must execute on the **server**. Do not place these modules in `ReplicatedStorage` for clients to control.
 - Published experiences must have Roblox DataStore permissions. Enable Studio API access only when appropriate, and use test keys/universes.
 
@@ -1000,7 +1049,7 @@ The following are the defaults in **v7.3.0**. Every option goes inside `NexusDat
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `Compression` | `true` | Enable custom compressed/raw selection |
+| `Compression` | `true` | Enable custom compressed/raw selection; compact packets remain opt-in |
 | `CompressionModule` | Auto-resolved | Override codec ModuleScript |
 | `CompressionOptions` | `{}` | Codec-specific options |
 | `CompressionStrategy` | `"balanced"` | `"balanced"` or `"smallest"` |
@@ -1025,7 +1074,7 @@ The following are the defaults in **v7.3.0**. Every option goes inside `NexusDat
 | `Debug` | `false` | Debug logging |
 | `ProfileOperations` | `false` | Opt-in per-server operation time/count profiling |
 
-The codec's `CompressionOptions` include `StringDictionary`, `DictionaryMinLength`, `DictionaryMinUses`, `DictionaryMaxEntries`, `DictionaryMaxCandidates`, `DeterministicMaps`, `MaxDepth`, `MaxNodes`, `PreallocateLimit`, and `AllowExpansion`. Tune only with representative profile benchmarks.
+The codec's `CompressionOptions` include opt-in `CompactEncoding` (v231, defaults off), `StringDictionary`, `DictionaryMinLength`, `DictionaryMinUses`, `DictionaryMaxEntries`, `DictionaryMaxCandidates`, `DeterministicMaps`, `MaxDepth`, `MaxNodes`, `PreallocateLimit`, and `AllowExpansion`. Tune only with representative profile benchmarks.
 
 ## API reference
 
@@ -1227,4 +1276,4 @@ For DataStore fundamentals and limits, consult [Roblox Data Stores](https://crea
 
 ---
 
-**Version 7.5.0** · [Source](./DataStore.lua) · [Compression](./Compression.lua) · [Tests](./tests)
+**Version 7.6.0** · [Source](./DataStore.lua) · [Compression](./Compression.lua) · [Tests](./tests)
