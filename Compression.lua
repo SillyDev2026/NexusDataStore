@@ -635,6 +635,7 @@ local function writeValue(
 				if typeof(value[index]) ~= "boolean" then allBooleans = false; break end
 			end
 			if allBooleans then
+				if depth + 1 > (options.MaxDepth :: number) then error("MAX_DEPTH_EXCEEDED") end
 				writer:U8(TAG_BOOLEAN_BITS)
 				writer:VarUInt(count)
 				local byte = 0
@@ -743,6 +744,7 @@ local function readValue(
 	elseif tag == TAG_BOOLEAN_BITS and options.CompactEncoding then
 		local count = reader:VarUInt()
 		if count < 4 then error("INVALID_BOOLEAN_ARRAY_COUNT") end
+		if depth + 1 > (options.MaxDepth :: number) then error("MAX_DEPTH_EXCEEDED") end
 		if count > (options.MaxNodes :: number) - state.Nodes then error("MAX_NODES_EXCEEDED") end
 		local bytes = math.floor((count + 7) / 8)
 		if bytes > reader:Remaining() then error("COMPRESSION_TRUNCATED") end
