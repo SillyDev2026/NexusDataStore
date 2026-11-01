@@ -27,7 +27,7 @@ The new **Compression v2.4.0** retains legacy packet codec `230` by default and 
 
 ### Exact 80+ byte to 30 byte example
 
-For `{Flags = {<64 Boolean values>}}`, the codec regression checks that the legacy v230 packet is at least **80 bytes** and the compact v231 packet is **30 bytes or less**, and verifies the round-trip. These are **packet bytes**, not complete Roblox DataStore record bytes. Other data compress less; irreducible data cannot be shrunk losslessly.
+For `{Flag = {<64 Boolean values>}}`, the codec regression checks that the legacy v230 packet is at least **80 bytes** and the compact v231 packet is **30 bytes or less**, and verifies the round-trip. These are **packet bytes**, not complete Roblox DataStore record bytes. Other data compress less; irreducible data cannot be shrunk losslessly.
 
 ### Enable the new compact encoding
 
