@@ -2623,7 +2623,11 @@ function NexusDataStore:GetStorageForecast(dataOrSession: any, warningRatio: num
 	local utilization = used / capacity
 	return {StorageBytes = used, CapacityBytes = capacity, RemainingBytes = math.max(0, capacity - used),
 		Utilization = utilization, WarningRatio = ratio, NearLimit = utilization >= ratio,
-		Transport = report.Transport, IncludesSessionLock = sessionReport, RawStorageEstimate = report.RawStorageEstimate}
+		Transport = report.Transport, IncludesSessionLock = sessionReport, RawStorageEstimate = report.RawStorageEstimate,
+		SelectedCodec = report.SelectedCodec, Compressed = report.PersistedCompressed, SelectionReason = report.SelectionReason,
+		SavedStorageBytes = report.SavedStorageBytes, ExpansionBytes = report.ExpansionBytes,
+		CandidatesChecked = report.AlternativeCodecCandidates, PackedIntegerValues = report.PackedIntegerValues,
+		PackedIntegerValueBits = report.PackedIntegerValueBits}
 end
 
 function NexusDataStore:GetVersion(): string
