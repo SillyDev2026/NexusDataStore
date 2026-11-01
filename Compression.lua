@@ -20,6 +20,9 @@ export type Report = {
 	RawBytes: number,
 	RawBits: number,
 	CodecVersion: number,
+	PackedIntegerArrays: number?,
+	PackedIntegerValues: number?,
+	PackedIntegerValueBits: number?,
 	EncodedBytes: number,
 	EncodedBits: number,
 	PayloadBytes: number,
@@ -671,6 +674,9 @@ local function writeValue(
 				if bits > 0 then writer:U8(accumulator) end
 				state.Nodes += count
 				state.RawBytes += count * 8
+				state.PackedIntegerArrays += 1
+				state.PackedIntegerValues += count
+				state.PackedIntegerValueBits += count * width
 				seen[value] = nil
 				return
 			end
@@ -913,7 +919,7 @@ function Compression.CompressTablePacket(value: any, options: Options?): (buffer
 		packetWriter:String(text)
 	end
 
-	local writeState = {Nodes = 0, RawBytes = 0}
+	local writeState = {Nodes = 0, RawBytes = 0, PackedIntegerArrays = 0, PackedIntegerValues = 0, PackedIntegerValueBits = 0}
 	writeValue(packetWriter, value, lookup, {}, writeState, normalized, 0)
 	local payloadBytes = packetWriter.Position - HEADER_BYTES
 	local checksum = adler32(packetWriter.Buffer, HEADER_BYTES, payloadBytes)
@@ -937,6 +943,9 @@ function Compression.CompressTablePacket(value: any, options: Options?): (buffer
 	local report: Report = {
 		RawBytes = rawBytes,
 		RawBits = rawBytes * 8,
+		PackedIntegerArrays = writeState.PackedIntegerArrays,
+		PackedIntegerValues = writeState.PackedIntegerValues,
+		PackedIntegerValueBits = writeState.PackedIntegerValueBits,
 		CodecVersion = normalized.BitPackedIntegers and Compression.PackedCodecVersion or (normalized.CompactEncoding and Compression.CompactCodecVersion or Compression.CodecVersion),
 		EncodedBytes = encodedBytes,
 		EncodedBits = encodedBytes * 8,
