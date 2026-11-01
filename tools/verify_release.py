@@ -32,14 +32,22 @@ check("legacy codec is the default encoder", 'CompactEncoding = source.CompactEn
 check("compact Boolean arrays pack eight values per byte", 'TAG_BOOLEAN_BITS = 9' in codec and 'index % 8 == 0' in codec)
 check("compact small integers and decoding are bounded", 'TAG_SMALL_INTEGER_LAST = 39' in codec and 'NONZERO_BOOLEAN_PADDING' in codec)
 check("store envelope carries selected packet codec", 'Codec = selectedCodec' in data and 'COMPRESSED_ENVELOPE_CODEC_MISMATCH' in data)
-check("compact setting documented with staged rollout", '## New in 7.6.0' in readme and 'CompactEncoding = true' in readme and 'Safe deployment order' in readme)
+check("compact setting documented with staged rollout", '## Previously in 7.6.0' in readme and 'CompactEncoding = true' in readme and 'Safe deployment order' in readme)
 check("compact locks default disabled", "CompactSessionLocks = config.CompactSessionLocks == true" in data)
 check("forced buffer mode defaults off and remains opt-in", "ForceCompressedBuffer = config.ForceCompressedBuffer == true" in data)
 check("forced buffer option is typed", "ForceCompressedBuffer: boolean?" in data)
 check("forced buffer requires buffer transport", "ForceCompressedBuffer requires CompressionTransport = buffer" in data)
-check("forced buffer never silently falls back to raw", "if not self.Config.ForceCompressedBuffer and rawBytes <= self.Config.MaxStoredBytes" in data)
-check("forced buffer ignores threshold safely", "if not self.Config.ForceCompressedBuffer and rawBytes < self.Config.CompressionMinBytes" in data)
+check("forced buffer never silently falls back to raw", "if not enforceCompressed and rawBytes <= self.Config.MaxStoredBytes" in data)
+check("forced buffer ignores threshold safely", "if not enforceCompressed and rawBytes < self.Config.CompressionMinBytes" in data)
 check("both compressed and raw reports can be emitted", "if self.Config.CompressionReports then" in data and "SelectionReason" in data)
+check("always-smallest remains opt-in", 'CompressionPolicy = config.CompressionPolicy or "adaptive"' in data)
+check("always-smallest forces all writes compressed", 'local enforceCompressed = alwaysCompressed or self.Config.ForceCompressedBuffer' in data and 'if not enforceCompressed and rawBytes < self.Config.CompressionMinBytes' in data)
+check("always-smallest evaluates four compression options", 'local compactModes = alwaysCompressed and {false, true}' in data and 'bestReport.AlternativeCodecCandidates = #variants * #compactModes' in data)
+check("always-smallest selects whole-record transport size", 'if candidate ~= nil and candidateBytes < bestBytes then' in data and 'bestReport.SelectedCodec = bestEnvelope.Codec' in data)
+check("always-smallest never raw-falls-back at size limit", 'if not enforceCompressed and rawBytes <= self.Config.MaxStoredBytes then' in data and 'STORED_BYTES_EXCEEDED' in data)
+check("always-smallest reports expansion accurately", 'bestReport.CompressionExpanded = bestBytes > rawBytes' in data and 'bestReport.ExpansionBytes = math.max(0, bestBytes - rawBytes)' in data)
+check("always-smallest rejects invalid combinations", 'config.CompressionPolicy ~= "always-smallest" or config.ForceCompressedBuffer ~= true' in data and 'config.CompressionPolicy ~= "always-smallest" or config.Compression ~= false' in data)
+check("always-smallest has full setup and limits documentation", '## New in 7.7.0' in readme and 'CompressionPolicy = "always-smallest"' in readme and 'Safe rollout' in readme)
 check("no-op suppression opt-in", "SkipUnchangedMutations = config.SkipUnchangedMutations == true" in data)
 check("profiling opt-in", "ProfileOperations = config.ProfileOperations == true" in data)
 check("coalesced save metric present", "SavesCoalesced += 1" in data)
@@ -88,6 +96,7 @@ required = (
     "MutationSafetyRegression.server.lua", "PersistenceRecoveryRegression.server.lua",
     "SchemaMigrationRegression.server.lua", "CompressionRegression.server.lua",
     "ForcedBufferRegression.server.lua", "SessionLockWaitRegression.server.lua", "SessionHandoffRegression.server.lua",
+    "AlwaysCompressedRegression.server.lua", "PortableCompressionPolicyRegression.luau",
     "CompactCodecRegression.server.lua",
     "MillionLocalBenchmark.server.lua", "MillionMockBackendBenchmark.server.lua",
 )
@@ -95,6 +104,12 @@ check("core regression and benchmark scripts exist", all((test_dir / name).is_fi
 forced_test = (test_dir / "ForcedBufferRegression.server.lua").read_text(encoding="utf-8")
 check("forced buffer mock-backed save test present", all(token in forced_test for token in ("ForceCompressedBuffer", "OpenAsync", "SaveAsync", "ReleaseAsync", "STORED_BYTES_EXCEEDED")))
 check("forced buffer legacy-compatibility test present", "legacyDecoded" in forced_test and "crossDecoded" in forced_test)
+always_test = (test_dir / "AlwaysCompressedRegression.server.lua").read_text(encoding="utf-8")
+policy_test = (test_dir / "PortableCompressionPolicyRegression.luau").read_text(encoding="utf-8")
+check("always-compressed test verifies real persisted envelopes", all(token in always_test for token in ("_EncodeRecord", "SaveAsync", "ReleaseAsync", "Compressed == true", "StorageBytes == minimum")))
+check("portable always-compressed selector tests included", all(token in policy_test for token in ("CompressionExpanded", "STORED_BYTES_EXCEEDED", "AlternativeCodecCandidates", "always-compressed-smallest")))
+runner = (ROOT / "tools" / "run_behavioral_tests.py").read_text(encoding="utf-8")
+check("portable policy tests execute in GitHub Actions", "PortableCompressionPolicyRegression.luau" in runner)
 lock_wait_test = (test_dir / "SessionLockWaitRegression.server.lua").read_text(encoding="utf-8")
 check("contention regression covers ownership, timeout, shutdown and context guards", all(token in lock_wait_test for token in ("SESSION_LOCKED", "ReleaseAsync", "SESSION_CONTEXT_CONFLICT", "SESSION_LOCK_WAIT_TIMEOUT", "CloseAsync")))
 handoff_test = (test_dir / "SessionHandoffRegression.server.lua").read_text(encoding="utf-8")
