@@ -100,6 +100,8 @@ export type StoreConfig<T> = {
 	HeartbeatInterval: number?,
 	WaitForSessionLock: boolean?,
 	SessionLockRetryInterval: number?,
+	EnableSessionHandoff: boolean?,
+	SessionHandoffCooldown: number?,
 	RetryAttempts: number?,
 	RetryBaseDelay: number?,
 	RetryMaxDelay: number?,
@@ -277,7 +279,7 @@ local EncodingService = game:GetService("EncodingService")
 
 local NexusDataStore: any = {}
 NexusDataStore.__index = NexusDataStore
-NexusDataStore.Version = "7.4.0"
+NexusDataStore.Version = "7.5.0"
 NexusDataStore.RecordFormat = 700
 NexusDataStore.RequiredCompressionVersion = "2.3.0"
 
@@ -1515,7 +1517,7 @@ function NexusDataStore:_LockIsActive(lock: any): boolean
 end
 
 function NexusDataStore:_Publish(eventName: string, payload: any)
-	if not self.Config.EnableCrossServerEvents then
+	if not self.Config.EnableCrossServerEvents and not (self.Config.EnableSessionHandoff and eventName == "Released") then
 		return
 	end
 	task.spawn(function()
@@ -1523,6 +1525,8 @@ function NexusDataStore:_Publish(eventName: string, payload: any)
 			Version = NexusDataStore.Version,
 			Event = eventName,
 			Store = self.Config.Name,
+			Scope = self.Config.Scope,
+			KeyPrefix = self.Config.KeyPrefix,
 			JobId = self.JobId,
 			Payload = payload,
 			At = unix(),
@@ -1532,6 +1536,67 @@ function NexusDataStore:_Publish(eventName: string, payload: any)
 			self.Metrics.CrossServerPublishFailed += 1
 			self:_Fire("CrossServerError", tostring(err))
 		end
+	end)
+end
+
+-- MessagingService is advisory: an owner must still pass the normal release commit.
+function NexusDataStore:_PublishHandoffRequest(key: string, ownerJobId: string, ownerSessionId: string)
+	if not self.Config.EnableSessionHandoff or not self.CrossServerSubscription or self.Closing or self.Closed then return end
+	task.spawn(function()
+		if self.Closing or self.Closed then return end
+		local packet = {
+			Version = NexusDataStore.Version,
+			Event = "HandoffRequest",
+			Store = self.Config.Name,
+			Scope = self.Config.Scope,
+			KeyPrefix = self.Config.KeyPrefix,
+			JobId = self.JobId,
+			Payload = {Key = key, OwnerJobId = ownerJobId, OwnerSessionId = ownerSessionId},
+			At = unix(),
+		}
+		local ok, err = pcall(MessagingService.PublishAsync, MessagingService, self.Config.CrossServerTopic, packet)
+		if ok then
+			self.Metrics.HandoffRequestsSent += 1
+		else
+			self.Metrics.HandoffMessagesFailed += 1
+			self:_Fire("SessionHandoffError", tostring(err))
+		end
+	end)
+end
+
+-- Ignore stale, mistargeted and cross-store messages; never release a connected player's profile.
+function NexusDataStore:_HandleHandoffPacket(packet: any)
+	if not self.Config.EnableSessionHandoff or self.Closed or typeof(packet) ~= "table" then return end
+	if packet.Store ~= self.Config.Name or packet.Scope ~= self.Config.Scope or packet.KeyPrefix ~= self.Config.KeyPrefix then return end
+	if typeof(packet.JobId) ~= "string" or packet.JobId == self.JobId then return end
+	if typeof(packet.At) ~= "number" or math.abs(unix() - packet.At) > 30 then return end
+	local payload = packet.Payload
+	if typeof(payload) ~= "table" or typeof(payload.Key) ~= "string" then return end
+	if packet.Event == "Released" then
+		if self.HandoffWakeGeneration[payload.Key] == nil then return end
+		self.HandoffWakeGeneration[payload.Key] += 1
+		self.Metrics.HandoffWakeups += 1
+		self:_Fire("SessionHandoffWake", payload.Key)
+		return
+	end
+	if packet.Event ~= "HandoffRequest" or payload.OwnerJobId ~= self.JobId then return end
+	local session = self.Sessions[payload.Key]
+	if not session or session.SessionId ~= payload.OwnerSessionId or not session:IsActive() or session.Releasing or session.HandoffPending then return end
+	if not session.Player or session.Player.Parent == Players then
+		self.Metrics.HandoffRequestsDeclined += 1
+		return
+	end
+	session.HandoffPending = true
+	self.Metrics.HandoffReleaseAttempts += 1
+	task.spawn(function()
+		if session:IsActive() and session.Player and session.Player.Parent ~= Players and not self.Closing then
+			local protected, ok, err = pcall(self.ReleaseAsync, self, session)
+			if not protected or not ok then
+				self.Metrics.HandoffReleaseFailed += 1
+				self:_Fire("SessionHandoffError", tostring(protected and err or ok))
+			end
+		end
+		session.HandoffPending = false
 	end)
 end
 
@@ -1639,17 +1704,22 @@ function NexusDataStore:OpenAsync(key: string | number, context: OpenContext?): 
 		end
 		local sessionId = HttpService:GenerateGUID(false)
 		local acquireError
+		local lockedOwner
+		local lastHandoffRequestAt = -math.huge
+		self.HandoffWakeGeneration[normalizedKey] = 0
 		local recordForSession
 		local encodeReport
 		local startTime = openStartedAt
 
 		local success, result
 		repeat
+			local wakeGeneration = self.HandoffWakeGeneration[normalizedKey] or 0
 			if self.Closing or self.Closed then return nil, "STORE_CLOSING" end
 			if openContext.Player and openContext.Player.Parent ~= Players then return nil, "PLAYER_LEFT" end
 			success, result = self:_Retry(function()
 				return self.DataStore:UpdateAsync(normalizedKey, function(raw, keyInfo)
 					acquireError = nil
+					lockedOwner = nil
 					recordForSession = nil
 					encodeReport = nil
 					local record, decodeErr = self:_DecodeRecord(raw)
@@ -1664,6 +1734,7 @@ function NexusDataStore:OpenAsync(key: string | number, context: OpenContext?): 
 						local sameOwner = record.Lock.JobId == self.JobId and record.Lock.SessionId == sessionId
 						if not sameOwner then
 							acquireError = "SESSION_LOCKED"
+							lockedOwner = {JobId = record.Lock.JobId, SessionId = record.Lock.SessionId}
 							return nil
 						end
 					end
@@ -1712,7 +1783,21 @@ function NexusDataStore:OpenAsync(key: string | number, context: OpenContext?): 
 			end
 			self.Metrics.SessionLockRetries += 1
 			self:_Fire("SessionLockWait", normalizedKey, remaining)
-			task.wait(math.min(self.Config.SessionLockRetryInterval, remaining))
+			if self.Config.EnableSessionHandoff and lockedOwner and typeof(lockedOwner.JobId) == "string"
+				and typeof(lockedOwner.SessionId) == "string" and now() - lastHandoffRequestAt >= self.Config.SessionHandoffCooldown then
+				lastHandoffRequestAt = now()
+				self:_PublishHandoffRequest(normalizedKey, lockedOwner.JobId, lockedOwner.SessionId)
+			end
+			local retryDeadline = now() + math.min(self.Config.SessionLockRetryInterval, remaining)
+			if self.Config.EnableSessionHandoff and self.CrossServerSubscription then
+				while not self.Closing and not self.Closed and (self.HandoffWakeGeneration[normalizedKey] or 0) == wakeGeneration do
+					local waitLeft = retryDeadline - now()
+					if waitLeft <= 0 or (openContext.Player and openContext.Player.Parent ~= Players) then break end
+					task.wait(math.min(0.1, waitLeft))
+				end
+			else
+				task.wait(math.max(0, retryDeadline - now()))
+			end
 		until false
 
 		if not success then
@@ -1754,6 +1839,7 @@ function NexusDataStore:OpenAsync(key: string | number, context: OpenContext?): 
 		return session
 	end)
 	self.OpenInFlight -= 1
+	self.HandoffWakeGeneration[normalizedKey] = nil
 	return openedSession, openError
 end
 
@@ -3581,6 +3667,7 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 	assert(config.SkipUnchangedMutations == nil or typeof(config.SkipUnchangedMutations) == "boolean", "SkipUnchangedMutations must be a boolean")
 	assert(config.ProfileOperations == nil or typeof(config.ProfileOperations) == "boolean", "ProfileOperations must be a boolean")
 	assert(config.WaitForSessionLock == nil or typeof(config.WaitForSessionLock) == "boolean", "WaitForSessionLock must be a boolean")
+	assert(config.EnableSessionHandoff == nil or typeof(config.EnableSessionHandoff) == "boolean", "EnableSessionHandoff must be a boolean")
 	assert(config.OrderedDataStores == nil or typeof(config.OrderedDataStores) == "table", "OrderedDataStores must be a table")
 	assert(config.PlayerKey == nil or typeof(config.PlayerKey) == "function", "PlayerKey must be a function")
 	assert(config.KeyPrefix == nil or typeof(config.KeyPrefix) == "string", "KeyPrefix must be a string")
@@ -3625,8 +3712,10 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 		AutoSaveInterval = configNumber(config.AutoSaveInterval, 30, 10, "AutoSaveInterval"),
 		LockTimeout = lockTimeout,
 		HeartbeatInterval = heartbeatInterval,
-		WaitForSessionLock = config.WaitForSessionLock == true,
+		WaitForSessionLock = config.WaitForSessionLock == true or config.EnableSessionHandoff == true,
 		SessionLockRetryInterval = configNumber(config.SessionLockRetryInterval, 2, 0.5, "SessionLockRetryInterval", false, 30),
+		EnableSessionHandoff = config.EnableSessionHandoff == true,
+		SessionHandoffCooldown = configNumber(config.SessionHandoffCooldown, 6, 1, "SessionHandoffCooldown", false, 60),
 		RetryAttempts = configNumber(config.RetryAttempts, 6, 1, "RetryAttempts", true),
 		RetryBaseDelay = retryBaseDelay,
 		RetryMaxDelay = retryMaxDelay,
@@ -3669,6 +3758,7 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 	self.OpenLocks = {}
 	self.OpenInFlight = 0
 	self.Events = {}
+	self.HandoffWakeGeneration = {}
 	self.Performance = {}
 	self.OrderedStores = {}
 	self.Closed = false
@@ -3690,6 +3780,12 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 		Heartbeats = 0,
 		SessionLost = 0,
 		SessionLockRetries = 0,
+		HandoffRequestsSent = 0,
+		HandoffRequestsDeclined = 0,
+		HandoffReleaseAttempts = 0,
+		HandoffReleaseFailed = 0,
+		HandoffWakeups = 0,
+		HandoffMessagesFailed = 0,
 		TypeErrors = 0,
 		DirectChanges = 0,
 		BytesEncoded = 0,
@@ -3743,10 +3839,11 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 		assert(codecOK, "Invalid Compression v2.3.x configuration or template: " .. tostring(codecErr))
 	end
 
-	if self.Config.EnableCrossServerEvents then
+	if self.Config.EnableCrossServerEvents or self.Config.EnableSessionHandoff then
 		local ok, subscription = pcall(MessagingService.SubscribeAsync, MessagingService, self.Config.CrossServerTopic, function(message)
 			local packet = message.Data
-			if typeof(packet) == "table"
+			if typeof(packet) == "table" and self.Config.EnableSessionHandoff then self:_HandleHandoffPacket(packet) end
+			if self.Config.EnableCrossServerEvents and typeof(packet) == "table"
 				and packet.JobId ~= self.JobId
 				and typeof(packet.Event) == "string"
 				and #packet.Event > 0 then
@@ -3757,6 +3854,7 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 			self.CrossServerSubscription = subscription
 		else
 			self:_Fire("CrossServerError", tostring(subscription))
+			if self.Config.EnableSessionHandoff then self:_Fire("SessionHandoffError", "SUBSCRIBE_FAILED:" .. tostring(subscription)) end
 		end
 	end
 

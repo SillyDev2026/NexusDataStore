@@ -2,19 +2,50 @@
 
 **Typed, session-aware data persistence for Roblox.**
 
-![Version](https://img.shields.io/badge/NexusDataStore-7.4.0-2563eb)
+![Version](https://img.shields.io/badge/NexusDataStore-7.5.0-2563eb)
 ![Codec](https://img.shields.io/badge/Compression-2.3.4-0f766e)
 ![Luau](https://img.shields.io/badge/language-Luau-00a2ff)
 ![Platform](https://img.shields.io/badge/platform-Roblox-222222)
 
 NexusDataStore brings standard Roblox DataStore persistence, session ownership, typed player profiles, validation, migrations, snapshots, adaptive compression, and numeric leaderboards into one server-side library.
 
-**Current version:** `7.4.0` · **Compression:** `2.3.4` / codec `230` · **Record format:** `700`
+**Current version:** `7.5.0` · **Compression:** `2.3.4` / codec `230` · **Record format:** `700`
 
 > [!IMPORTANT]
 > This documentation describes the current source on `main`. Regression scripts are included, but production reliability and performance have not been certified by live-server load testing. Use a separate test universe before deploying changes to existing player data.
 
-## New in 7.4.0
+## New in 7.5.0
+
+**Opt-in MessagingService-assisted session handoff** reduces time spent waiting for an old server to release a player's profile without bypassing the authoritative `UpdateAsync` lock.
+
+- `EnableSessionHandoff = true` activates handoff messaging and automatically enables `WaitForSessionLock`. The default is `false`.
+- Contended loads publish a **targeted release request** to the owning server, including the observed job ID and session ID. Requests have a per-load `SessionHandoffCooldown` (default `6` seconds).
+- The owner releases **only if the recorded session is still the target, belongs to a player who has left**, and is not already releasing. Active players and non-player records cannot be displaced by a message.
+- A successful release sends a lightweight notification to awaken a waiting load ahead of its normal retry interval. Wait states are cleaned up after each open attempt, avoiding per-player retention.
+- Invalid, cross-store, mismatched, or stale (over 30 seconds) messages are rejected. Missing or failed subscriptions fall back to timed polling.
+- Added counters: `HandoffRequestsSent`, `HandoffRequestsDeclined`, `HandoffReleaseAttempts`, `HandoffReleaseFailed`, `HandoffWakeups`, `HandoffMessagesFailed`; events `SessionHandoffWake` and `SessionHandoffError`.
+- New mock Studio handoff/crash recovery regression and portable message-validation tests.
+
+### Recommended player-store settings
+
+~~~lua
+local Store = NexusDataStore.new({
+    Name = "PlayerData",
+    Template = PlayersData,
+    AutoSave = true,
+    BudgetAware = true,
+    EnableSessionHandoff = true,
+    SessionLockRetryInterval = 5,
+    SessionHandoffCooldown = 6,
+    LoadTimeout = 30,
+})
+~~~
+
+Keep your current store name, template, schema and compression options in this **same** constructor. The longer retry interval reduces repeated contention requests when notifications work; missing messages can delay a retry until the interval ends. A `LoadTimeout` still bounds waiting. No session is force-stolen. Roblox MessagingService is **best effort**, has message/subscription quotas, and must never be the source of truth for player data. See [Roblox MessagingService](https://create.roblox.com/docs/reference/engine/classes/MessagingService).
+
+**Compatibility:** v7.5.0 keeps record format `700` and compression codec `230`; no saved-data migration is required. Mixed-version servers continue to rely on lock-based retries; old servers do not understand handoff messages. Roll out to a staging universe first. Portable/CLI tests do not establish real-world cross-server service reliability.
+
+## Previously in 7.4.0
 
 Version 7.4.0 adds **opt-in bounded session-lock waiting**, rather than immediately failing every player load with `SESSION_LOCKED`. The default remains unchanged for existing games.
 
@@ -24,7 +55,7 @@ Version 7.4.0 adds **opt-in bounded session-lock waiting**, rather than immediat
 - `SessionLockWait` event and `GetMetrics().SessionLockRetries` provide visibility into contention.
 - The Studio mock regression `tests/SessionLockWaitRegression.server.lua` covers two mock servers, safe handoff after release, bounded timeouts, shutdown cancellation, and conflicting user contexts.
 
-This is **polling-based lock waiting**, not ProfileStore's MessagingService-driven handoff. It is intentionally conservative: no force-stealing and no guarantee of availability when the previous owner is alive or the backend is unavailable. Record format `700` and compression codec `230` are unchanged.
+Version 7.4.0 introduced **polling-based lock waiting**; v7.5.0 extends it with best-effort MessagingService signals. It is intentionally conservative: no force-stealing and no guarantee of availability when the previous owner is alive or the backend is unavailable. Record format `700` and compression codec `230` are unchanged.
 
 ### Enable session contention waiting
 
@@ -83,7 +114,7 @@ Record format `700`, compression codec `230`, and existing configuration default
 
 ### Session safety and developer tooling
 
-Version 7.4.0 builds on 7.3.0's safer callback mutations and convenient profile helpers with migration previews, storage forecasts, bounded journals, and copy-on-write updates. It preserves the existing API, strict Luau profile types, record format `700`, and Compression `2.3.4` / codec `230`. No saved-data migration is required for this library update.
+Version 7.5.0 builds on 7.3.0's safer callback mutations and convenient profile helpers with migration previews, storage forecasts, bounded journals, and copy-on-write updates. It preserves the existing API, strict Luau profile types, record format `700`, and Compression `2.3.4` / codec `230`. No saved-data migration is required for this library update.
 
 - **Path-level copy-on-write:** `Set`, `Delete`, `Append`, `RemoveAt`, and multi-field `Patch` copy only affected table branches before validating and committing, rather than deep-cloning unrelated profile trees for each edit.
 - **Incremental direct-change baseline:** Controlled path mutations update their independent observation snapshot by path when possible. Whole-profile changes and uncertain paths retain the full-clone fallback.
@@ -959,7 +990,9 @@ The following are the defaults in **v7.3.0**. Every option goes inside `NexusDat
 | `MinimumSaveInterval` | `3` seconds | Normal-priority save throttle |
 | `LoadTimeout` | `30` seconds | Load deadline, including opt-in lock waiting |
 | `WaitForSessionLock` | `false` | Opt-in retry on `SESSION_LOCKED`; never force-steals |
-| `SessionLockRetryInterval` | `2` seconds | Delay between locked-key acquisition attempts (0.5–30 seconds) |
+| `SessionLockRetryInterval` | `2` seconds | Fallback interval between locked-key attempts (0.5–30 seconds) |
+| `EnableSessionHandoff` | `false` | Subscribe/publish safe targeted handoff messages; also enables lock waiting |
+| `SessionHandoffCooldown` | `6` seconds | Minimum spacing of requests per waiting load (1–60 seconds) |
 | `SaveTimeout` | `30` seconds | Save deadline |
 | `AutoPlayerLifecycle` | `false` | Attach join/leave management in constructor |
 
@@ -987,7 +1020,7 @@ The following are the defaults in **v7.3.0**. Every option goes inside `NexusDat
 | Option | Default | Description |
 | --- | --- | --- |
 | `OrderedDataStores` | `{}` | Ordered leaderboard configurations |
-| `EnableCrossServerEvents` | `false` | Publish/subscribe optional MessagingService events |
+| `EnableCrossServerEvents` | `false` | Publish/subscribe optional general MessagingService events; handoff works independently |
 | `CrossServerTopic` | Derived | MessagingService topic |
 | `Debug` | `false` | Debug logging |
 | `ProfileOperations` | `false` | Opt-in per-server operation time/count profiling |
@@ -1072,7 +1105,7 @@ Store:On("OrderedSyncFailed", function(profile, reason)
 end)
 ~~~
 
-Common event names include `Opened`, `Saved`, `Released`, `Changed`, `SessionLockWait`, `SessionLost`, `PlayerLoadFailed`, `PlayerReleaseFailed`, `AutoSaveFailed`, `HeartbeatFailed`, `CompressionReport`, `OrderedSyncCompleted`, `OrderedSyncFailed`, `CloseFailed`, and `Closed`.
+Common event names include `Opened`, `Saved`, `Released`, `Changed`, `SessionLockWait`, `SessionHandoffWake`, `SessionHandoffError`, `SessionLost`, `PlayerLoadFailed`, `PlayerReleaseFailed`, `AutoSaveFailed`, `HeartbeatFailed`, `CompressionReport`, `OrderedSyncCompleted`, `OrderedSyncFailed`, `CloseFailed`, and `Closed`.
 
 ### Inspect health and metrics
 
@@ -1124,9 +1157,9 @@ These are examples, not the complete error-code list. Check returned values and 
 
 ## Testing and troubleshooting
 
-> **v7.4.0 validation status:** This release adds a Studio-only mock two-server test. A passing compile or static check does not establish live Roblox server handoff reliability. The historical v7.3.0 results below remain version-specific.
+> **v7.5.0 validation status:** This release adds a Studio-only mock two-server test. A passing compile or static check does not establish live Roblox server handoff reliability. The historical v7.3.0 results below remain version-specific.
 
-The [`tests/` directory](./tests) includes [SessionLockWaitRegression.server.lua](./tests/SessionLockWaitRegression.server.lua) for bounded lock contention and shutdown tests, along with [DeveloperToolsRegression.server.lua](./tests/DeveloperToolsRegression.server.lua) for migration previews, storage forecasts, and bounded journals, plus Roblox Studio regression scripts for codec correctness, malformed payloads, copy-on-write isolation, **zero-change suppression, coalesced saves and profiling** (see [EfficiencyRegression.server.lua](./tests/EfficiencyRegression.server.lua)), compact locks, ambiguous acknowledgements, and load/close races. Place test Scripts with the required ModuleScripts as directed by their headers; do **not** run them against production player keys.
+The [`tests/` directory](./tests) includes [SessionHandoffRegression.server.lua](./tests/SessionHandoffRegression.server.lua) for two-server mocked messaging and expired-lock recovery, plus [SessionLockWaitRegression.server.lua](./tests/SessionLockWaitRegression.server.lua) for bounded lock contention and shutdown tests, along with [DeveloperToolsRegression.server.lua](./tests/DeveloperToolsRegression.server.lua) for migration previews, storage forecasts, and bounded journals, plus Roblox Studio regression scripts for codec correctness, malformed payloads, copy-on-write isolation, **zero-change suppression, coalesced saves and profiling** (see [EfficiencyRegression.server.lua](./tests/EfficiencyRegression.server.lua)), compact locks, ambiguous acknowledgements, and load/close races. Place test Scripts with the required ModuleScripts as directed by their headers; do **not** run them against production player keys.
 
 ### Recorded v7.3.0 validation
 
@@ -1194,4 +1227,4 @@ For DataStore fundamentals and limits, consult [Roblox Data Stores](https://crea
 
 ---
 
-**Version 7.4.0** · [Source](./DataStore.lua) · [Compression](./Compression.lua) · [Tests](./tests)
+**Version 7.5.0** · [Source](./DataStore.lua) · [Compression](./Compression.lua) · [Tests](./tests)

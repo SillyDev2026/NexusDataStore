@@ -11,7 +11,11 @@ parser.add_argument('--luau', default='luau')
 args = parser.parse_args()
 source = (ROOT / 'DataStore.lua').read_text()
 source = source.replace('local PlayersData = require(script.PlayersData)', 'local PlayersData = {}', 1)
-prelude = '''local game = {GetService = function() return {} end}
+prelude = '''local services = {}
+local game = {GetService = function(_self, name)
+    if services[name] == nil then services[name] = {} end
+    return services[name]
+end}
 local Enum = {DataStoreRequestType = {}}
 local task = {spawn = function(callback, ...) callback(...) end}
 local DataStore = (function()

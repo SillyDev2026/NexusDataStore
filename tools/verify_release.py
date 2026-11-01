@@ -42,7 +42,15 @@ check("lock waiting defaults off", "WaitForSessionLock = config.WaitForSessionLo
 check("lock retry interval is validated", 'configNumber(config.SessionLockRetryInterval, 2, 0.5, "SessionLockRetryInterval", false, 30)' in data)
 check("context conflicts rejected", '"SESSION_CONTEXT_CONFLICT"' in data)
 check("session contention metrics present", "SessionLockRetries += 1" in data)
-check("session contention documented", "## New in 7.4.0" in readme and "SessionLockRetryInterval" in readme)
+check("handoff disabled by default", "EnableSessionHandoff = config.EnableSessionHandoff == true" in data)
+check("handoff uses bounded cooldown", 'configNumber(config.SessionHandoffCooldown, 6, 1, "SessionHandoffCooldown", false, 60)' in data)
+check("handoff uses authoritative owner and session fencing", "payload.OwnerJobId ~= self.JobId" in data and "session.SessionId ~= payload.OwnerSessionId" in data)
+check("handoff refuses connected players and arbitrary profiles", "not session.Player or session.Player.Parent == Players" in data)
+check("handoff wait state cleaned up", "self.HandoffWakeGeneration[normalizedKey] = nil" in data)
+check("handoff messages are independent of general events", "or self.Config.EnableSessionHandoff then" in data)
+check("handoff release notification present", 'eventName == "Released"' in data)
+check("handoff documented with service limits", "MessagingService is **best effort**" in readme)
+check("session contention documented", "## Previously in 7.4.0" in readme and "SessionLockRetryInterval" in readme)
 check("snapshot protection retained", '"SNAPSHOT_NOT_OWNED"' in data)
 check("key metadata preservation retained", "persistWithKeyInfo(encoded, keyInfo)" in data)
 methods = [
@@ -74,7 +82,7 @@ required = (
     "DeveloperToolsRegression.server.lua",
     "MutationSafetyRegression.server.lua", "PersistenceRecoveryRegression.server.lua",
     "SchemaMigrationRegression.server.lua", "CompressionRegression.server.lua",
-    "ForcedBufferRegression.server.lua", "SessionLockWaitRegression.server.lua",
+    "ForcedBufferRegression.server.lua", "SessionLockWaitRegression.server.lua", "SessionHandoffRegression.server.lua",
     "MillionLocalBenchmark.server.lua", "MillionMockBackendBenchmark.server.lua",
 )
 check("core regression and benchmark scripts exist", all((test_dir / name).is_file() for name in required))
@@ -83,6 +91,8 @@ check("forced buffer mock-backed save test present", all(token in forced_test fo
 check("forced buffer legacy-compatibility test present", "legacyDecoded" in forced_test and "crossDecoded" in forced_test)
 lock_wait_test = (test_dir / "SessionLockWaitRegression.server.lua").read_text(encoding="utf-8")
 check("contention regression covers ownership, timeout, shutdown and context guards", all(token in lock_wait_test for token in ("SESSION_LOCKED", "ReleaseAsync", "SESSION_CONTEXT_CONFLICT", "SESSION_LOCK_WAIT_TIMEOUT", "CloseAsync")))
+handoff_test = (test_dir / "SessionHandoffRegression.server.lua").read_text(encoding="utf-8")
+check("mock handoff and crash recovery coverage present", all(token in handoff_test for token in ("_HandleHandoffPacket", "_PublishHandoffRequest", "HandoffWakeups", "SESSION_LOST", "ExpiresAt")))
 for filename, required_count in (
     ("MillionLocalBenchmark.server.lua", 32),
     ("MillionMockBackendBenchmark.server.lua", 21),
