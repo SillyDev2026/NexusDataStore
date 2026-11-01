@@ -1573,7 +1573,8 @@ function NexusDataStore:_HandleHandoffPacket(packet: any)
 	local payload = packet.Payload
 	if typeof(payload) ~= "table" or typeof(payload.Key) ~= "string" then return end
 	if packet.Event == "Released" then
-		self.HandoffWakeGeneration[payload.Key] = (self.HandoffWakeGeneration[payload.Key] or 0) + 1
+		if self.HandoffWakeGeneration[payload.Key] == nil then return end
+		self.HandoffWakeGeneration[payload.Key] += 1
 		self.Metrics.HandoffWakeups += 1
 		self:_Fire("SessionHandoffWake", payload.Key)
 		return
@@ -1705,6 +1706,7 @@ function NexusDataStore:OpenAsync(key: string | number, context: OpenContext?): 
 		local acquireError
 		local lockedOwner
 		local lastHandoffRequestAt = -math.huge
+		self.HandoffWakeGeneration[normalizedKey] = 0
 		local recordForSession
 		local encodeReport
 		local startTime = openStartedAt
@@ -1837,6 +1839,7 @@ function NexusDataStore:OpenAsync(key: string | number, context: OpenContext?): 
 		return session
 	end)
 	self.OpenInFlight -= 1
+	self.HandoffWakeGeneration[normalizedKey] = nil
 	return openedSession, openError
 end
 
