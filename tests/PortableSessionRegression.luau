@@ -201,6 +201,51 @@ test("Handoff request releases only detached matching sessions", function()
     assert(calls == 1, "Duplicate release attempt")
 end)
 
+test("Connected players cannot be released by handoff messages", function()
+    local session = profile()
+    local store = session.Store
+    store.Config.Name = "HandoffTest"
+    store.Config.Scope = "Global"
+    store.Config.KeyPrefix = ""
+    store.Config.EnableSessionHandoff = true
+    store.JobId = "current-job"
+    store.HandoffWakeGeneration = {}
+    store.Metrics.HandoffRequestsDeclined = 0
+    store.Metrics.HandoffReleaseAttempts = 0
+    local player = {Parent = game:GetService("Players")}
+    session.Player = player
+    local calls = 0
+    store.ReleaseAsync = function(_self, target)
+        calls += 1
+        target.Active = false
+        return true
+    end
+    local packet = {Store = "HandoffTest", Scope = "Global", KeyPrefix = "", JobId = "other-job", Event = "HandoffRequest", At = os.time(), Payload = {Key = "test", OwnerJobId = "current-job", OwnerSessionId = "session"}}
+    store:_HandleHandoffPacket(packet)
+    assert(session:IsActive() and calls == 0 and store.Metrics.HandoffRequestsDeclined == 1)
+    player.Parent = nil
+    store:_HandleHandoffPacket(packet)
+    assert(not session:IsActive() and calls == 1, "Departed player was not released")
+end)
+
+test("Handoff release errors clear pending state", function()
+    local session = profile()
+    local store = session.Store
+    store.Config.Name = "HandoffTest"
+    store.Config.Scope = "Global"
+    store.Config.KeyPrefix = ""
+    store.Config.EnableSessionHandoff = true
+    store.JobId = "current-job"
+    store.HandoffWakeGeneration = {}
+    store.Metrics.HandoffReleaseAttempts = 0
+    store.Metrics.HandoffReleaseFailed = 0
+    session.Player = {Parent = nil}
+    store.ReleaseAsync = function() error("simulated backend exception") end
+    store:_HandleHandoffPacket({Store = "HandoffTest", Scope = "Global", KeyPrefix = "", JobId = "other-job", Event = "HandoffRequest", At = os.time(), Payload = {Key = "test", OwnerJobId = "current-job", OwnerSessionId = "session"}})
+    assert(store.Metrics.HandoffReleaseFailed == 1 and session.HandoffPending == false)
+    assert(session:IsActive(), "Failed handoff invalidated owner session")
+end)
+
 test("Released notifications wake waiters without changing ownership", function()
     local session = profile()
     local store = session.Store
