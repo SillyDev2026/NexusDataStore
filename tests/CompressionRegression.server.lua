@@ -1,5 +1,5 @@
 --!strict
--- Roblox Studio server regression tests for Compression v2.4.0 (legacy 230, compact 231).
+-- Roblox Studio server regression tests for Compression v2.5.0 (legacy 230, compact 231, packed 232).
 -- Place this Script beside a ModuleScript named Compression and run Play/Run.
 local Compression = require(script.Parent:WaitForChild("Compression"))
 
@@ -39,9 +39,9 @@ local function makePacket(payload: {number}, codec: number?): buffer
     return packet
 end
 
-assert(Compression.Version() == "2.4.0", "Unexpected compression version")
-assert(Compression.CodecVersion == 230 and Compression.CompactCodecVersion == 231, "Legacy/compact codecs changed")
-assert(Compression.TableMode({}) == "buffer-v230" and Compression.TableMode({}, {CompactEncoding = true}) == "buffer-v231", "Packet modes changed")
+assert(Compression.Version() == "2.5.0", "Unexpected compression version")
+assert(Compression.CodecVersion == 230 and Compression.CompactCodecVersion == 231 and Compression.PackedCodecVersion == 232, "Codec compatibility changed")
+assert(Compression.TableMode({}) == "buffer-v230" and Compression.TableMode({}, {CompactEncoding = true}) == "buffer-v231" and Compression.TableMode({}, {BitPackedIntegers = true}) == "buffer-v232", "Packet modes changed")
 
 local fixtures = {
     {Name = "empty table", Value = {}},
@@ -139,4 +139,45 @@ passed += 1
 assertRejected(makePacket({0, 16}, 230), "UNKNOWN_TAG")
 passed += 1
 
-print(("Compression v2.4.0 codec230/231 regression PASS: %d cases"):format(passed))
+-- v232 bit width is selected from real signed integer array contents; no padding data is lost.
+for length = 8, 256 do
+    local values = {}
+    local range = length % 8
+    for index = 1, length do
+        local magnitude = index % (2 ^ range)
+        values[index] = index % 2 == 0 and magnitude or -magnitude
+    end
+    local fixture = {Integers = values, Flags = {true, false, true, false, true, false, true, false}, Other = 1.25}
+    local packet, report = Compression.CompressTablePacket(fixture, {BitPackedIntegers = true, StringDictionary = false})
+    assert(report.CodecVersion == 232 and buffer.readu16(packet, 4) == 232)
+    local restored = Compression.DecompressTable(packet)
+    assert(equals(fixture, restored), "Packed array roundtrip failed: " .. tostring(length))
+    passed += 1
+end
+
+local tiny = {}
+for index = 1, 64 do tiny[index] = index % 4 end
+local oldIntegers = Compression.CompressTablePacket({Values = tiny}, {CompactEncoding = true, StringDictionary = false})
+local packedIntegers = Compression.CompressTablePacket({Values = tiny}, {BitPackedIntegers = true, StringDictionary = false})
+assert(buffer.len(packedIntegers) < buffer.len(oldIntegers), "Packed integer codec failed to save bits")
+assert(equals(Compression.DecompressTable(oldIntegers), Compression.DecompressTable(packedIntegers)))
+print(("Packed integer packet: %d -> %d bytes"):format(buffer.len(oldIntegers), buffer.len(packedIntegers)))
+passed += 1
+
+-- Packet-level hostile tests use correct checksums to reach the packed decoder.
+assertRejected(makePacket({0, 10, 8, 0, 0}, 232), "INVALID_PACKED_INTEGER_WIDTH")
+passed += 1
+assertRejected(makePacket({0, 10, 8, 17, 0}, 232), "INVALID_PACKED_INTEGER_WIDTH")
+passed += 1
+assertRejected(makePacket({0, 10, 7, 1, 0}, 232), "INVALID_PACKED_ARRAY_COUNT")
+passed += 1
+assertRejected(makePacket({0, 10, 8, 1}, 232), "COMPRESSION_TRUNCATED")
+passed += 1
+assertRejected(makePacket({0, 10, 9, 1, 0, 2}, 232), "NONZERO_PACKED_INTEGER_PADDING")
+passed += 1
+assertRejected(makePacket({0, 10, 8, 4, 0, 0, 0, 0}, 232), "NON_CANONICAL_PACKED_INTEGER_WIDTH")
+passed += 1
+assertRejected(makePacket({0, 10, 8, 1, 0}, 231), "UNKNOWN_TAG")
+passed += 1
+
+print(("Compression v2.5.0 codec230/231/232 regression PASS: %d cases"):format(passed))

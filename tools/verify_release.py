@@ -27,10 +27,16 @@ if split_locals:
     print("Split local assignments found in:", ", ".join(split_locals))
 check("typed public API retained", "export type Data = PlayersData.Data" in data and "export type Store<T>" in data and "export type Session<T>" in data)
 check("record format compatible", "local RECORD_FORMAT = 700" in data)
-check("compression legacy and compact codecs declared", 'Compression.CodecVersion = 230' in codec and 'Compression.CompactCodecVersion = 231' in codec and 'return "2.4.0"' in codec)
+check("compression legacy and compact codecs declared", 'Compression.CodecVersion = 230' in codec and 'Compression.CompactCodecVersion = 231' in codec and 'return "2.5.0"' in codec and 'Compression.PackedCodecVersion = 232' in codec)
 check("legacy codec is the default encoder", 'CompactEncoding = source.CompactEncoding == true' in codec and 'Compression.CodecVersion = 230' in codec)
 check("compact Boolean arrays pack eight values per byte", 'TAG_BOOLEAN_BITS = 9' in codec and 'index % 8 == 0' in codec)
 check("compact small integers and decoding are bounded", 'TAG_SMALL_INTEGER_LAST = 39' in codec and 'NONZERO_BOOLEAN_PADDING' in codec)
+check("packed integers opt-in", 'BitPackedIntegers = source.BitPackedIntegers == true' in codec and 'BitPackedIntegers: boolean?' in data)
+check("packed integer codec rejects padding", 'NONZERO_PACKED_INTEGER_PADDING' in codec and 'NON_CANONICAL_PACKED_INTEGER_WIDTH' in codec)
+check("packed integer codec validates array size and width", 'INVALID_PACKED_ARRAY_COUNT' in codec and 'INVALID_PACKED_INTEGER_WIDTH' in codec)
+check("packed codec negotiation and envelopes", 'selectedCodec ~= 232' in data and 'PackedCodecVersion' in data)
+check("forecast includes packed bit counts", 'PackedIntegerValueBits = report.PackedIntegerValueBits' in data)
+check("v7.8 README documents rolling upgrades", '## New in 7.8.0' in readme and 'BitPackedIntegers = true' in readme and 'Safe rollout' in readme)
 check("store envelope carries selected packet codec", 'Codec = selectedCodec' in data and 'COMPRESSED_ENVELOPE_CODEC_MISMATCH' in data)
 check("compact setting documented with staged rollout", '## Previously in 7.6.0' in readme and 'CompactEncoding = true' in readme and 'Safe deployment order' in readme)
 check("compact locks default disabled", "CompactSessionLocks = config.CompactSessionLocks == true" in data)
@@ -42,12 +48,12 @@ check("forced buffer ignores threshold safely", "if not enforceCompressed and ra
 check("both compressed and raw reports can be emitted", "if self.Config.CompressionReports then" in data and "SelectionReason" in data)
 check("always-smallest remains opt-in", 'CompressionPolicy = config.CompressionPolicy or "adaptive"' in data)
 check("always-smallest forces all writes compressed", 'local enforceCompressed = alwaysCompressed or self.Config.ForceCompressedBuffer' in data and 'if not enforceCompressed and rawBytes < self.Config.CompressionMinBytes' in data)
-check("always-smallest evaluates four compression options", 'local compactModes = alwaysCompressed and {false, true}' in data and 'bestReport.AlternativeCodecCandidates = #variants * #compactModes' in data)
+check("always-smallest evaluates four compression options", 'local codecModes = alwaysCompressed' in data and 'bestReport.AlternativeCodecCandidates = #variants * #codecModes' in data)
 check("always-smallest selects whole-record transport size", 'if candidate ~= nil and candidateBytes < bestBytes then' in data and 'bestReport.SelectedCodec = bestEnvelope.Codec' in data)
 check("always-smallest never raw-falls-back at size limit", 'if not enforceCompressed and rawBytes <= self.Config.MaxStoredBytes then' in data and 'STORED_BYTES_EXCEEDED' in data)
 check("always-smallest reports expansion accurately", 'bestReport.CompressionExpanded = bestBytes > rawBytes' in data and 'bestReport.ExpansionBytes = math.max(0, bestBytes - rawBytes)' in data)
 check("always-smallest rejects invalid combinations", 'config.CompressionPolicy ~= "always-smallest" or config.ForceCompressedBuffer ~= true' in data and 'config.CompressionPolicy ~= "always-smallest" or config.Compression ~= false' in data)
-check("always-smallest has full setup and limits documentation", '## New in 7.7.0' in readme and 'CompressionPolicy = "always-smallest"' in readme and 'Safe rollout' in readme)
+check("always-smallest has full setup and limits documentation", '## Previously in 7.7.0' in readme and 'CompressionPolicy = "always-smallest"' in readme and 'Safe rollout' in readme)
 check("no-op suppression opt-in", "SkipUnchangedMutations = config.SkipUnchangedMutations == true" in data)
 check("profiling opt-in", "ProfileOperations = config.ProfileOperations == true" in data)
 check("coalesced save metric present", "SavesCoalesced += 1" in data)
@@ -97,7 +103,7 @@ required = (
     "SchemaMigrationRegression.server.lua", "CompressionRegression.server.lua",
     "ForcedBufferRegression.server.lua", "SessionLockWaitRegression.server.lua", "SessionHandoffRegression.server.lua",
     "AlwaysCompressedRegression.server.lua", "PortableCompressionPolicyRegression.luau",
-    "CompactCodecRegression.server.lua",
+    "CompactCodecRegression.server.lua", "PackedIntegerCodecRegression.server.lua",
     "MillionLocalBenchmark.server.lua", "MillionMockBackendBenchmark.server.lua",
 )
 check("core regression and benchmark scripts exist", all((test_dir / name).is_file() for name in required))
@@ -116,6 +122,8 @@ handoff_test = (test_dir / "SessionHandoffRegression.server.lua").read_text(enco
 check("mock handoff and crash recovery coverage present", all(token in handoff_test for token in ("_HandleHandoffPacket", "_PublishHandoffRequest", "HandoffWakeups", "SESSION_LOST", "ExpiresAt")))
 compact_test = (test_dir / "CompactCodecRegression.server.lua").read_text(encoding="utf-8")
 check("v230/v231 cross-format record regression present", all(token in compact_test for token in ("COMPRESSED_ENVELOPE_CODEC_MISMATCH", "Codec == 230", "Codec == 231", "StorageBytes")))
+packed_test = (test_dir / "PackedIntegerCodecRegression.server.lua").read_text(encoding="utf-8")
+check("v232 Studio mocks and byte reporting", all(token in packed_test for token in ("Codec == 232", "PackedIntegerValueBits", "GetStorageForecast", "COMPRESSED_ENVELOPE_CODEC_MISMATCH")))
 for filename, required_count in (
     ("MillionLocalBenchmark.server.lua", 32),
     ("MillionMockBackendBenchmark.server.lua", 21),
