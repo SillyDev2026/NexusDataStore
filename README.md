@@ -136,7 +136,7 @@ if not ok then warn(settings) end
 local view = profile:GetDataSnapshot()
 ```
 
-Record format `700`, compression codec `230`, and existing configuration defaults remain unchanged. Replace `DataStore.lua`; the codec stays at `2.3.4`.
+Historical v7.3 note: record format `700`, compression codec `230`, and defaults were unchanged at that time. Version 7.6 now recommends Compression `2.4.0` to support optional v231 packets.
 
 ## Contents
 
@@ -163,7 +163,7 @@ Record format `700`, compression codec `230`, and existing configuration default
 
 ### Session safety and developer tooling
 
-Version 7.6.0 builds on 7.3.0's safer callback mutations and convenient profile helpers with migration previews, storage forecasts, bounded journals, and copy-on-write updates. It preserves the existing API, strict Luau profile types, record format `700`, and Compression `2.3.4` / codec `230`. No saved-data migration is required for this library update.
+Version 7.6.0 builds on 7.3.0's safer callback mutations and convenient profile helpers with migration previews, storage forecasts, bounded journals, and copy-on-write updates. It preserves the existing API, strict Luau profile types, and record format `700`; Compression `2.4.0` reads codecs `230` and `231` while defaulting to legacy `230` writes. No record schema migration is required, but enabling v231 must follow the staged rollout above.
 
 - **Path-level copy-on-write:** `Set`, `Delete`, `Append`, `RemoveAt`, and multi-field `Patch` copy only affected table branches before validating and committing, rather than deep-cloning unrelated profile trees for each edit.
 - **Incremental direct-change baseline:** Controlled path mutations update their independent observation snapshot by path when possible. Whole-profile changes and uncertain paths retain the full-clone fallback.
@@ -311,7 +311,7 @@ ServerScriptService
 
 - The source in `DataStore.lua` must be inside the `NexusDataStore` ModuleScript.
 - `PlayersData` is a **required direct child** of `NexusDataStore`; the library reads `require(script.PlayersData)`.
-- Place `Compression` beneath `NexusDataStore`, next to it, or provide it through `CompressionModule`. The required codec is `230` from the `2.3.x` series.
+- Place `Compression` beneath `NexusDataStore`, next to it, or supply `CompressionModule`. **Compression v2.4.0 is recommended and required for compact encoding**; 2.3.x remains usable for legacy v230-only installations.
 - All persistence code must execute on the **server**. Do not place these modules in `ReplicatedStorage` for clients to control.
 - Published experiences must have Roblox DataStore permissions. Enable Studio API access only when appropriate, and use test keys/universes.
 
