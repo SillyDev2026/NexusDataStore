@@ -1590,10 +1590,10 @@ function NexusDataStore:_HandleHandoffPacket(packet: any)
 	self.Metrics.HandoffReleaseAttempts += 1
 	task.spawn(function()
 		if session:IsActive() and session.Player and session.Player.Parent ~= Players and not self.Closing then
-			local ok, err = self:ReleaseAsync(session)
-			if not ok then
+			local protected, ok, err = pcall(self.ReleaseAsync, self, session)
+			if not protected or not ok then
 				self.Metrics.HandoffReleaseFailed += 1
-				self:_Fire("SessionHandoffError", tostring(err))
+				self:_Fire("SessionHandoffError", tostring(protected and err or ok))
 			end
 		end
 		session.HandoffPending = false
