@@ -117,6 +117,18 @@ assert(equals(Compression.DecompressTable(oldFlags), Compression.DecompressTable
 print(("Packed Boolean packet: %d -> %d bytes"):format(buffer.len(oldFlags), buffer.len(compactFlags)))
 passed += 1
 
+-- Exercise all bitset boundary lengths and small-integer transitions with
+-- deterministic fixtures (no live backend or nondeterministic RNG).
+for count = 0, 255 do
+    local values = {}
+    for index = 1, count do values[index] = (index * 17 + count) % 7 <= 2 end
+    local fixture = {Flags = values, Delta = count % 32 - 16, Index = count}
+    local packet = Compression.CompressTablePacket(fixture, {CompactEncoding = true, StringDictionary = count % 2 == 0})
+    local restored = Compression.DecompressTable(packet)
+    assert(equals(fixture, restored), "Boundary roundtrip failed for length " .. tostring(count))
+    passed += 1
+end
+
 -- Construct checksum-correct hostile v231 packets to test canonical padding.
 assertRejected(makePacket({0, 9, 4, 16}, 231), "NONZERO_BOOLEAN_PADDING")
 passed += 1
