@@ -2,19 +2,46 @@
 
 **Typed, session-aware data persistence for Roblox.**
 
-![Version](https://img.shields.io/badge/NexusDataStore-7.3.0-2563eb)
+![Version](https://img.shields.io/badge/NexusDataStore-7.4.0-2563eb)
 ![Codec](https://img.shields.io/badge/Compression-2.3.4-0f766e)
 ![Luau](https://img.shields.io/badge/language-Luau-00a2ff)
 ![Platform](https://img.shields.io/badge/platform-Roblox-222222)
 
 NexusDataStore brings standard Roblox DataStore persistence, session ownership, typed player profiles, validation, migrations, snapshots, adaptive compression, and numeric leaderboards into one server-side library.
 
-**Current version:** `7.3.0` · **Compression:** `2.3.4` / codec `230` · **Record format:** `700`
+**Current version:** `7.4.0` · **Compression:** `2.3.4` / codec `230` · **Record format:** `700`
 
 > [!IMPORTANT]
 > This documentation describes the current source on `main`. Regression scripts are included, but production reliability and performance have not been certified by live-server load testing. Use a separate test universe before deploying changes to existing player data.
 
-## New in 7.3.0
+## New in 7.4.0
+
+Version 7.4.0 adds **opt-in bounded session-lock waiting**, rather than immediately failing every player load with `SESSION_LOCKED`. The default remains unchanged for existing games.
+
+- `WaitForSessionLock = true`: when another server currently owns a key, `OpenAsync` retries ownership acquisition until the existing `LoadTimeout` deadline. It never overwrites an unexpired lock.
+- `SessionLockRetryInterval = 2`: delay in seconds between conflicting `UpdateAsync` attempts (accepted range 0.5–30). Repeated attempts consume DataStore budgets. Use this selectively and monitor contention.
+- `SESSION_CONTEXT_CONFLICT`: a locally owned session cannot silently be reused for a different explicit `Player` or `UserId`. Matching callers can still share the cached session.
+- `SessionLockWait` event and `GetMetrics().SessionLockRetries` provide visibility into contention.
+- The Studio mock regression `tests/SessionLockWaitRegression.server.lua` covers two mock servers, safe handoff after release, bounded timeouts, shutdown cancellation, and conflicting user contexts.
+
+This is **polling-based lock waiting**, not ProfileStore's MessagingService-driven handoff. It is intentionally conservative: no force-stealing and no guarantee of availability when the previous owner is alive or the backend is unavailable. Record format `700` and compression codec `230` are unchanged.
+
+### Enable session contention waiting
+
+~~~lua
+local Store = NexusDataStore.new({
+    Name = "PlayerData",
+    Template = PlayersData,
+    WaitForSessionLock = true,
+    SessionLockRetryInterval = 2,
+    LoadTimeout = 30,
+    BudgetAware = true,
+})
+~~~
+
+Use these options in your **existing single store constructor**, not a second store sharing player keys. For a teleport-heavy game, benchmark the extra request load and monitor `SessionLockRetries`. Failed loads should still be handled; timeout is not permission to replace the locked record.
+
+## Previously in 7.3.0
 
 - `Mutate` commits an independent copy so retained callback drafts and returned nested tables cannot edit live data afterward. This adds one full-data copy to successful transactions; path setters remain copy-on-write.
 - `UpdatePath` captures and validates the path before invoking the callback. Editing the caller's path array cannot redirect the write.
@@ -56,7 +83,7 @@ Record format `700`, compression codec `230`, and existing configuration default
 
 ### Session safety and developer tooling
 
-Version 7.3.0 combines safer callback mutations and convenient profile helpers with migration previews, storage forecasts, bounded journals, and copy-on-write updates. It preserves the existing API, strict Luau profile types, record format `700`, and Compression `2.3.4` / codec `230`. No saved-data migration is required for this library update.
+Version 7.4.0 builds on 7.3.0's safer callback mutations and convenient profile helpers with migration previews, storage forecasts, bounded journals, and copy-on-write updates. It preserves the existing API, strict Luau profile types, record format `700`, and Compression `2.3.4` / codec `230`. No saved-data migration is required for this library update.
 
 - **Path-level copy-on-write:** `Set`, `Delete`, `Append`, `RemoveAt`, and multi-field `Patch` copy only affected table branches before validating and committing, rather than deep-cloning unrelated profile trees for each edit.
 - **Incremental direct-change baseline:** Controlled path mutations update their independent observation snapshot by path when possible. Whole-profile changes and uncertain paths retain the full-clone fallback.
@@ -369,7 +396,7 @@ Store:AttachPlayerLifecycle() -- after registering your listeners
 -- Or set AutoPlayerLifecycle = true in the constructor, not both.
 ~~~
 
-The library handles `PlayerAdded`, `PlayerRemoving`, and players already connected when attachment begins. The server must still call `Store:BindToClose()` (or handle shutdown explicitly).
+The library handles `PlayerAdded`, `PlayerRemoving`, and players already connected when attachment begins. Set `WaitForSessionLock = true` in the constructor to wait for another server to release a locked session rather than failing the load immediately. The server must still call `Store:BindToClose()` (or handle shutdown explicitly).
 
 ### Option B — custom lifecycle
 
@@ -930,7 +957,9 @@ The following are the defaults in **v7.3.0**. Every option goes inside `NexusDat
 | `BudgetAware` | `true` | Wait for adequate request budget |
 | `BudgetWaitTimeout` | `10` seconds | Budget wait per attempt |
 | `MinimumSaveInterval` | `3` seconds | Normal-priority save throttle |
-| `LoadTimeout` | `30` seconds | Load deadline |
+| `LoadTimeout` | `30` seconds | Load deadline, including opt-in lock waiting |
+| `WaitForSessionLock` | `false` | Opt-in retry on `SESSION_LOCKED`; never force-steals |
+| `SessionLockRetryInterval` | `2` seconds | Delay between locked-key acquisition attempts (0.5–30 seconds) |
 | `SaveTimeout` | `30` seconds | Save deadline |
 | `AutoPlayerLifecycle` | `false` | Attach join/leave management in constructor |
 
@@ -1043,7 +1072,7 @@ Store:On("OrderedSyncFailed", function(profile, reason)
 end)
 ~~~
 
-Common event names include `Opened`, `Saved`, `Released`, `Changed`, `SessionLost`, `PlayerLoadFailed`, `PlayerReleaseFailed`, `AutoSaveFailed`, `HeartbeatFailed`, `CompressionReport`, `OrderedSyncCompleted`, `OrderedSyncFailed`, `CloseFailed`, and `Closed`.
+Common event names include `Opened`, `Saved`, `Released`, `Changed`, `SessionLockWait`, `SessionLost`, `PlayerLoadFailed`, `PlayerReleaseFailed`, `AutoSaveFailed`, `HeartbeatFailed`, `CompressionReport`, `OrderedSyncCompleted`, `OrderedSyncFailed`, `CloseFailed`, and `Closed`.
 
 ### Inspect health and metrics
 
@@ -1065,6 +1094,9 @@ Metrics describe this **server process** and are not a permanent analytics wareh
 | Result | Meaning / response |
 | --- | --- |
 | `SESSION_LOCKED` | Another session appears to own the profile; do not overwrite it |
+| `SESSION_LOCK_WAIT_TIMEOUT` | Opt-in lock waiting exhausted the configured load deadline |
+| `SESSION_CONTEXT_CONFLICT` | A different Player/UserId tried to reuse a locally active key |
+| `PLAYER_LEFT` | Player departed while waiting to acquire a locked session |
 | `SESSION_LOST` / `REVISION_CONFLICT` | Ownership or revision changed; stop modifying that session |
 | `LOAD_VALIDATION_FAILED` / `SAVE_VALIDATION_FAILED` | Data failed validation; inspect field types/limits |
 | `MIGRATION_MISSING` / `MIGRATION_FAILED` | Missing/broken migration; repair code, do not reset data |
@@ -1092,7 +1124,9 @@ These are examples, not the complete error-code list. Check returned values and 
 
 ## Testing and troubleshooting
 
-The [`tests/` directory](./tests) contains [DeveloperToolsRegression.server.lua](./tests/DeveloperToolsRegression.server.lua) for migration previews, storage forecasts, and bounded journals, plus Roblox Studio regression scripts for codec correctness, malformed payloads, copy-on-write isolation, **zero-change suppression, coalesced saves and profiling** (see [EfficiencyRegression.server.lua](./tests/EfficiencyRegression.server.lua)), compact locks, ambiguous acknowledgements, and load/close races. Place test Scripts with the required ModuleScripts as directed by their headers; do **not** run them against production player keys.
+> **v7.4.0 validation status:** This release adds a Studio-only mock two-server test. A passing compile or static check does not establish live Roblox server handoff reliability. The historical v7.3.0 results below remain version-specific.
+
+The [`tests/` directory](./tests) includes [SessionLockWaitRegression.server.lua](./tests/SessionLockWaitRegression.server.lua) for bounded lock contention and shutdown tests, along with [DeveloperToolsRegression.server.lua](./tests/DeveloperToolsRegression.server.lua) for migration previews, storage forecasts, and bounded journals, plus Roblox Studio regression scripts for codec correctness, malformed payloads, copy-on-write isolation, **zero-change suppression, coalesced saves and profiling** (see [EfficiencyRegression.server.lua](./tests/EfficiencyRegression.server.lua)), compact locks, ambiguous acknowledgements, and load/close races. Place test Scripts with the required ModuleScripts as directed by their headers; do **not** run them against production player keys.
 
 ### Recorded v7.3.0 validation
 
@@ -1160,4 +1194,4 @@ For DataStore fundamentals and limits, consult [Roblox Data Stores](https://crea
 
 ---
 
-**Version 7.3.0** · [Source](./DataStore.lua) · [Compression](./Compression.lua) · [Tests](./tests)
+**Version 7.4.0** · [Source](./DataStore.lua) · [Compression](./Compression.lua) · [Tests](./tests)

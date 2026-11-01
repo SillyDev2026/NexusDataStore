@@ -38,6 +38,11 @@ check("both compressed and raw reports can be emitted", "if self.Config.Compress
 check("no-op suppression opt-in", "SkipUnchangedMutations = config.SkipUnchangedMutations == true" in data)
 check("profiling opt-in", "ProfileOperations = config.ProfileOperations == true" in data)
 check("coalesced save metric present", "SavesCoalesced += 1" in data)
+check("lock waiting defaults off", "WaitForSessionLock = config.WaitForSessionLock == true" in data)
+check("lock retry interval is validated", 'configNumber(config.SessionLockRetryInterval, 2, 0.5, "SessionLockRetryInterval", false, 30)' in data)
+check("context conflicts rejected", '"SESSION_CONTEXT_CONFLICT"' in data)
+check("session contention metrics present", "SessionLockRetries += 1" in data)
+check("session contention documented", "## New in 7.4.0" in readme and "SessionLockRetryInterval" in readme)
 check("snapshot protection retained", '"SNAPSHOT_NOT_OWNED"' in data)
 check("key metadata preservation retained", "persistWithKeyInfo(encoded, keyInfo)" in data)
 methods = [
@@ -69,13 +74,15 @@ required = (
     "DeveloperToolsRegression.server.lua",
     "MutationSafetyRegression.server.lua", "PersistenceRecoveryRegression.server.lua",
     "SchemaMigrationRegression.server.lua", "CompressionRegression.server.lua",
-    "ForcedBufferRegression.server.lua",
+    "ForcedBufferRegression.server.lua", "SessionLockWaitRegression.server.lua",
     "MillionLocalBenchmark.server.lua", "MillionMockBackendBenchmark.server.lua",
 )
 check("core regression and benchmark scripts exist", all((test_dir / name).is_file() for name in required))
 forced_test = (test_dir / "ForcedBufferRegression.server.lua").read_text(encoding="utf-8")
 check("forced buffer mock-backed save test present", all(token in forced_test for token in ("ForceCompressedBuffer", "OpenAsync", "SaveAsync", "ReleaseAsync", "STORED_BYTES_EXCEEDED")))
 check("forced buffer legacy-compatibility test present", "legacyDecoded" in forced_test and "crossDecoded" in forced_test)
+lock_wait_test = (test_dir / "SessionLockWaitRegression.server.lua").read_text(encoding="utf-8")
+check("contention regression covers ownership, timeout, shutdown and context guards", all(token in lock_wait_test for token in ("SESSION_LOCKED", "ReleaseAsync", "SESSION_CONTEXT_CONFLICT", "SESSION_LOCK_WAIT_TIMEOUT", "CloseAsync")))
 for filename, required_count in (
     ("MillionLocalBenchmark.server.lua", 32),
     ("MillionMockBackendBenchmark.server.lua", 21),

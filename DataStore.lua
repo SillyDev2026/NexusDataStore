@@ -98,6 +98,8 @@ export type StoreConfig<T> = {
 	AutoSaveInterval: number?,
 	LockTimeout: number?,
 	HeartbeatInterval: number?,
+	WaitForSessionLock: boolean?,
+	SessionLockRetryInterval: number?,
 	RetryAttempts: number?,
 	RetryBaseDelay: number?,
 	RetryMaxDelay: number?,
@@ -275,7 +277,7 @@ local EncodingService = game:GetService("EncodingService")
 
 local NexusDataStore: any = {}
 NexusDataStore.__index = NexusDataStore
-NexusDataStore.Version = "7.3.0"
+NexusDataStore.Version = "7.4.0"
 NexusDataStore.RecordFormat = 700
 NexusDataStore.RequiredCompressionVersion = "2.3.0"
 
@@ -1629,6 +1631,10 @@ function NexusDataStore:OpenAsync(key: string | number, context: OpenContext?): 
 		end
 		local existing = self.Sessions[normalizedKey]
 		if existing and existing:IsActive() then
+			if (openContext.Player ~= nil and existing.Player ~= openContext.Player)
+				or (openContext.UserId ~= nil and existing.UserId ~= openContext.UserId) then
+				return nil, "SESSION_CONTEXT_CONFLICT"
+			end
 			return existing
 		end
 		local sessionId = HttpService:GenerateGUID(false)
@@ -1637,63 +1643,77 @@ function NexusDataStore:OpenAsync(key: string | number, context: OpenContext?): 
 		local encodeReport
 		local startTime = openStartedAt
 
-		local success, result = self:_Retry(function()
-			return self.DataStore:UpdateAsync(normalizedKey, function(raw, keyInfo)
-				acquireError = nil
-				recordForSession = nil
-				encodeReport = nil
-				local record, decodeErr = self:_DecodeRecord(raw)
-				if raw ~= nil and not record then
-					acquireError = decodeErr or "DECODE_FAILED"
-					return nil
-				end
-				if record == nil then
-					record = self:_BuildNewRecord(clone(self.Template))
-				end
-				if record.Lock and self:_LockIsActive(record.Lock) then
-					local sameOwner = record.Lock.JobId == self.JobId and record.Lock.SessionId == sessionId
-					if not sameOwner then
-						acquireError = "SESSION_LOCKED"
+		local success, result
+		repeat
+			if self.Closing or self.Closed then return nil, "STORE_CLOSING" end
+			if openContext.Player and openContext.Player.Parent ~= Players then return nil, "PLAYER_LEFT" end
+			success, result = self:_Retry(function()
+				return self.DataStore:UpdateAsync(normalizedKey, function(raw, keyInfo)
+					acquireError = nil
+					recordForSession = nil
+					encodeReport = nil
+					local record, decodeErr = self:_DecodeRecord(raw)
+					if raw ~= nil and not record then
+						acquireError = decodeErr or "DECODE_FAILED"
 						return nil
 					end
-				end
-
-				local schemaVersion = tonumber(record.SchemaVersion) or 1
-				local migrated, migrationErr = self:_ApplyMigrations(record.Data :: Data, schemaVersion, normalizedKey)
-				if not migrated then
-					acquireError = migrationErr
-					return nil
-				end
-				local reconciled, reconcileErr = self:_Reconcile(migrated)
-				if not reconciled then
-					acquireError = "RECONCILE_FAILED:" .. tostring(reconcileErr)
-					return nil
-				end
-				local valid, validationErr = self:Validate(reconciled)
-				if not valid then
-					acquireError = "LOAD_VALIDATION_FAILED:" .. tostring(validationErr)
-					return nil
-				end
-				local changedOnLoad = schemaVersion ~= self.SchemaVersion or not deepEqual(record.Data, reconciled)
-				record.Data = reconciled :: Data
-				record.SchemaVersion = self.SchemaVersion
-				if changedOnLoad then
-					record.Revision = (tonumber(record.Revision) or 0) + 1
-				end
-				record.UpdatedAt = unix()
-				self:_LockRecord(record, sessionId)
-				-- The decoder/record builder already owns this table; session creation
-				-- clones the player data, so copying the entire record here is redundant.
-				recordForSession = record
-				local encoded, encodeErr, currentReport = self:_EncodeRecord(record)
-				if encoded == nil then
-					acquireError = encodeErr
-					return nil
-				end
-				encodeReport = currentReport
-				return persistWithKeyInfo(encoded, keyInfo)
-			end)
-		end, REQUEST_STANDARD_UPDATE, openDeadline, "LOAD_TIMEOUT")
+					if record == nil then
+						record = self:_BuildNewRecord(clone(self.Template))
+					end
+					if record.Lock and self:_LockIsActive(record.Lock) then
+						local sameOwner = record.Lock.JobId == self.JobId and record.Lock.SessionId == sessionId
+						if not sameOwner then
+							acquireError = "SESSION_LOCKED"
+							return nil
+						end
+					end
+	
+					local schemaVersion = tonumber(record.SchemaVersion) or 1
+					local migrated, migrationErr = self:_ApplyMigrations(record.Data :: Data, schemaVersion, normalizedKey)
+					if not migrated then
+						acquireError = migrationErr
+						return nil
+					end
+					local reconciled, reconcileErr = self:_Reconcile(migrated)
+					if not reconciled then
+						acquireError = "RECONCILE_FAILED:" .. tostring(reconcileErr)
+						return nil
+					end
+					local valid, validationErr = self:Validate(reconciled)
+					if not valid then
+						acquireError = "LOAD_VALIDATION_FAILED:" .. tostring(validationErr)
+						return nil
+					end
+					local changedOnLoad = schemaVersion ~= self.SchemaVersion or not deepEqual(record.Data, reconciled)
+					record.Data = reconciled :: Data
+					record.SchemaVersion = self.SchemaVersion
+					if changedOnLoad then
+						record.Revision = (tonumber(record.Revision) or 0) + 1
+					end
+					record.UpdatedAt = unix()
+					self:_LockRecord(record, sessionId)
+					-- The decoder/record builder already owns this table; session creation
+					-- clones the player data, so copying the entire record here is redundant.
+					recordForSession = record
+					local encoded, encodeErr, currentReport = self:_EncodeRecord(record)
+					if encoded == nil then
+						acquireError = encodeErr
+						return nil
+					end
+					encodeReport = currentReport
+					return persistWithKeyInfo(encoded, keyInfo)
+				end)
+			end, REQUEST_STANDARD_UPDATE, openDeadline, "LOAD_TIMEOUT")
+			if not (self.Config.WaitForSessionLock and success and acquireError == "SESSION_LOCKED") then break end
+			local remaining = openDeadline - now()
+			if remaining <= 0 then
+				acquireError = "SESSION_LOCK_WAIT_TIMEOUT"
+				break
+			end
+			self.Metrics.SessionLockRetries += 1
+			self:_Fire("SessionLockWait", normalizedKey, remaining)
+			task.wait(math.min(self.Config.SessionLockRetryInterval, remaining))
+		until false
 
 		if not success then
 			-- The lock acquisition may have committed even if its acknowledgement was lost.
@@ -3560,6 +3580,7 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 	assert(config.ForceCompressedBuffer ~= true or config.CompressionTransport == nil or config.CompressionTransport == "buffer", "ForceCompressedBuffer requires CompressionTransport = buffer")
 	assert(config.SkipUnchangedMutations == nil or typeof(config.SkipUnchangedMutations) == "boolean", "SkipUnchangedMutations must be a boolean")
 	assert(config.ProfileOperations == nil or typeof(config.ProfileOperations) == "boolean", "ProfileOperations must be a boolean")
+	assert(config.WaitForSessionLock == nil or typeof(config.WaitForSessionLock) == "boolean", "WaitForSessionLock must be a boolean")
 	assert(config.OrderedDataStores == nil or typeof(config.OrderedDataStores) == "table", "OrderedDataStores must be a table")
 	assert(config.PlayerKey == nil or typeof(config.PlayerKey) == "function", "PlayerKey must be a function")
 	assert(config.KeyPrefix == nil or typeof(config.KeyPrefix) == "string", "KeyPrefix must be a string")
@@ -3604,6 +3625,8 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 		AutoSaveInterval = configNumber(config.AutoSaveInterval, 30, 10, "AutoSaveInterval"),
 		LockTimeout = lockTimeout,
 		HeartbeatInterval = heartbeatInterval,
+		WaitForSessionLock = config.WaitForSessionLock == true,
+		SessionLockRetryInterval = configNumber(config.SessionLockRetryInterval, 2, 0.5, "SessionLockRetryInterval", false, 30),
 		RetryAttempts = configNumber(config.RetryAttempts, 6, 1, "RetryAttempts", true),
 		RetryBaseDelay = retryBaseDelay,
 		RetryMaxDelay = retryMaxDelay,
@@ -3666,6 +3689,7 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 		Rollbacks = 0,
 		Heartbeats = 0,
 		SessionLost = 0,
+		SessionLockRetries = 0,
 		TypeErrors = 0,
 		DirectChanges = 0,
 		BytesEncoded = 0,
