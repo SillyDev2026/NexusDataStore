@@ -154,6 +154,8 @@ export type Session<T> = {
 	Get: (self: Session<T>, path: Path) -> any,
 	GetOr: (self: Session<T>, path: Path, fallback: any) -> any,
 	Has: (self: Session<T>, path: Path) -> boolean,
+	SetDefault: (self: Session<T>, path: Path, value: any) -> (boolean, any, boolean?),
+	GetDataSnapshot: (self: Session<T>) -> T,
 	Set: (self: Session<T>, path: Path, value: any) -> (boolean, string?),
 	Delete: (self: Session<T>, path: Path) -> (boolean, string?),
 	Increment: (self: Session<T>, path: Path, amount: number?) -> (boolean, any),
@@ -273,7 +275,7 @@ local EncodingService = game:GetService("EncodingService")
 
 local NexusDataStore: any = {}
 NexusDataStore.__index = NexusDataStore
-NexusDataStore.Version = "7.2.0"
+NexusDataStore.Version = "7.3.0"
 NexusDataStore.RecordFormat = 700
 NexusDataStore.RequiredCompressionVersion = "2.3.0"
 
@@ -3113,6 +3115,27 @@ function Session:GetOr(path: Path, fallback: any): any
 	return clone(value)
 end
 
+-- Returns an independent copy without allocating a retained restore slot.
+function Session:GetDataSnapshot(): Data
+	return clone(self.Data)
+end
+
+-- Inserts only when missing; false and zero are existing values.
+function Session:SetDefault(path: Path, value: any): (boolean, any, boolean?)
+	local mutable, mutableErr = self:_CanMutate()
+	if not mutable then return false, mutableErr end
+	local valid, keys = pcall(normalizePath, path)
+	if not valid then return false, "INVALID_PATH:" .. tostring(keys) end
+	local current = getAt(self.Data, keys)
+	if current ~= nil then return true, clone(current), false end
+	if value == nil then return false, "DEFAULT_VALUE_REQUIRED" end
+	local copied, detached = pcall(clone, value)
+	if not copied then return false, "INVALID_DEFAULT_VALUE:" .. tostring(detached) end
+	local ok, err = self:Set(keys, detached)
+	if not ok then return false, err end
+	return true, clone(detached), true
+end
+
 function Session:Has(path: Path): boolean
 	return getAt(self.Data, path) ~= nil
 end
@@ -3280,23 +3303,27 @@ function Session:UpdatePath(path: Path, callback): (boolean, any)
 	if not mutable then
 		return false, mutableErr
 	end
+	local valid, keys = pcall(normalizePath, path)
+	if not valid then return false, "INVALID_PATH:" .. tostring(keys) end
 	local baseMutationId = self.MutationId
 	-- A yielding callback must not overwrite a direct edit of this path.
-	local original = clone(getAt(self.Data, path))
+	local original = clone(getAt(self.Data, keys))
 	local ok, transformed = pcall(callback, clone(original), self)
 	if not ok then
 		return false, tostring(transformed)
 	end
+	local stillMutable, lifecycleErr = self:_CanMutate()
+	if not stillMutable then return false, lifecycleErr end
 	if self.MutationId ~= baseMutationId then
 		return false, "CONCURRENT_MUTATION"
 	end
-	if self.Store.Config.DetectDirectChanges and not deepEqual(getAt(self.Data, path), original) then
+	if self.Store.Config.DetectDirectChanges and not deepEqual(getAt(self.Data, keys), original) then
 		return false, "CONCURRENT_DIRECT_MUTATION"
 	end
 	if transformed == nil then
 		return true, original, "CANCELLED"
 	end
-	local changed, err = self:Set(path, transformed)
+	local changed, err = self:Set(keys, transformed)
 	if not changed then
 		return false, err
 	end
@@ -3320,6 +3347,8 @@ function Session:Mutate(callback: (draft: Data, session: Session<Data>) -> any):
 	if not ok then
 		return false, tostring(result)
 	end
+	local stillMutable, lifecycleErr = self:_CanMutate()
+	if not stillMutable then return false, lifecycleErr end
 	if self.MutationId ~= baseMutationId then
 		return false, "CONCURRENT_MUTATION"
 	end
@@ -3333,8 +3362,11 @@ function Session:Mutate(callback: (draft: Data, session: Session<Data>) -> any):
 		self.Store.Metrics.NoopMutations += 1
 		return true, result
 	end
+	-- The callback may retain the draft or return a nested reference to it.
+	local copied, detached = pcall(clone, draft)
+	if not copied then return false, "INVALID_MUTATION_DRAFT:" .. tostring(detached) end
 	local before = self.Data
-	local committed, commitErr = self:_CommitDraft(draft, nil, before, draft)
+	local committed, commitErr = self:_CommitDraft(detached, nil, before, detached)
 	if not committed then
 		return false, commitErr
 	end

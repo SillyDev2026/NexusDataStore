@@ -19,3 +19,24 @@ jobs:
         uses: actions/checkout@v4
       - name: Verify version, API, codec and benchmark scripts
         run: python3 tools/verify_release.py
+
+  luau-behavior:
+    name: Luau compile and behavioral regressions
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout pinned official Luau source
+        uses: actions/checkout@v4
+        with:
+          repository: luau-lang/luau
+          ref: 2a3d8937c19c8fd9f7b72b6ec9068c62760e6588
+          path: .luau-toolchain
+      - name: Build Luau CLI
+        run: make -C .luau-toolchain config=release luau luau-compile -j2
+      - name: Compile library and regression scripts
+        run: .luau-toolchain/luau-compile --null DataStore.lua Compression.lua Data.lua tests/*.lua tests/*.luau
+      - name: Execute session and compression regressions
+        run: python3 tools/run_behavioral_tests.py --luau .luau-toolchain/luau

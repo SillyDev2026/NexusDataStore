@@ -20,7 +20,7 @@ check("README and source versions match", version is not None and ("**Current ve
 check("README badge matches", version is not None and ("NexusDataStore-" + version + "-") in readme)
 check("strict Luau directive", data.startswith("--!strict\n"))
 local_declaration_pattern = re.compile(r"^[ \t]*local[ \t]+[^=\n]+=[ \t]*$", re.MULTILINE)
-luau_files = [ROOT / "DataStore.lua", ROOT / "Compression.lua", *(ROOT / "tests").glob("*.lua")]
+luau_files = [ROOT / "DataStore.lua", ROOT / "Compression.lua", *(ROOT / "tests").glob("*.lua"), *(ROOT / "tests").glob("*.luau")]
 split_locals = [str(path.relative_to(ROOT)) for path in luau_files if local_declaration_pattern.search(path.read_text(encoding="utf-8"))]
 check("Luau local assignments keep the RHS on the same line", len(split_locals) == 0)
 if split_locals:
@@ -46,7 +46,7 @@ methods = [
     "NexusDataStore:_Commit", "NexusDataStore:GetMetrics",
     "NexusDataStore:GetPerformanceReport", "NexusDataStore:GetHealth",
     "NexusDataStore:PreviewMigration", "NexusDataStore:GetStorageForecast",
-    "Session:Get", "Session:Set", "Session:Delete", "Session:Patch",
+    "Session:Get", "Session:SetDefault", "Session:GetDataSnapshot", "Session:Set", "Session:Delete", "Session:Patch",
     "Session:Mutate", "Session:Append", "Session:RemoveAt",
     "Session:Snapshot", "Session:Restore", "Session:SaveAsync",
     "Session:GetChangeJournal", "Session:ClearChangeJournal",

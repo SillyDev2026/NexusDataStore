@@ -2,17 +2,34 @@
 
 **Typed, session-aware data persistence for Roblox.**
 
-![Version](https://img.shields.io/badge/NexusDataStore-7.2.0-2563eb)
+![Version](https://img.shields.io/badge/NexusDataStore-7.3.0-2563eb)
 ![Codec](https://img.shields.io/badge/Compression-2.3.4-0f766e)
 ![Luau](https://img.shields.io/badge/language-Luau-00a2ff)
 ![Platform](https://img.shields.io/badge/platform-Roblox-222222)
 
 NexusDataStore brings standard Roblox DataStore persistence, session ownership, typed player profiles, validation, migrations, snapshots, adaptive compression, and numeric leaderboards into one server-side library.
 
-**Current version:** `7.2.0` · **Compression:** `2.3.4` / codec `230` · **Record format:** `700`
+**Current version:** `7.3.0` · **Compression:** `2.3.4` / codec `230` · **Record format:** `700`
 
 > [!IMPORTANT]
 > This documentation describes the current source on `main`. Regression scripts are included, but production reliability and performance have not been certified by live-server load testing. Use a separate test universe before deploying changes to existing player data.
+
+## New in 7.3.0
+
+- `Mutate` commits an independent copy so retained callback drafts and returned nested tables cannot edit live data afterward. This adds one full-data copy to successful transactions; path setters remain copy-on-write.
+- `UpdatePath` captures and validates the path before invoking the callback. Editing the caller's path array cannot redirect the write.
+- Both callback APIs recheck session activity after callbacks, including cancellation and unchanged-data paths.
+- `SetDefault(path, value)` inserts only missing values, preserving existing `false` and `0`. Returns `ok, valueOrError, inserted`; returned tables are detached. A nil default is rejected when the field is missing. Parent-path and schema rules match `Set`.
+- `GetDataSnapshot()` returns a detached whole-profile copy without using a retained `Snapshot` restore slot or marking the profile dirty. It is a read helper, not an owned restore token.
+- GitHub Actions now compiles Luau and runs behavioral session and codec regressions in addition to static compatibility checks.
+
+```lua
+local ok, settings, inserted = profile:SetDefault("Settings", {Music = true, Volume = 0.5})
+if not ok then warn(settings) end
+local view = profile:GetDataSnapshot()
+```
+
+Record format `700`, compression codec `230`, and existing configuration defaults remain unchanged. Replace `DataStore.lua`; the codec stays at `2.3.4`.
 
 ## Contents
 
@@ -1051,6 +1068,17 @@ These are examples, not the complete error-code list. Check returned values and 
 ## Testing and troubleshooting
 
 The [`tests/` directory](./tests) contains [DeveloperToolsRegression.server.lua](./tests/DeveloperToolsRegression.server.lua) for migration previews, storage forecasts, and bounded journals, plus Roblox Studio regression scripts for codec correctness, malformed payloads, copy-on-write isolation, **zero-change suppression, coalesced saves and profiling** (see [EfficiencyRegression.server.lua](./tests/EfficiencyRegression.server.lua)), compact locks, ambiguous acknowledgements, and load/close races. Place test Scripts with the required ModuleScripts as directed by their headers; do **not** run them against production player keys.
+
+### Portable behavioral checks
+
+With the official Luau CLI installed:
+
+```sh
+python3 tools/verify_release.py
+python3 tools/run_behavioral_tests.py --luau /path/to/luau
+```
+
+The portable runner executes real module methods with minimal service stubs and the existing compression regression script. It does not emulate Roblox scheduling, DataStore budgets, server shutdown, or network persistence. Run the included `.server.lua` suites in Studio for those paths. CLI compilation checks syntax, not Roblox-aware strict type analysis.
 
 ### One-million-iteration performance and correctness suites
 
