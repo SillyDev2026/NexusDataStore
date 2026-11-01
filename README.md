@@ -2,19 +2,69 @@
 
 **Typed, session-aware data persistence for Roblox.**
 
-![Version](https://img.shields.io/badge/NexusDataStore-7.6.0-2563eb)
+![Version](https://img.shields.io/badge/NexusDataStore-7.7.0-2563eb)
 ![Codec](https://img.shields.io/badge/Compression-2.4.0-0f766e)
 ![Luau](https://img.shields.io/badge/language-Luau-00a2ff)
 ![Platform](https://img.shields.io/badge/platform-Roblox-222222)
 
 NexusDataStore brings standard Roblox DataStore persistence, session ownership, typed player profiles, validation, migrations, snapshots, adaptive compression, and numeric leaderboards into one server-side library.
 
-**Current version:** `7.6.0` · **Compression:** `2.4.0` / legacy codec `230` + compact codec `231` · **Record format:** `700`
+**Current version:** `7.7.0` · **Compression:** `2.4.0` / legacy codec `230` + compact codec `231` · **Record format:** `700`
 
 > [!IMPORTANT]
 > This documentation describes the current source on `main`. Regression scripts are included, but production reliability and performance have not been certified by live-server load testing. Use a separate test universe before deploying changes to existing player data.
 
-## New in 7.6.0 — Compact binary codec
+## New in 7.7.0 — Always compress the complete record
+
+**`CompressionPolicy = "always-smallest"`** guarantees that every successfully written NexusDataStore record uses a **compressed packet envelope**, regardless of data shape, size, threshold or whether raw JSON would be smaller. The policy applies to records written during load acquisition, saves, heartbeats and release.
+
+It evaluates four **lossless** combinations: legacy codec 230 or compact codec 231, each with the string dictionary enabled or disabled. With `CompressionTransport = "auto"`, it also compares buffer versus Base64 storage and picks the smallest compressed **complete persisted envelope**. It never selects a raw table.
+
+### Configure always-smallest compression
+
+~~~lua
+local Store = NexusDataStore.new({
+    Name = "PlayerData",
+    Template = PlayersData,
+    Compression = true,
+    CompressionPolicy = "always-smallest",
+    CompressionTransport = "auto",
+    CompressionMinBytes = 0,
+    CompressionOptions = {
+        StringDictionary = true,
+        AllowExpansion = false,
+    },
+    AutoSave = true,
+    BudgetAware = true,
+})
+~~~
+
+Keep your existing store name, template, schema and other settings. You do **not** need `ForceCompressedBuffer`; that is an older, separate, buffer-only mode that cannot be combined with `CompressionPolicy = "always-smallest"`. The new policy overrides compression thresholds and evaluates both codec modes even when `CompressionOptions.CompactEncoding` is false.
+
+### Measure size and distinguish expansion from savings
+
+~~~lua
+local report, err = Store:GetCompressionReport(profile)
+if report then
+    print("Selection:", report.SelectionReason)
+    print("Persisted bytes:", report.StorageBytes)
+    print("Raw JSON bytes:", report.RawStorageEstimate)
+    print("Selected codec:", report.SelectedCodec)
+    print("Expanded:", report.CompressionExpanded)
+    print("Extra bytes:", report.ExpansionBytes)
+    print("Candidates checked:", report.AlternativeCodecCandidates)
+else
+    warn("Compression report failed:", err)
+end
+~~~
+
+**Important limits:** Compression is lossless but **not guaranteed to make every record smaller**. High-entropy, tiny or already-compressed records can grow because checksums, headers and required metadata cannot be removed. If a compressed result exceeds `MaxStoredBytes`, saving returns `STORED_BYTES_EXCEEDED` instead of writing raw data. Unsupported Luau values (including Instances, cyclic tables and nonfinite numbers) are rejected rather than silently deleted. The four codec passes and transport measurements cost more CPU than the default balanced strategy.
+
+**Safe rollout:** Deploy NexusDataStore v7.7.0 with Compression v2.4.0 everywhere **before** enabling this policy. The policy can select codec 231 for any record; old v230-only servers cannot read those packets. Perform staged tests, drain old servers, then enable the mode. Don't downgrade readers while 231 records are present.
+
+The existing `CompressionStrategy = "smallest"` is adaptive and may choose uncompressed storage; `CompressionPolicy = "always-smallest"` deliberately never does.
+
+## Previously in 7.6.0 — Compact binary codec
 
 The new **Compression v2.4.0** retains legacy packet codec `230` by default and adds an opt-in compact packet codec `231`. The compact encoding removes redundant per-value tags where they are unnecessary:
 
@@ -1052,7 +1102,7 @@ The following are the defaults in **v7.3.0**. Every option goes inside `NexusDat
 | `Compression` | `true` | Enable custom compressed/raw selection; compact packets remain opt-in |
 | `CompressionModule` | Auto-resolved | Override codec ModuleScript |
 | `CompressionOptions` | `{}` | Codec-specific options |
-| `CompressionStrategy` | `"balanced"` | `"balanced"` or `"smallest"` |
+| `CompressionStrategy` | `"balanced"` | `"balanced"` or `"smallest"` for adaptive selection |\n| `CompressionPolicy` | `"adaptive"` | `"always-smallest"` always persists a compressed packet chosen from four variants |
 | `CompressionMinBytes` | `512` | Compression threshold (ignored for forced buffer writes) |
 | `ForceCompressedBuffer` | `false` | Opt-in mandatory compressed buffer envelope; may increase bytes |
 | `CompressionTransport` | `"auto"` | `"auto"` / `"buffer"` / `"base64"` |
@@ -1276,4 +1326,4 @@ For DataStore fundamentals and limits, consult [Roblox Data Stores](https://crea
 
 ---
 
-**Version 7.6.0** · [Source](./DataStore.lua) · [Compression](./Compression.lua) · [Tests](./tests)
+**Version 7.7.0** · [Source](./DataStore.lua) · [Compression](./Compression.lua) · [Tests](./tests)
