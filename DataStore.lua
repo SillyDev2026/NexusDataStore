@@ -1251,9 +1251,16 @@ function NexusDataStore:_EncodeRecord(record: any): (any?, string?, any?)
 					end
 				else
 					local payload = buffer.tostring(base64Buffer)
+					local envelope = {Format = RECORD_FORMAT, Codec = selectedCodec, Compressed = true, Encoding = "base64", Payload = payload}
 					local size = self.CompressedEnvelopeBaseBytes + #payload
+					if alwaysCompressed then
+						-- Measure the full persisted envelope for exact size-first selection.
+						local measured, measureErr = self:_MeasureStoredValue(envelope)
+						if measured == nil then return nil, "BASE64_TRANSPORT_SIZE_MEASURE_FAILED:" .. tostring(measureErr) end
+						size = measured
+					end
 					if size < candidateBytes then
-						candidate = {Format = RECORD_FORMAT, Codec = selectedCodec, Compressed = true, Encoding = "base64", Payload = payload}
+						candidate = envelope
 						candidateBytes, candidateTransport = size, "base64"
 					end
 				end
