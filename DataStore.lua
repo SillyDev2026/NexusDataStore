@@ -93,6 +93,7 @@ export type StoreConfig<T> = {
 	CompressionMinBytes: number?,
 	ForceCompressedBuffer: boolean?,
 	CompressionStrategy: ("balanced" | "smallest")?,
+	CompressionPolicy: ("adaptive" | "always-smallest")?,
 	CompactSessionLocks: boolean?,
 	CompressionTransport: CompressionTransport?,
 	AutoSave: boolean?,
@@ -280,7 +281,7 @@ local EncodingService = game:GetService("EncodingService")
 
 local NexusDataStore: any = {}
 NexusDataStore.__index = NexusDataStore
-NexusDataStore.Version = "7.6.0"
+NexusDataStore.Version = "7.7.0"
 NexusDataStore.RecordFormat = 700
 NexusDataStore.RequiredCompressionVersion = "2.3.0"
 
@@ -1183,6 +1184,8 @@ function NexusDataStore:_EncodeRecord(record: any): (any?, string?, any?)
 	if rawBytes == nil then
 		return nil, rawMeasureErr
 	end
+	local alwaysCompressed = self.Config.CompressionPolicy == "always-smallest"
+	local enforceCompressed = alwaysCompressed or self.Config.ForceCompressedBuffer
 	local rawReport = {StorageBytes = rawBytes, RawStorageEstimate = rawBytes, Transport = "raw-table", PersistedCompressed = false, CompactLock = hasCompactLock, SelectionReason = "compression-disabled"}
 	if not self.Config.Compression then
 		if rawBytes > self.Config.MaxStoredBytes then
@@ -1190,7 +1193,7 @@ function NexusDataStore:_EncodeRecord(record: any): (any?, string?, any?)
 		end
 		return storageRecord, nil, rawReport
 	end
-	if not self.Config.ForceCompressedBuffer and rawBytes < self.Config.CompressionMinBytes then
+	if not enforceCompressed and rawBytes < self.Config.CompressionMinBytes then
 		if rawBytes > self.Config.MaxStoredBytes then
 			return nil, ("STORED_BYTES_EXCEEDED:%d>%d"):format(rawBytes, self.Config.MaxStoredBytes)
 		end
@@ -1205,56 +1208,68 @@ function NexusDataStore:_EncodeRecord(record: any): (any?, string?, any?)
 	local codec = tonumber(self.CompressionEngine.CodecVersion) or 230
 	local bestEnvelope, bestReport, bestBytes, bestTransport = nil, nil, math.huge, nil
 	local variants = {self.Config.CompressionOptions.StringDictionary ~= false}
-	if self.Config.CompressionStrategy == "smallest" then
+	if self.Config.CompressionStrategy == "smallest" or alwaysCompressed then
 		variants[2] = not variants[1]
 	end
-	for _, dictionaryEnabled in ipairs(variants) do
-		local options = self.Config.CompressionOptions
-		if self.Config.CompressionStrategy == "smallest" then
-			options = table.clone(options)
-			options.StringDictionary = dictionaryEnabled
-		end
-		local ok, encoded, report = pcall(self.CompressionEngine.CompressTablePacket, storageRecord, options)
-		if not ok then
-			return nil, "COMPRESSED_ENCODE_FAILED:" .. tostring(encoded)
-		end
-		if typeof(encoded) ~= "buffer" then
-			return nil, "COMPRESSED_ENCODE_INVALID_BUFFER"
-		end
-		if typeof(report) ~= "table" then
-			report = {EngineVersion = self.CompressionEngineVersion, EncodedBytes = buffer.len(encoded)}
-		end
-		local selectedCodec = tonumber(report.CodecVersion) or codec
-		if selectedCodec ~= 230 and selectedCodec ~= 231 then return nil, "UNSUPPORTED_COMPRESSION_CODEC:" .. tostring(selectedCodec) end
-		if selectedCodec == 231 and tonumber(self.CompressionEngine.CompactCodecVersion) ~= 231 then return nil, "COMPACT_COMPRESSION_UNAVAILABLE" end
-		local candidate, candidateBytes, candidateTransport = nil, math.huge, nil
-		if transport == "auto" or transport == "buffer" then
-			local envelope = {Format = RECORD_FORMAT, Codec = selectedCodec, Compressed = true, Encoding = "buffer", Payload = encoded}
-			local bytes, sizeError = self:_MeasureStoredValue(envelope)
-			if bytes ~= nil then
-				candidate, candidateBytes, candidateTransport = envelope, bytes, "buffer"
-			elseif transport == "buffer" then
-				return nil, "BUFFER_TRANSPORT_SIZE_MEASURE_FAILED:" .. tostring(sizeError)
+	local compactModes = alwaysCompressed and {false, true} or {self.Config.CompressionOptions.CompactEncoding == true}
+	for _, compactEnabled in ipairs(compactModes) do
+		for _, dictionaryEnabled in ipairs(variants) do
+			local options = self.Config.CompressionOptions
+			if self.Config.CompressionStrategy == "smallest" or alwaysCompressed then
+				options = table.clone(options)
+				options.StringDictionary = dictionaryEnabled
+				if alwaysCompressed then options.CompactEncoding = compactEnabled end
 			end
-		end
-		if transport == "auto" or transport == "base64" then
-			local success, base64Buffer = pcall(EncodingService.Base64Encode, EncodingService, encoded)
-			if not success then
-				if transport == "base64" or candidate == nil then
-					return nil, "BASE64_ENCODE_FAILED:" .. tostring(base64Buffer)
-				end
-			else
-				local payload = buffer.tostring(base64Buffer)
-				local size = self.CompressedEnvelopeBaseBytes + #payload
-				if size < candidateBytes then
-					candidate = {Format = RECORD_FORMAT, Codec = selectedCodec, Compressed = true, Encoding = "base64", Payload = payload}
-					candidateBytes, candidateTransport = size, "base64"
+			local ok, encoded, report = pcall(self.CompressionEngine.CompressTablePacket, storageRecord, options)
+			if not ok then
+				return nil, "COMPRESSED_ENCODE_FAILED:" .. tostring(encoded)
+			end
+			if typeof(encoded) ~= "buffer" then
+				return nil, "COMPRESSED_ENCODE_INVALID_BUFFER"
+			end
+			if typeof(report) ~= "table" then
+				report = {EngineVersion = self.CompressionEngineVersion, EncodedBytes = buffer.len(encoded)}
+			end
+			local selectedCodec = tonumber(report.CodecVersion) or codec
+			if selectedCodec ~= 230 and selectedCodec ~= 231 then return nil, "UNSUPPORTED_COMPRESSION_CODEC:" .. tostring(selectedCodec) end
+			if selectedCodec == 231 and tonumber(self.CompressionEngine.CompactCodecVersion) ~= 231 then return nil, "COMPACT_COMPRESSION_UNAVAILABLE" end
+			local candidate, candidateBytes, candidateTransport = nil, math.huge, nil
+			if transport == "auto" or transport == "buffer" then
+				local envelope = {Format = RECORD_FORMAT, Codec = selectedCodec, Compressed = true, Encoding = "buffer", Payload = encoded}
+				local bytes, sizeError = self:_MeasureStoredValue(envelope)
+				if bytes ~= nil then
+					candidate, candidateBytes, candidateTransport = envelope, bytes, "buffer"
+				elseif transport == "buffer" then
+					return nil, "BUFFER_TRANSPORT_SIZE_MEASURE_FAILED:" .. tostring(sizeError)
 				end
 			end
-		end
-		if candidate ~= nil and candidateBytes < bestBytes then
-			bestEnvelope, bestBytes, bestTransport, bestReport = candidate, candidateBytes, candidateTransport, report
-			bestReport.DictionaryEnabled = dictionaryEnabled
+			if transport == "auto" or transport == "base64" then
+				local success, base64Buffer = pcall(EncodingService.Base64Encode, EncodingService, encoded)
+				if not success then
+					if transport == "base64" or candidate == nil then
+						return nil, "BASE64_ENCODE_FAILED:" .. tostring(base64Buffer)
+					end
+				else
+					local payload = buffer.tostring(base64Buffer)
+					local envelope = {Format = RECORD_FORMAT, Codec = selectedCodec, Compressed = true, Encoding = "base64", Payload = payload}
+					local size = self.CompressedEnvelopeBaseBytes + #payload
+					if alwaysCompressed then
+						-- Measure the full persisted envelope for exact size-first selection.
+						local measured, measureErr = self:_MeasureStoredValue(envelope)
+						if measured == nil then return nil, "BASE64_TRANSPORT_SIZE_MEASURE_FAILED:" .. tostring(measureErr) end
+						size = measured
+					end
+					if size < candidateBytes then
+						candidate = envelope
+						candidateBytes, candidateTransport = size, "base64"
+					end
+				end
+			end
+			if candidate ~= nil and candidateBytes < bestBytes then
+				bestEnvelope, bestBytes, bestTransport, bestReport = candidate, candidateBytes, candidateTransport, report
+				bestReport.DictionaryEnabled = dictionaryEnabled
+				bestReport.CompactEncoding = compactEnabled
+			end
 		end
 	end
 	if bestEnvelope == nil then
@@ -1262,28 +1277,33 @@ function NexusDataStore:_EncodeRecord(record: any): (any?, string?, any?)
 	end
 	bestReport.RawStorageEstimate = rawBytes
 	bestReport.CompactLock = hasCompactLock
-	bestReport.AlternativeCodecCandidates = #variants
+	bestReport.AlternativeCodecCandidates = #variants * #compactModes
 	-- The size-first strategy always selects the smallest JSON representation.
 	-- Balanced maintains the legacy AllowExpansion behaviour.
 	local forceEncode = self.Config.CompressionStrategy == "balanced" and self.Config.CompressionOptions.AllowExpansion == true
-	if not self.Config.ForceCompressedBuffer and rawBytes <= self.Config.MaxStoredBytes and not forceEncode and bestBytes >= rawBytes then
+	if not enforceCompressed and rawBytes <= self.Config.MaxStoredBytes and not forceEncode and bestBytes >= rawBytes then
 		rawReport.DictionaryEnabled = bestReport.DictionaryEnabled
 		rawReport.AlternativeCodecCandidates = #variants
 		rawReport.SelectionReason = "raw-smaller-or-equal"
 		return storageRecord, nil, rawReport
 	end
 	if bestBytes > self.Config.MaxStoredBytes then
-		if not self.Config.ForceCompressedBuffer and rawBytes <= self.Config.MaxStoredBytes then
+		if not enforceCompressed and rawBytes <= self.Config.MaxStoredBytes then
 			rawReport.SelectionReason = "compressed-exceeds-limit"
 			return storageRecord, nil, rawReport
 		end
-		return nil, ("STORED_BYTES_EXCEEDED:%d>%d"):format(self.Config.ForceCompressedBuffer and bestBytes or math.min(rawBytes, bestBytes), self.Config.MaxStoredBytes)
+		return nil, ("STORED_BYTES_EXCEEDED:%d>%d"):format(enforceCompressed and bestBytes or math.min(rawBytes, bestBytes), self.Config.MaxStoredBytes)
 	end
 	bestReport.StorageBytes = bestBytes
 	bestReport.Transport = bestTransport
 	bestReport.PersistedCompressed = true
 	bestReport.ForcedBuffer = self.Config.ForceCompressedBuffer
-	bestReport.SelectionReason = self.Config.ForceCompressedBuffer and "forced-buffer" or "compressed-smaller"
+	bestReport.CompressionPolicy = self.Config.CompressionPolicy
+	bestReport.CompressionExpanded = bestBytes > rawBytes
+	bestReport.ExpansionBytes = math.max(0, bestBytes - rawBytes)
+	bestReport.SavedStorageBytes = rawBytes - bestBytes
+	bestReport.SelectedCodec = bestEnvelope.Codec
+	bestReport.SelectionReason = alwaysCompressed and "always-compressed-smallest" or (self.Config.ForceCompressedBuffer and "forced-buffer" or "compressed-smaller")
 	return bestEnvelope, nil, bestReport
 end
 
@@ -3668,6 +3688,9 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 	assert(config.CompressionOptions == nil or typeof(config.CompressionOptions) == "table", "CompressionOptions must be a table")
 	assert(config.CompressionTransport == nil or config.CompressionTransport == "auto" or config.CompressionTransport == "buffer" or config.CompressionTransport == "base64", "CompressionTransport must be auto, buffer, or base64")
 	assert(config.CompressionStrategy == nil or config.CompressionStrategy == "balanced" or config.CompressionStrategy == "smallest", "CompressionStrategy must be balanced or smallest")
+	assert(config.CompressionPolicy == nil or config.CompressionPolicy == "adaptive" or config.CompressionPolicy == "always-smallest", "CompressionPolicy must be adaptive or always-smallest")
+	assert(config.CompressionPolicy ~= "always-smallest" or config.Compression ~= false, "CompressionPolicy always-smallest requires Compression = true")
+	assert(config.CompressionPolicy ~= "always-smallest" or config.ForceCompressedBuffer ~= true, "CompressionPolicy always-smallest cannot combine with ForceCompressedBuffer")
 	assert(config.CompactSessionLocks == nil or typeof(config.CompactSessionLocks) == "boolean", "CompactSessionLocks must be a boolean")
 	assert(config.ForceCompressedBuffer == nil or typeof(config.ForceCompressedBuffer) == "boolean", "ForceCompressedBuffer must be a boolean")
 	assert(config.ForceCompressedBuffer ~= true or config.Compression ~= false, "ForceCompressedBuffer requires Compression = true")
@@ -3714,6 +3737,7 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 		CompressionMinBytes = configNumber(config.CompressionMinBytes, 512, 0, "CompressionMinBytes", true),
 		ForceCompressedBuffer = config.ForceCompressedBuffer == true,
 		CompressionStrategy = config.CompressionStrategy or "balanced",
+		CompressionPolicy = config.CompressionPolicy or "adaptive",
 		CompactSessionLocks = config.CompactSessionLocks == true,
 		CompressionTransport = config.ForceCompressedBuffer == true and "buffer" or (config.CompressionTransport or "auto"),
 		AutoSave = config.AutoSave ~= false,
@@ -3821,7 +3845,7 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 	self.CompressionEngineVersion = versionOK and compressionVersion ~= nil and tostring(compressionVersion) or nil
 	if self.Config.Compression then
 		assert(compressionEngine ~= nil, "NexusDataStore compression requires compatible v2.3.x/v2.4.x engine (codec 230): " .. tostring(compressionError))
-		if self.Config.CompressionOptions.CompactEncoding then assert(tonumber(compressionEngine.CompactCodecVersion) == 231, "CompactEncoding requires Compression v2.4.0 (codec 231)") end
+		if self.Config.CompressionOptions.CompactEncoding or self.Config.CompressionPolicy == "always-smallest" then assert(tonumber(compressionEngine.CompactCodecVersion) == 231, "Compact encoding and always-smallest policy require Compression v2.4.0 (codec 231)") end
 	end
 
 	-- Cache the JSON overhead for the compressed envelope once. Base64 payload
