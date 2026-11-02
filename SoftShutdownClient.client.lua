@@ -499,18 +499,79 @@ local function applyResponsiveLayout()
         entry.Line.Position = UDim2.fromScale((0.5 + entry.StartX) * 0.5, (0.645 + 1) * 0.5)
         entry.Line.Rotation = math.deg(math.atan2(dy, dx))
     end
-    if ratio < 0.85 then
-        panel.Size = UDim2.fromScale(0.88, 0.43)
-        banner.Size = UDim2.fromScale(0.9, 0.073)
+    local portrait = ratio < 0.85
+    local shortLandscape = ratio >= 1.45 and view.Y < 560
+    if portrait then
+        panel.Size = UDim2.fromScale(0.92, 0.56)
+        banner.Size = UDim2.fromScale(0.92, 0.073)
     elseif ratio < 1.45 then
-        panel.Size = UDim2.fromScale(0.76, 0.5)
-        banner.Size = UDim2.fromScale(0.72, 0.088)
-    elseif view.Y < 560 then
-        panel.Size = UDim2.fromScale(0.59, 0.71)
-        banner.Size = UDim2.fromScale(0.56, 0.115)
+        panel.Size = UDim2.fromScale(0.82, 0.58)
+        banner.Size = UDim2.fromScale(0.74, 0.092)
+    elseif shortLandscape then
+        panel.Size = UDim2.fromScale(0.80, 0.82)
+        banner.Size = UDim2.fromScale(0.68, 0.12)
     else
-        panel.Size = UDim2.fromScale(0.58, 0.5)
-        banner.Size = UDim2.fromScale(0.48, 0.085)
+        panel.Size = UDim2.fromScale(0.64, 0.57)
+        banner.Size = UDim2.fromScale(0.52, 0.095)
+    end
+
+    -- Explicit sizes preserve readable hierarchy regardless of sentence length.
+    -- TextScaled is deliberately disabled: long strings wrap rather than shrink.
+    local scale = math.clamp(math.min(view.X / 1000, view.Y / 540), 0.85, 1.25)
+    for _, label in ipairs(textElements) do
+        local name = label.Name
+        local base = 16
+        if name == "Title" then base = 36
+        elseif name == "Status" then base = 25
+        elseif name == "Description" then base = 20
+        elseif name == "Eyebrow" then base = 16
+        elseif name == "Phase" then base = 16
+        elseif name == "Message" then base = 19
+        elseif name == "Timer" then base = 23
+        elseif name == "Icon" then base = 32
+        elseif string.sub(name, 1, 4) == "Step" then base = 18
+        end
+        label.TextSize = math.floor(base * scale + 0.5)
+    end
+
+    if title and statusText and description and statusOrb and phaseLabel then
+        if portrait then
+            statusOrb.Position = UDim2.fromScale(0.5, 0.21)
+            statusOrb.Size = UDim2.fromScale(0.17, 0.14)
+            title.Position = UDim2.fromScale(0.065, 0.315)
+            title.Size = UDim2.fromScale(0.87, 0.18)
+            title.TextXAlignment = Enum.TextXAlignment.Center
+            statusText.Position = UDim2.fromScale(0.07, 0.495)
+            statusText.Size = UDim2.fromScale(0.86, 0.09)
+            statusText.TextXAlignment = Enum.TextXAlignment.Center
+            description.Position = UDim2.fromScale(0.095, 0.61)
+            description.Size = UDim2.fromScale(0.81, 0.12)
+        else
+            statusOrb.Position = UDim2.fromScale(0.19, 0.345)
+            statusOrb.Size = UDim2.fromScale(0.15, 0.235)
+            title.Position = UDim2.fromScale(0.3, 0.23)
+            title.Size = UDim2.fromScale(0.64, 0.20)
+            title.TextXAlignment = Enum.TextXAlignment.Left
+            statusText.Position = UDim2.fromScale(0.3, 0.44)
+            statusText.Size = UDim2.fromScale(0.64, 0.135)
+            statusText.TextXAlignment = Enum.TextXAlignment.Left
+            description.Position = UDim2.fromScale(0.1, 0.603)
+            description.Size = UDim2.fromScale(0.8, 0.12)
+        end
+        phaseLabel.Position = UDim2.fromScale(0.105, 0.885)
+        phaseLabel.Size = UDim2.fromScale(0.79, 0.058)
+    end
+    if eyebrowLabel then
+        eyebrowLabel.Position = UDim2.fromScale(0.095, portrait and 0.07 or 0.095)
+        eyebrowLabel.Size = UDim2.fromScale(0.81, 0.09)
+    end
+    for index, step in ipairs(phaseSteps) do
+        step.Position = UDim2.fromScale(0.105 + (index - 1) * 0.275, 0.758)
+        step.Size = UDim2.fromScale(0.24, 0.103)
+    end
+    if progressTrack then
+        progressTrack.Position = UDim2.fromScale(0.105, 0.965)
+        progressTrack.Size = UDim2.fromScale(0.79, 0.018)
     end
 end
 
@@ -608,6 +669,8 @@ local function clearInterface()
     phaseLabel, progressTrack, phaseFill, accentLine, statusOrb = nil, nil, nil, nil, nil
     ambientGlow, secondaryGlow, haloGradientRef, progressShine, bannerPulse = nil, nil, nil, nil, nil
     table.clear(phaseSteps)
+    table.clear(textElements)
+    eyebrowLabel, coreIconLabel = nil, nil
     currentStatus, activePresentation, restartAt, lastMessage = "idle", "hidden", 0, ""
 end
 
@@ -746,44 +809,44 @@ local function update(status: string, target: number, message: string)
         title.Text = "Server update incoming"
         statusText.Text = "Server restart in " .. countdown(seconds)
         description.Text = message ~= "" and message or "We will save your progress before the server moves."
-        phaseLabel.Text = "PREPARING SERVER UPDATE"
+        phaseLabel.Text = "Preparing update"
         if bannerText then bannerText.Text = "SERVER UPDATE INCOMING" end
         if bannerTimer then bannerTimer.Text = countdown(seconds) end
     elseif status == "saving" then
         title.Text = "Saving your progress"
         statusText.Text = "Saving profile data..."
         description.Text = "Stay connected while your latest progress is saved securely."
-        phaseLabel.Text = "PERSISTING PROFILE DATA"
+        phaseLabel.Text = "Saving profile"
     elseif status == "retrying" then
         title.Text = "Keeping progress safe"
         statusText.Text = "Retrying the save..."
         description.Text = "The data service is busy. Your profile remains protected."
-        phaseLabel.Text = "RETRYING SECURE SAVE"
+        phaseLabel.Text = "Retrying save"
     elseif status == "ready" then
         title.Text = "Your progress is saved"
         statusText.Text = "Waiting for server transfer..."
         description.Text = "Save confirmed. Preparing to join the updated server."
-        phaseLabel.Text = "AWAITING SERVER MIGRATION"
+        phaseLabel.Text = "Waiting for transfer"
     elseif status == "moving" then
         title.Text = "Joining the updated server"
         statusText.Text = "Connecting to the new server..."
         description.Text = "Your progress is saved. Roblox is moving your party."
-        phaseLabel.Text = "TRANSFERRING TO UPDATED SERVER"
+        phaseLabel.Text = "Connecting to server"
     elseif status == "teleport-retrying" then
         title.Text = "Reconnecting players"
         statusText.Text = "Retrying connection..."
         description.Text = "The transfer was interrupted. Your saved progress is safe."
-        phaseLabel.Text = "RETRYING SERVER TRANSFER"
+        phaseLabel.Text = "Retrying transfer"
     elseif status == "arriving" then
         title.Text = "Welcome back"
         statusText.Text = "Loading your saved profile..."
         description.Text = "Waiting for the previous session lock to release."
-        phaseLabel.Text = "SYNCING PLAYER DATA"
+        phaseLabel.Text = "Loading player data"
     elseif status == "error" then
         title.Text = "Unable to load profile"
         statusText.Text = "Please reconnect"
         description.Text = "The profile could not load safely. Please reconnect."
-        phaseLabel.Text = "PROFILE LOAD NOT COMPLETED"
+        phaseLabel.Text = "Profile not loaded"
     end
 end
 
