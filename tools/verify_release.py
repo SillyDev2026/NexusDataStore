@@ -38,7 +38,7 @@ check("responsive layout reflows when orientation changes", 'applyResponsiveLayo
 check("restart animations pause when hidden and cancel on cleanup", all(token in client for token in ("tween:Pause()", "tween:Cancel()", "table.clear(stageTweens)", "table.clear(bannerTweens)")))
 check("arrival interface works with legacy transfer GUIs", 'arriving.Name == "NexusRestartGui"' in client and 'readyAttribute' in client and 'errorAttribute' in client)
 check("v8.1 UI details retained", "## Previously in 8.1.0" in readme and "UDim2.fromScale" in readme)
-check("v8.2 cinematic HUD and status timeline", all(token in client for token in ('DataCore', 'UIAspectRatioConstraint', 'GridX', 'GridY', 'Step1', 'phaseSteps', 'active and shade', 'statusOrb', 'phaseColor')))
+check("v8.2 cinematic HUD and status timeline", all(token in client for token in ('DataCore', 'UIAspectRatioConstraint', 'GridX', 'GridY', 'stepNames', 'phaseSteps', 'active and shade', 'statusOrb', 'phaseColor')))
 check("v8.2 animations track and cancel stale phase tweens", all(token in client for token in ('cancelStatusTweens()', 'table.clear(statusTweens)', 'animateState(', 'Rotation = 360', 'stageTweens')))
 check("v8.2 true save, transfer and restore states", all(token in client for token in ('"ready"', '"arriving"', '"error"', 'SAVE', 'TRANSFER', 'RESTORE', 'currentStep')))
 check("v8.2 reduced-motion option", 'local REDUCED_MOTION = false' in client and 'if REDUCED_MOTION then' in client)
