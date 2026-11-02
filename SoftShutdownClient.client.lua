@@ -1,6 +1,6 @@
 --!strict
--- Install as a LocalScript under ReplicatedFirst. No GUI objects need to be created in Studio.
--- The store name must match NexusDataStore.new({Name = "PlayerData"}).
+-- NexusDataStore v8.1 restart interface: scale-only layout, animated notices and teleport arrival.
+-- Install this LocalScript in ReplicatedFirst and set STORE_NAME to the DataStore Name.
 local STORE_NAME = "PlayerData"
 local Players = game:GetService("Players")
 local ReplicatedFirst = game:GetService("ReplicatedFirst")
@@ -11,219 +11,389 @@ local TweenService = game:GetService("TweenService")
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 local arriving = TeleportService:GetArrivingTeleportGui()
+local guiName = "NexusRestartGui_" .. STORE_NAME
+local readyAttribute = "NexusDataStoreProfileReady_" .. STORE_NAME
+local errorAttribute = "NexusDataStoreProfileError_" .. STORE_NAME
+local accent = Color3.fromRGB(86, 191, 255)
+local normal = Color3.fromRGB(230, 242, 255)
+local muted = Color3.fromRGB(157, 179, 207)
+local panelColor = Color3.fromRGB(17, 31, 55)
+local infoEase = TweenInfo.new(0.38, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+local fadeEase = TweenInfo.new(0.28, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local moveEase = TweenInfo.new(1.55, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true)
+
 local activeGui: ScreenGui? = nil
-local statusLabel: TextLabel? = nil
-local detailLabel: TextLabel? = nil
-local titleLabel: TextLabel? = nil
-local bannerLabel: TextLabel? = nil
-local restartAt = 0
+local stage: CanvasGroup? = nil
+local banner: CanvasGroup? = nil
+local panel: Frame? = nil
+local bannerText: TextLabel? = nil
+local bannerTimer: TextLabel? = nil
+local title: TextLabel? = nil
+local statusText: TextLabel? = nil
+local description: TextLabel? = nil
+local phaseLabel: TextLabel? = nil
+local progressTrack: Frame? = nil
+local phaseFill: Frame? = nil
+local activePresentation = "hidden"
 local currentStatus = "idle"
-local closed = false
+local restartAt = 0
+local arrivalMode = false
+local lastMessage = ""
+local transitionToken = 0
+local fadeTween: Tween? = nil
+local slideTween: Tween? = nil
+local bannerTween: Tween? = nil
+local viewportConnection: RBXScriptConnection? = nil
+local stageTweens: {Tween} = {}
+local bannerTweens: {Tween} = {}
 
-local function createGui(): ScreenGui
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "NexusRestartGui_" .. STORE_NAME
-    gui:SetAttribute("StoreName", STORE_NAME)
-    gui.ResetOnSpawn = false
-    gui.IgnoreGuiInset = true
-    gui.DisplayOrder = 1000
-    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-
-    local screen = Instance.new("Frame")
-    screen.Name = "Background"
-    screen.Size = UDim2.fromScale(1, 1)
-    screen.BackgroundColor3 = Color3.fromRGB(10, 15, 30)
-    screen.BorderSizePixel = 0
-    screen.Parent = gui
-    local gradient = Instance.new("UIGradient")
-    gradient.Color = ColorSequence.new(Color3.fromRGB(10, 15, 30), Color3.fromRGB(23, 39, 69))
-    gradient.Rotation = 45
-    gradient.Parent = screen
-
-    local panel = Instance.new("Frame")
-    panel.Name = "Panel"
-    panel.AnchorPoint = Vector2.new(0.5, 0.5)
-    panel.Position = UDim2.fromScale(0.5, 0.5)
-    panel.Size = UDim2.fromScale(0.86, 0.36)
-    panel.BackgroundColor3 = Color3.fromRGB(20, 29, 47)
-    panel.BorderSizePixel = 0
-    panel.Parent = screen
-    local constraint = Instance.new("UISizeConstraint")
-    constraint.MaxSize = Vector2.new(540, 310)
-    constraint.MinSize = Vector2.new(220, 170)
-    constraint.Parent = panel
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0.065, 0)
-    corner.Parent = panel
-    local stroke = Instance.new("UIStroke")
-    stroke.Thickness = 1
-    stroke.Color = Color3.fromRGB(67, 90, 126)
-    stroke.Transparency = 0.35
-    stroke.Parent = panel
-
-    local layout = Instance.new("UIListLayout")
-    layout.FillDirection = Enum.FillDirection.Vertical
-    layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-    layout.VerticalAlignment = Enum.VerticalAlignment.Center
-    layout.Padding = UDim.new(0.045, 0)
-    layout.Parent = panel
-
-    local tag = Instance.new("TextLabel")
-    tag.Name = "Tag"
-    tag.Size = UDim2.fromScale(0.85, 0.12)
-    tag.BackgroundTransparency = 1
-    tag.Font = Enum.Font.GothamBold
-    tag.Text = "NEXUS  /  SERVER UPDATE"
-    tag.TextColor3 = Color3.fromRGB(91, 185, 255)
-    tag.TextScaled = true
-    tag.Parent = panel
-
-    local heading = Instance.new("TextLabel")
-    heading.Name = "Title"
-    heading.Size = UDim2.fromScale(0.88, 0.25)
-    heading.BackgroundTransparency = 1
-    heading.Font = Enum.Font.GothamBold
-    heading.Text = "Server restarting"
-    heading.TextColor3 = Color3.fromRGB(245, 249, 255)
-    heading.TextScaled = true
-    heading.TextWrapped = true
-    heading.Parent = panel
-
-    local state = Instance.new("TextLabel")
-    state.Name = "Status"
-    state.Size = UDim2.fromScale(0.86, 0.14)
-    state.BackgroundTransparency = 1
-    state.Font = Enum.Font.GothamMedium
-    state.Text = "Preparing your progress..."
-    state.TextColor3 = Color3.fromRGB(180, 219, 252)
-    state.TextScaled = true
-    state.TextWrapped = true
-    state.Parent = panel
-
-    local details = Instance.new("TextLabel")
-    details.Name = "Details"
-    details.Size = UDim2.fromScale(0.85, 0.22)
-    details.BackgroundTransparency = 1
-    details.Font = Enum.Font.Gotham
-    details.Text = "You will be moved automatically when Roblox restarts the server."
-    details.TextColor3 = Color3.fromRGB(166, 179, 200)
-    details.TextScaled = true
-    details.TextWrapped = true
-    details.Parent = panel
-
-    local indicator = Instance.new("Frame")
-    indicator.Name = "Indicator"
-    indicator.Size = UDim2.fromScale(0.75, 0.023)
-    indicator.BackgroundColor3 = Color3.fromRGB(44, 59, 84)
-    indicator.BorderSizePixel = 0
-    indicator.Parent = panel
-    local progress = Instance.new("Frame")
-    progress.Name = "Motion"
-    progress.Size = UDim2.fromScale(0.2, 1)
-    progress.BackgroundColor3 = Color3.fromRGB(45, 170, 255)
-    progress.BorderSizePixel = 0
-    progress.Parent = indicator
-    local moving = TweenService:Create(progress, TweenInfo.new(1.6, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {Position = UDim2.fromScale(0.8, 0)})
-    moving:Play()
-    local banner = Instance.new("TextLabel")
-    banner.Name = "Banner"
-    banner.AnchorPoint = Vector2.new(0.5, 0)
-    banner.Position = UDim2.fromScale(0.5, 0.025)
-    banner.Size = UDim2.fromScale(0.85, 0.07)
-    banner.BackgroundColor3 = Color3.fromRGB(21, 34, 55)
-    banner.Font = Enum.Font.GothamBold
-    banner.TextColor3 = Color3.fromRGB(220, 239, 255)
-    banner.TextScaled = true
-    banner.Text = "Server update scheduled"
-    banner.Visible = false
-    banner.Parent = gui
-    local bannerBounds = Instance.new("UISizeConstraint")
-    bannerBounds.MaxSize = Vector2.new(470, 60)
-    bannerBounds.MinSize = Vector2.new(170, 32)
-    bannerBounds.Parent = banner
-    local bannerCorner = Instance.new("UICorner")
-    bannerCorner.CornerRadius = UDim.new(0.2, 0)
-    bannerCorner.Parent = banner
-    return gui
+local function corner(parent: Instance, radius: number)
+    local item = Instance.new("UICorner")
+    item.CornerRadius = UDim.new(radius, 0)
+    item.Parent = parent
 end
 
-local function attach(gui: ScreenGui)
-    activeGui = gui
-    local panel = gui:WaitForChild("Background"):WaitForChild("Panel")
-    statusLabel = panel:WaitForChild("Status") :: TextLabel
-    detailLabel = panel:WaitForChild("Details") :: TextLabel
-    titleLabel = panel:WaitForChild("Title") :: TextLabel
-    bannerLabel = gui:FindFirstChild("Banner") :: TextLabel?
-    gui.Parent = playerGui
+local function stroke(parent: Instance, color: Color3, opacity: number)
+    local item = Instance.new("UIStroke")
+    item.Thickness = 1
+    item.Color = color
+    item.Transparency = opacity
+    item.Parent = parent
 end
 
-local function show()
-    if closed then return end
-    if not activeGui then attach(createGui()) end
-    if activeGui then activeGui.Enabled = true end
+local function textLabel(parent: Instance, name: string, value: string, font: Enum.Font, color: Color3, pos: UDim2, size: UDim2, alignment: Enum.TextXAlignment?): TextLabel
+    local item = Instance.new("TextLabel")
+    item.Name = name
+    item.Position = pos
+    item.Size = size
+    item.BackgroundTransparency = 1
+    item.Text = value
+    item.Font = font
+    item.TextColor3 = color
+    item.TextScaled = true
+    item.TextWrapped = true
+    item.TextXAlignment = alignment or Enum.TextXAlignment.Center
+    item.TextYAlignment = Enum.TextYAlignment.Center
+    item.Parent = parent
+    return item
 end
 
-local function hide()
-    currentStatus = "idle"
-    restartAt = 0
-    statusLabel, detailLabel, titleLabel, bannerLabel = nil, nil, nil, nil
-    if activeGui then activeGui:Destroy(); activeGui = nil end
+local function loopTween(object: Instance, config: TweenInfo, properties: {[string]: any}, bucket: {Tween})
+    local tween = TweenService:Create(object, config, properties)
+    table.insert(bucket, tween)
+end
+
+local function makeInterface(): ScreenGui
+    local screen = Instance.new("ScreenGui")
+    screen.Name = guiName
+    screen:SetAttribute("StoreName", STORE_NAME)
+    screen.ResetOnSpawn = false
+    screen.IgnoreGuiInset = true
+    screen.DisplayOrder = 1000
+    screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+    local overlay = Instance.new("CanvasGroup")
+    overlay.Name = "Stage"
+    overlay.Size = UDim2.fromScale(1, 1)
+    overlay.BackgroundTransparency = 1
+    overlay.GroupTransparency = 1
+    overlay.Visible = false
+    overlay.Parent = screen
+    stage = overlay
+
+    local backdrop = Instance.new("Frame")
+    backdrop.Name = "Backdrop"
+    backdrop.Size = UDim2.fromScale(1, 1)
+    backdrop.BackgroundColor3 = Color3.fromRGB(8, 13, 26)
+    backdrop.BackgroundTransparency = 0.07
+    backdrop.BorderSizePixel = 0
+    backdrop.Parent = overlay
+    local backgroundGradient = Instance.new("UIGradient")
+    backgroundGradient.Rotation = 35
+    backgroundGradient.Color = ColorSequence.new(Color3.fromRGB(8, 13, 26), Color3.fromRGB(20, 40, 69))
+    backgroundGradient.Parent = backdrop
+
+    local glow = Instance.new("Frame")
+    glow.Name = "AmbientGlow"
+    glow.AnchorPoint = Vector2.new(0.5, 0.5)
+    glow.Position = UDim2.fromScale(0.82, 0.24)
+    glow.Size = UDim2.fromScale(0.5, 0.52)
+    glow.BackgroundColor3 = Color3.fromRGB(26, 94, 162)
+    glow.BackgroundTransparency = 0.83
+    glow.BorderSizePixel = 0
+    glow.Parent = backdrop
+    corner(glow, 1)
+    loopTween(glow, TweenInfo.new(4.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {
+        Position = UDim2.fromScale(0.7, 0.33),
+        BackgroundTransparency = 0.91,
+    }, stageTweens)
+
+    local main = Instance.new("Frame")
+    main.Name = "Panel"
+    main.AnchorPoint = Vector2.new(0.5, 0.5)
+    main.Position = UDim2.fromScale(0.5, 0.55)
+    main.Size = UDim2.fromScale(0.86, 0.47)
+    main.BackgroundColor3 = panelColor
+    main.BackgroundTransparency = 0.035
+    main.BorderSizePixel = 0
+    main.Parent = overlay
+    corner(main, 0.055)
+    stroke(main, Color3.fromRGB(79, 119, 163), 0.35)
+    panel = main
+    local mainGradient = Instance.new("UIGradient")
+    mainGradient.Color = ColorSequence.new(Color3.fromRGB(20, 37, 62), Color3.fromRGB(13, 24, 44))
+    mainGradient.Rotation = 105
+    mainGradient.Parent = main
+
+    local highlight = Instance.new("Frame")
+    highlight.Name = "AccentLine"
+    highlight.Size = UDim2.fromScale(0.25, 0.012)
+    highlight.Position = UDim2.fromScale(0.375, 0)
+    highlight.BackgroundColor3 = accent
+    highlight.BorderSizePixel = 0
+    highlight.Parent = main
+    corner(highlight, 1)
+
+    local tag = textLabel(main, "Eyebrow", "NEXUS  /  LIVE SERVER UPDATE", Enum.Font.GothamBold, accent, UDim2.fromScale(0.13, 0.10), UDim2.fromScale(0.74, 0.095))
+    tag.TextTransparency = 0.03
+
+    title = textLabel(main, "Title", "Server update scheduled", Enum.Font.GothamBold, normal, UDim2.fromScale(0.08, 0.235), UDim2.fromScale(0.84, 0.205))
+    statusText = textLabel(main, "Status", "Preparing to migrate...", Enum.Font.GothamMedium, accent, UDim2.fromScale(0.1, 0.47), UDim2.fromScale(0.8, 0.10))
+    description = textLabel(main, "Description", "Your progress stays protected while the server updates.", Enum.Font.Gotham, muted, UDim2.fromScale(0.12, 0.6), UDim2.fromScale(0.76, 0.155))
+
+    phaseLabel = textLabel(main, "Phase", "CHECKING PROFILE", Enum.Font.GothamBold, muted, UDim2.fromScale(0.11, 0.815), UDim2.fromScale(0.78, 0.075), Enum.TextXAlignment.Left)
+
+    local bar = Instance.new("Frame")
+    bar.Name = "ProgressTrack"
+    bar.Size = UDim2.fromScale(0.78, 0.023)
+    bar.Position = UDim2.fromScale(0.11, 0.922)
+    bar.BackgroundColor3 = Color3.fromRGB(43, 68, 101)
+    bar.BorderSizePixel = 0
+    bar.ClipsDescendants = true
+    bar.Parent = main
+    corner(bar, 1)
+    progressTrack = bar
+
+    local fill = Instance.new("Frame")
+    fill.Name = "PhaseFill"
+    fill.Size = UDim2.fromScale(0.22, 1)
+    fill.Position = UDim2.fromScale(0, 0)
+    fill.BorderSizePixel = 0
+    fill.BackgroundColor3 = accent
+    fill.Parent = bar
+    corner(fill, 1)
+    phaseFill = fill
+    loopTween(fill, moveEase, {Position = UDim2.fromScale(0.78, 0)}, stageTweens)
+
+    local notice = Instance.new("CanvasGroup")
+    notice.Name = "Banner"
+    notice.AnchorPoint = Vector2.new(0.5, 0)
+    notice.Position = UDim2.fromScale(0.5, -0.11)
+    notice.Size = UDim2.fromScale(0.82, 0.085)
+    notice.BackgroundColor3 = Color3.fromRGB(16, 33, 56)
+    notice.GroupTransparency = 1
+    notice.Visible = false
+    notice.Parent = screen
+    corner(notice, 0.25)
+    stroke(notice, Color3.fromRGB(76, 142, 189), 0.45)
+    banner = notice
+
+    local orb = Instance.new("Frame")
+    orb.Name = "Pulse"
+    orb.AnchorPoint = Vector2.new(0.5, 0.5)
+    orb.Position = UDim2.fromScale(0.075, 0.5)
+    orb.Size = UDim2.fromScale(0.035, 0.34)
+    orb.BorderSizePixel = 0
+    orb.BackgroundColor3 = accent
+    orb.BackgroundTransparency = 0.05
+    orb.Parent = notice
+    corner(orb, 1)
+    loopTween(orb, TweenInfo.new(1.15, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {BackgroundTransparency = 0.8}, bannerTweens)
+
+    bannerText = textLabel(notice, "Message", "SERVER UPDATE SCHEDULED", Enum.Font.GothamBold, normal, UDim2.fromScale(0.13, 0.12), UDim2.fromScale(0.59, 0.76), Enum.TextXAlignment.Left)
+    bannerTimer = textLabel(notice, "Timer", "01:00", Enum.Font.GothamBold, accent, UDim2.fromScale(0.76, 0.12), UDim2.fromScale(0.18, 0.76), Enum.TextXAlignment.Right)
+    return screen
+end
+
+local function stopTransitions()
+    if fadeTween then fadeTween:Cancel(); fadeTween = nil end
+    if slideTween then slideTween:Cancel(); slideTween = nil end
+    if bannerTween then bannerTween:Cancel(); bannerTween = nil end
+end
+
+local function applyResponsiveLayout()
+    if not stage or not banner or not panel then return end
+    local view = stage.AbsoluteSize
+    if view.X <= 0 or view.Y <= 0 then return end
+    local ratio = view.X / view.Y
+    if ratio < 0.85 then
+        panel.Size = UDim2.fromScale(0.88, 0.43)
+        banner.Size = UDim2.fromScale(0.9, 0.073)
+    elseif ratio < 1.45 then
+        panel.Size = UDim2.fromScale(0.76, 0.5)
+        banner.Size = UDim2.fromScale(0.72, 0.088)
+    elseif view.Y < 560 then
+        panel.Size = UDim2.fromScale(0.59, 0.71)
+        banner.Size = UDim2.fromScale(0.56, 0.115)
+    else
+        panel.Size = UDim2.fromScale(0.58, 0.5)
+        banner.Size = UDim2.fromScale(0.48, 0.085)
+    end
+end
+
+local function ensureInterface()
+    if activeGui then return end
+    local screen = makeInterface()
+    activeGui = screen
+    screen.Parent = playerGui
+    applyResponsiveLayout()
+    if stage then
+        viewportConnection = stage:GetPropertyChangedSignal("AbsoluteSize"):Connect(applyResponsiveLayout)
+    end
+end
+
+local function setPresentation(kind: string, immediate: boolean?)
+    ensureInterface()
+    if not stage or not banner or not panel or kind == activePresentation then return end
+    transitionToken += 1
+    local token = transitionToken
+    stopTransitions()
+    activePresentation = kind
+    local showStage = kind == "full"
+    local showBanner = kind == "banner"
+    for _, tween in ipairs(stageTweens) do if showStage then tween:Play() else tween:Pause() end end
+    for _, tween in ipairs(bannerTweens) do if showBanner then tween:Play() else tween:Pause() end end
+    if showStage then
+        stage.Visible = true
+        if not immediate then
+            stage.GroupTransparency = 1
+            panel.Position = UDim2.fromScale(0.5, 0.55)
+        end
+        fadeTween = TweenService:Create(stage, fadeEase, {GroupTransparency = 0})
+        slideTween = TweenService:Create(panel, infoEase, {Position = UDim2.fromScale(0.5, 0.5)})
+        fadeTween:Play()
+        slideTween:Play()
+    elseif stage.Visible then
+        local oldStage = stage
+        local out = TweenService:Create(oldStage, fadeEase, {GroupTransparency = 1})
+        fadeTween = out
+        out.Completed:Connect(function()
+            if transitionToken == token and oldStage.Parent then oldStage.Visible = false end
+        end)
+        out:Play()
+    end
+    if showBanner then
+        banner.Visible = true
+        if not immediate then
+            banner.GroupTransparency = 1
+            banner.Position = UDim2.fromScale(0.5, -0.11)
+        end
+        bannerTween = TweenService:Create(banner, fadeEase, {GroupTransparency = 0, Position = UDim2.fromScale(0.5, 0.06)})
+        bannerTween:Play()
+    elseif banner.Visible then
+        local oldBanner = banner
+        local out = TweenService:Create(oldBanner, fadeEase, {GroupTransparency = 1, Position = UDim2.fromScale(0.5, -0.11)})
+        bannerTween = out
+        out.Completed:Connect(function()
+            if transitionToken == token and oldBanner.Parent then oldBanner.Visible = false end
+        end)
+        out:Play()
+    end
+end
+
+local function clearInterface()
+    transitionToken += 1
+    if viewportConnection then viewportConnection:Disconnect(); viewportConnection = nil end
+    stopTransitions()
+    for _, tween in ipairs(stageTweens) do tween:Cancel() end
+    for _, tween in ipairs(bannerTweens) do tween:Cancel() end
+    table.clear(stageTweens)
+    table.clear(bannerTweens)
+    if activeGui then activeGui:Destroy() end
+    activeGui, stage, banner, panel = nil, nil, nil, nil
+    bannerText, bannerTimer, title, statusText, description = nil, nil, nil, nil, nil
+    phaseLabel, progressTrack, phaseFill = nil, nil, nil
+    currentStatus, activePresentation, restartAt, lastMessage = "idle", "hidden", 0, ""
+end
+
+local function secondsRemaining()
+    return math.max(0, math.ceil(restartAt - DateTime.now().UnixTimestamp))
+end
+
+local function countdown(seconds: number): string
+    local minutes = math.floor(seconds / 60)
+    local remainder = seconds % 60
+    return string.format("%02d:%02d", minutes, remainder)
 end
 
 local function update(status: string, target: number, message: string)
     if status == "idle" then return end
+    local previousStatus = currentStatus
     currentStatus = status
     restartAt = target
-    show()
-    if not titleLabel or not statusLabel or not detailLabel or not activeGui then return end
-    local background = activeGui:FindFirstChild("Background") :: Frame?
-    local panel = background and background:FindFirstChild("Panel") :: Frame?
-    local quiet = status == "scheduled" and target - DateTime.now().UnixTimestamp > 30
-    if background then background.BackgroundTransparency = quiet and 1 or 0 end
-    if panel then panel.Visible = not quiet end
-    if bannerLabel then bannerLabel.Visible = quiet end
-    if status == "arriving" then
-        titleLabel.Text = "Connecting to new server"
-        statusLabel.Text = "Securing your profile session..."
-        detailLabel.Text = "Your previous session lock must be released before progress loads."
-    elseif status == "scheduled" then
-        titleLabel.Text = "Server update incoming"
-        statusLabel.Text = "Preparing to migrate..."
-        detailLabel.Text = message
+    lastMessage = message
+    if status == "arriving" then arrivalMode = true end
+    local seconds = secondsRemaining()
+    local presentation = status == "scheduled" and seconds > 30 and not arrivalMode and "banner" or "full"
+    setPresentation(presentation)
+    if not title or not statusText or not description or not phaseLabel then return end
+    if status ~= previousStatus then
+        for _, label in ipairs({title, statusText, description, phaseLabel}) do
+            label.TextTransparency = 0.65
+            TweenService:Create(label, fadeEase, {TextTransparency = 0}):Play()
+        end
+    end
+    local shade = status == "ready" and Color3.fromRGB(96, 227, 184) or (status == "error" and Color3.fromRGB(255, 139, 145) or accent)
+    TweenService:Create(statusText, fadeEase, {TextColor3 = shade}):Play()
+    if status == "scheduled" then
+        title.Text = "New update incoming"
+        statusText.Text = "Server restart in " .. countdown(seconds)
+        description.Text = message ~= "" and message or "Your progress is protected during the update."
+        phaseLabel.Text = "PREPARING SERVER UPDATE"
+        if bannerText then bannerText.Text = "SERVER UPDATE INCOMING" end
+        if bannerTimer then bannerTimer.Text = countdown(seconds) end
     elseif status == "saving" then
-        titleLabel.Text = "Saving your progress"
-        statusLabel.Text = "Please stay in the game"
-        detailLabel.Text = "Final profile saves are being prepared before Roblox moves this server."
+        title.Text = "Saving your progress"
+        statusText.Text = "Securing your latest changes..."
+        description.Text = "Please stay connected while we prepare your profile for the new server."
+        phaseLabel.Text = "PERSISTING PROFILE DATA"
     elseif status == "retrying" then
-        titleLabel.Text = "Securing your progress"
-        statusLabel.Text = "Retrying a save request..."
-        detailLabel.Text = "A DataStore request needs another attempt. Your session remains protected."
+        title.Text = "Keeping progress safe"
+        statusText.Text = "Retrying a save request..."
+        description.Text = "The save service is busy. Your session remains protected while it retries."
+        phaseLabel.Text = "RETRYING SECURE SAVE"
     elseif status == "ready" then
-        titleLabel.Text = "Update is ready"
-        statusLabel.Text = "Latest progress saved"
-        detailLabel.Text = "Roblox will automatically move you to an updated game server."
+        title.Text = "Your progress is saved"
+        statusText.Text = "Moving to updated server"
+        description.Text = "The server is ready for Roblox to complete the restart."
+        phaseLabel.Text = "AWAITING SERVER MIGRATION"
+    elseif status == "arriving" then
+        title.Text = "Welcome back"
+        statusText.Text = "Acquiring your profile..."
+        description.Text = "Checking your session lock and loading saved progress securely."
+        phaseLabel.Text = "SYNCING PLAYER DATA"
     elseif status == "error" then
-        titleLabel.Text = "Unable to load profile"
-        statusLabel.Text = "Please reconnect"
-        detailLabel.Text = "Your profile is locked or the data service is unavailable. No replacement save was made."
+        title.Text = "Unable to load profile"
+        statusText.Text = "Please reconnect"
+        description.Text = "The data service or previous session lock is unavailable. Your progress was not overwritten."
+        phaseLabel.Text = "PROFILE LOAD NOT COMPLETED"
     end
 end
 
-if arriving and arriving:IsA("ScreenGui") and (arriving.Name == "NexusRestartGui_" .. STORE_NAME or (arriving.Name == "NexusRestartGui" and (arriving:GetAttribute("StoreName") == nil or arriving:GetAttribute("StoreName") == STORE_NAME))) then
+-- Rebuild arriving UI so the current scale-based layout also replaces legacy v7/v8 teleport GUIs.
+if arriving and arriving:IsA("ScreenGui") and (arriving.Name == guiName or (arriving.Name == "NexusRestartGui" and (arriving:GetAttribute("StoreName") == nil or arriving:GetAttribute("StoreName") == STORE_NAME))) then
     ReplicatedFirst:RemoveDefaultLoadingScreen()
-    attach(arriving)
+    arriving:Destroy()
     update("arriving", 0, "")
     task.spawn(function()
-        while not closed do
-            if player:GetAttribute("NexusDataStoreProfileReady_" .. STORE_NAME) == true then
-                hide()
+        while player.Parent == Players do
+            if player:GetAttribute(readyAttribute) == true then
+                arrivalMode = false
+                clearInterface()
                 return
             end
-            local loadError = player:GetAttribute("NexusDataStoreProfileError_" .. STORE_NAME)
-            if loadError ~= nil then
-                update("error", 0, "")
-                return
-            end
+            local loadError = player:GetAttribute(errorAttribute)
+            if loadError ~= nil and currentStatus ~= "error" then update("error", 0, "") end
             task.wait(0.25)
         end
     end)
@@ -232,37 +402,26 @@ end
 task.spawn(function()
     local remote = ReplicatedStorage:WaitForChild("NexusDataStoreRestart_" .. STORE_NAME, 30)
     if not remote or not remote:IsA("RemoteEvent") then return end
-    local function sync()
-        local status = remote:GetAttribute("Status")
-        if typeof(status) ~= "string" or status == "idle" then return end
-        local when = remote:GetAttribute("RestartAt")
-        local message = remote:GetAttribute("Message")
-        update(status, typeof(when) == "number" and when or 0, typeof(message) == "string" and message or "")
-        if activeGui then pcall(TeleportService.SetTeleportGui, TeleportService, activeGui) end
+    local function receive(status: any, timestamp: any, message: any)
+        if typeof(status) ~= "string" or status == "idle" or arrivalMode then return end
+        update(status, typeof(timestamp) == "number" and timestamp or 0, typeof(message) == "string" and message or "")
+        if activeGui then
+            local ok, err = pcall(TeleportService.SetTeleportGui, TeleportService, activeGui)
+            if not ok then warn("[NexusDataStore UI] Could not prepare teleport GUI:", err) end
+        end
     end
-    remote.OnClientEvent:Connect(function(status, when, message)
-        if typeof(status) ~= "string" then return end
-        update(status, typeof(when) == "number" and when or 0, typeof(message) == "string" and message or "")
-        if activeGui then pcall(TeleportService.SetTeleportGui, TeleportService, activeGui) end
-    end)
-    sync()
+    remote.OnClientEvent:Connect(receive)
+    receive(remote:GetAttribute("Status"), remote:GetAttribute("RestartAt"), remote:GetAttribute("Message"))
 end)
 
 task.spawn(function()
     while player.Parent == Players do
-        if currentStatus == "scheduled" and statusLabel and restartAt > 0 then
-            local seconds = math.max(0, restartAt - DateTime.now().UnixTimestamp)
-            local label = string.format("Restart in %02d:%02d", math.floor(seconds / 60), seconds % 60)
-            statusLabel.Text = seconds == 0 and "Moving to new server soon" or label
-            if bannerLabel then bannerLabel.Text = "SERVER UPDATE  •  " .. label end
-            if seconds <= 30 and activeGui then
-                local bg = activeGui:FindFirstChild("Background") :: Frame?
-                local panel = bg and bg:FindFirstChild("Panel") :: Frame?
-                if bg then bg.BackgroundTransparency = 0 end
-                if panel then panel.Visible = true end
-                if bannerLabel then bannerLabel.Visible = false end
-            end
+        if currentStatus == "scheduled" and restartAt > 0 then
+            local seconds = secondsRemaining()
+            if statusText then statusText.Text = seconds == 0 and "Moving to new server soon" or "Server restart in " .. countdown(seconds) end
+            if bannerTimer then bannerTimer.Text = countdown(seconds) end
+            if seconds <= 30 and activePresentation == "banner" then setPresentation("full") end
         end
-        task.wait(1)
+        task.wait(0.35)
     end
 end)

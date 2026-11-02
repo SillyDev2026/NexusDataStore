@@ -2,19 +2,38 @@
 
 **Typed, session-aware data persistence for Roblox.**
 
-![Version](https://img.shields.io/badge/NexusDataStore-8.0.0-2563eb)
+![Version](https://img.shields.io/badge/NexusDataStore-8.1.0-2563eb)
 ![Codec](https://img.shields.io/badge/Compression-2.6.1-0f766e)
 ![Luau](https://img.shields.io/badge/language-Luau-00a2ff)
 ![Platform](https://img.shields.io/badge/platform-Roblox-222222)
 
 NexusDataStore brings standard Roblox DataStore persistence, session ownership, typed player profiles, validation, migrations, snapshots, adaptive compression, and numeric leaderboards into one server-side library.
 
-**Current version:** `8.0.0` · **Compression:** `2.6.1` / codecs `230`–`233` · **Record format:** `700`
+**Current version:** `8.1.0` · **Compression:** `2.6.1` / codecs `230`–`233` · **Record format:** `700`
 
 > [!IMPORTANT]
 > This documentation describes the current source on `main`. Regression scripts are included, but production reliability and performance have not been certified by live-server load testing. Use a separate test universe before deploying changes to existing player data.
 
-## New in 8.0.0 — Reliability, compression correctness and restart hardening
+## New in 8.1.0 — Fully responsive soft-shutdown interface
+
+The built-in restart LocalScript has been **fully redesigned**. Every UI object's `Position` and `Size` uses `UDim2.fromScale` (relative percentages); there are no pixel-based layout offsets or `UISizeConstraint` widths/heights. The script also switches between portrait-phone, tablet, desktop and short-landscape percentage layouts when the viewport changes, without hand-tuning dimensions.
+
+The new interface includes:
+
+- **Nonblocking announcement banner** during early countdowns (more than 30 seconds). A soft-blue status dot pulses while the countdown updates; gameplay stays visible underneath.
+- **Smooth full-screen transition** within 30 seconds of restart, or immediately when profile saving starts. The panel slides upward, the backdrop fades in, and status labels crossfade.
+- **Animated progress strip**, breathing atmospheric light, and color-coded success/error status updates. Animations are paused when their sections are hidden to avoid unnecessary work.
+- **Clean modern layout** with gradient dark background, responsive central panel, readable scalable text, softly rounded cards and an accent line.
+- **Arrival and lock-acquisition view** for cross-server teleportation. On a destination server it rebuilds older transfer GUIs with the new UI, waits for the authoritative session-ready attribute, and displays a persistent load error when acquisition fails.
+- **Per-store isolation:** all GUI names, readiness and failure signals remain scoped to the configured store `Name`. The code makes no direct teleport calls; Roblox `Restart Servers` still handles player movement.
+
+### Installation
+
+Copy `SoftShutdownClient.client.lua` into **ReplicatedFirst** as a `LocalScript`, and set its `STORE_NAME` to the configured `Name` (default `"PlayerData"`). Use `EnableSoftShutdown = true` and `AutoPlayerLifecycle = true` in your store configuration. Both the old and new experience builds should include this LocalScript for seamless UI transfer. No manual ScreenGui elements are needed.
+
+This changes only UI presentation and library version; the **saved record format (700) and Compression v2.6.1 codecs 230–233 are unchanged**. Existing stored player data does not need conversion. Automated Luau compilation and static UI-contract checks run in GitHub Actions; visually inspect portrait/landscape mobile and desktop screens in Roblox Studio and a published test universe before shipping.
+
+## Previously in 8.0.0 — Reliability, compression correctness and restart hardening
 
 NexusDataStore **v8.0.0** is a major maintenance release built on v7.10.0. It preserves existing data, record format `700`, codecs `230`–`233`, and the soft-shutdown feature. There is **no mandatory migration for saved records**.
 
