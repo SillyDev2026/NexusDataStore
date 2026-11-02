@@ -383,6 +383,8 @@ local function ensureInterface()
     if stage then
         viewportConnection = stage:GetPropertyChangedSignal("AbsoluteSize"):Connect(applyResponsiveLayout)
     end
+    -- Connected only when UI exists; Roblox calls this once per rendered frame.
+    if not renderConnection and renderStep then renderConnection = RunService.PreRender:Connect(renderStep) end
 end
 
 local function setPresentation(kind: string, immediate: boolean?)
@@ -472,6 +474,81 @@ local function countdown(seconds: number): string
     local minutes = math.floor(seconds / 60)
     local remainder = seconds % 60
     return string.format("%02d:%02d", minutes, remainder)
+end
+
+-- Frame-linked motion: uses actual rendering delta, NOT a fixed 30/60/120Hz timer.
+-- Roblox determines the effective FPS. This adapts to whatever frames the client renders.
+renderStep = function(deltaTime: number)
+    if player.Parent ~= Players then clearInterface(); return end
+    if not activeGui or currentStatus == "idle" then return end
+    if deltaTime <= 0 then return end
+
+    local dt = math.min(deltaTime, 0.05)
+    countdownAccumulator += dt
+    if currentStatus == "scheduled" and restartAt > 0 and countdownAccumulator >= 0.15 then
+        countdownAccumulator = 0
+        local seconds = secondsRemaining()
+        if seconds ~= lastCountdownSeconds then
+            lastCountdownSeconds = seconds
+            if statusText then statusText.Text = seconds == 0 and "Moving to new server soon" or "Server restart in " .. countdown(seconds) end
+            if bannerTimer then bannerTimer.Text = countdown(seconds) end
+            if seconds <= 30 and activePresentation == "banner" then setPresentation("full") end
+        end
+    end
+
+    -- Low-pass frame-time measurement with time-based smoothing and hysteresis.
+    -- These are observed rendered frames, not a guessed hardware refresh rate.
+    if deltaTime < 0.2 then
+        local alpha = 1 - math.exp(-dt * 2.4)
+        averageFrameTime += (deltaTime - averageFrameTime) * alpha
+        local observedFPS = 1 / math.max(averageFrameTime, 1 / 300)
+        if observedFPS < 38 then
+            slowFrameDuration += dt
+            recoveryDuration = 0
+        elseif observedFPS > 52 then
+            recoveryDuration += dt
+            slowFrameDuration = 0
+        else
+            slowFrameDuration = 0
+            recoveryDuration = 0
+        end
+        if slowFrameDuration >= 1.4 then lightweightEffects = true end
+        if recoveryDuration >= 2.5 then lightweightEffects = false end
+        diagnosticsAccumulator += dt
+        if diagnosticsAccumulator >= 2 and activeGui then
+            diagnosticsAccumulator = 0
+            activeGui:SetAttribute("ObservedRenderFPS", math.floor(observedFPS + 0.5))
+            activeGui:SetAttribute("MotionQuality", REDUCED_MOTION and "reduced" or (lightweightEffects and "light" or "full"))
+        end
+    end
+
+    if REDUCED_MOTION then return end
+
+    -- Each visual phase advances in seconds, independent of rendered FPS.
+    -- Cap a single step after long stalls to avoid visually snapping across the screen.
+    animationClock = (animationClock + dt) % 10000
+    local t = animationClock
+    if activePresentation == "banner" and banner and banner.Visible then
+        if bannerPulse then bannerPulse.BackgroundTransparency = 0.13 + 0.53 * (0.5 + 0.5 * math.sin(t * 4.1)) end
+    elseif activePresentation == "full" and stage and stage.Visible and currentStatus ~= "error" then
+        if haloGradientRef then haloGradientRef.Rotation = (t * 48) % 360 end
+        if phaseFill then
+            local sweep = 0.5 + 0.5 * math.sin(t * 2.9 - math.pi / 2)
+            phaseFill.Position = UDim2.fromScale(sweep * 0.78, 0)
+        end
+        if statusOrb then statusOrb.BackgroundTransparency = 0.33 + 0.16 * (0.5 + 0.5 * math.sin(t * 2.1)) end
+        if not lightweightEffects then
+            if accentLine then accentLine.Position = UDim2.fromScale(0.375 + 0.245 * (0.5 + 0.5 * math.sin(t * 0.8)), 0) end
+            if ambientGlow then
+                ambientGlow.Position = UDim2.fromScale(0.76 + 0.06 * math.sin(t * 0.55), 0.28 + 0.05 * math.cos(t * 0.55))
+                ambientGlow.BackgroundTransparency = 0.88 + 0.035 * math.sin(t * 0.7)
+            end
+            if secondaryGlow then
+                secondaryGlow.Position = UDim2.fromScale(0.21 + 0.055 * math.sin(t * 0.43), 0.73 + 0.05 * math.cos(t * 0.43))
+            end
+            if progressShine then progressShine.Offset = Vector2.new(0.35 * math.sin(t * 1.5), 0) end
+        end
+    end
 end
 
 local function update(status: string, target: number, message: string)
