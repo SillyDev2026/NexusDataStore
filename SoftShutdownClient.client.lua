@@ -43,6 +43,7 @@ local transitionToken = 0
 local fadeTween: Tween? = nil
 local slideTween: Tween? = nil
 local bannerTween: Tween? = nil
+local viewportConnection: RBXScriptConnection? = nil
 local stageTweens: {Tween} = {}
 local bannerTweens: {Tween} = {}
 
@@ -220,11 +221,35 @@ local function stopTransitions()
     if bannerTween then bannerTween:Cancel(); bannerTween = nil end
 end
 
+local function applyResponsiveLayout()
+    if not stage or not banner or not panel then return end
+    local view = stage.AbsoluteSize
+    if view.X <= 0 or view.Y <= 0 then return end
+    local ratio = view.X / view.Y
+    if ratio < 0.85 then
+        panel.Size = UDim2.fromScale(0.88, 0.43)
+        banner.Size = UDim2.fromScale(0.9, 0.073)
+    elseif ratio < 1.45 then
+        panel.Size = UDim2.fromScale(0.76, 0.5)
+        banner.Size = UDim2.fromScale(0.72, 0.088)
+    elseif view.Y < 560 then
+        panel.Size = UDim2.fromScale(0.59, 0.71)
+        banner.Size = UDim2.fromScale(0.56, 0.115)
+    else
+        panel.Size = UDim2.fromScale(0.58, 0.5)
+        banner.Size = UDim2.fromScale(0.48, 0.085)
+    end
+end
+
 local function ensureInterface()
     if activeGui then return end
     local screen = makeInterface()
     activeGui = screen
     screen.Parent = playerGui
+    applyResponsiveLayout()
+    if stage then
+        viewportConnection = stage:GetPropertyChangedSignal("AbsoluteSize"):Connect(applyResponsiveLayout)
+    end
 end
 
 local function setPresentation(kind: string, immediate: boolean?)
@@ -278,6 +303,7 @@ end
 
 local function clearInterface()
     transitionToken += 1
+    if viewportConnection then viewportConnection:Disconnect(); viewportConnection = nil end
     stopTransitions()
     for _, tween in ipairs(stageTweens) do tween:Cancel() end
     for _, tween in ipairs(bannerTweens) do tween:Cancel() end
