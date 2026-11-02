@@ -2544,11 +2544,14 @@ function NexusDataStore:CloseAsync(timeout: number?): (boolean, string?)
 	end
 	self.Closing = true
 	local deadline = now() + (timeout or self.Config.SaveTimeout)
+	local wasFrozen = self.SoftShutdownFrozen
+	if self.Config.EnableSoftShutdown then self.SoftShutdownFrozen = true end
 	while self.OpenInFlight > 0 and now() < deadline do
 		task.wait(0.02)
 	end
 	if self.OpenInFlight > 0 then
 		self.Closing = false
+		self.SoftShutdownFrozen = wasFrozen
 		self:_Fire("CloseFailed", "OPEN_IN_FLIGHT_TIMEOUT")
 		return false, "OPEN_IN_FLIGHT_TIMEOUT"
 	end
@@ -2592,6 +2595,7 @@ function NexusDataStore:CloseAsync(timeout: number?): (boolean, string?)
 	end
 	if firstError ~= nil then
 		self.Closing = false
+		self.SoftShutdownFrozen = wasFrozen
 		self:_Fire("CloseFailed", firstError)
 		return false, firstError
 	end
@@ -3823,6 +3827,7 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 	assert(config.EnableSessionHandoff == nil or typeof(config.EnableSessionHandoff) == "boolean", "EnableSessionHandoff must be a boolean")
 	assert(config.EnableSoftShutdown == nil or typeof(config.EnableSoftShutdown) == "boolean", "EnableSoftShutdown must be a boolean")
 	assert(config.EnableSoftShutdown ~= true or config.AutoPlayerLifecycle ~= false, "Soft shutdown requires player lifecycle management")
+	assert(config.SoftShutdownFreezeSeconds == nil or config.SoftShutdownPreSaveSeconds == nil or config.SoftShutdownFreezeSeconds <= config.SoftShutdownPreSaveSeconds, "SoftShutdownFreezeSeconds must not exceed SoftShutdownPreSaveSeconds")
 	assert(config.OrderedDataStores == nil or typeof(config.OrderedDataStores) == "table", "OrderedDataStores must be a table")
 	assert(config.PlayerKey == nil or typeof(config.PlayerKey) == "function", "PlayerKey must be a function")
 	assert(config.KeyPrefix == nil or typeof(config.KeyPrefix) == "string", "KeyPrefix must be a string")
@@ -3891,12 +3896,13 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 		EnableSoftShutdown = config.EnableSoftShutdown == true,
 		SoftShutdownPreSaveSeconds = configNumber(config.SoftShutdownPreSaveSeconds, 20, 5, "SoftShutdownPreSaveSeconds"),
 		SoftShutdownFreezeSeconds = configNumber(config.SoftShutdownFreezeSeconds, 6, 1, "SoftShutdownFreezeSeconds"),
-		SoftShutdownCloseTimeout = configNumber(config.SoftShutdownCloseTimeout, 25, 5, "SoftShutdownCloseTimeout"),
+		SoftShutdownCloseTimeout = configNumber(config.SoftShutdownCloseTimeout, 25, 5, "SoftShutdownCloseTimeout", false, 28),
 		EnableCrossServerEvents = config.EnableCrossServerEvents == true,
 		CrossServerTopic = crossServerTopic,
 		OrderedDataStores = config.OrderedDataStores or {},
 		Debug = config.Debug == true,
 	}
+	assert(self.Config.SoftShutdownFreezeSeconds <= self.Config.SoftShutdownPreSaveSeconds, "SoftShutdownFreezeSeconds must not exceed SoftShutdownPreSaveSeconds")
 	if self.Config.CompressionOptions.MaxDepth == nil then
 		self.Config.CompressionOptions.MaxDepth = self.Config.MaxDepth + 8
 	end
