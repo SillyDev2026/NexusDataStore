@@ -54,4 +54,4 @@ local oldPacket = Compression.CompressTablePacket(template, {CompactEncoding = t
 assert(buffer.readu16(oldPacket, 4) == 231)
 assert(Compression.DecompressTable(oldPacket).Numbers[256] == numbers[256])
 assert(legacy:CloseAsync() and compact:CloseAsync())
-print(("NexusDataStore v8.4.0 bitpack regression PASS: %d -> %d bytes"):format(oldReport.StorageBytes, packedReport.StorageBytes))
+print(("NexusDataStore v8.4.1 bitpack regression PASS: %d -> %d bytes"):format(oldReport.StorageBytes, packedReport.StorageBytes))
