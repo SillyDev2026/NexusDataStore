@@ -56,6 +56,8 @@ local slideTween: Tween? = nil
 local bannerTween: Tween? = nil
 local viewportConnection: RBXScriptConnection? = nil
 local renderConnection: RBXScriptConnection? = nil
+local arrivalReadyConnection: RBXScriptConnection? = nil
+local arrivalErrorConnection: RBXScriptConnection? = nil
 local renderStep: ((number) -> ())? = nil
 local ambientGlow: Frame? = nil
 local secondaryGlow: Frame? = nil
@@ -449,6 +451,8 @@ local function clearInterface()
     stopTransitions()
     cancelStatusTweens()
     if renderConnection then renderConnection:Disconnect(); renderConnection = nil end
+    if arrivalReadyConnection then arrivalReadyConnection:Disconnect(); arrivalReadyConnection = nil end
+    if arrivalErrorConnection then arrivalErrorConnection:Disconnect(); arrivalErrorConnection = nil end
     animationClock = 0
     countdownAccumulator = 0
     lastCountdownSeconds = -1
@@ -625,18 +629,18 @@ if arriving and arriving:IsA("ScreenGui") and (arriving.Name == guiName or (arri
     ReplicatedFirst:RemoveDefaultLoadingScreen()
     arriving:Destroy()
     update("arriving", 0, "")
-    task.spawn(function()
-        while player.Parent == Players do
-            if player:GetAttribute(readyAttribute) == true then
-                arrivalMode = false
-                clearInterface()
-                return
-            end
-            local loadError = player:GetAttribute(errorAttribute)
-            if loadError ~= nil and currentStatus ~= "error" then update("error", 0, "") end
-            task.wait(0.25)
+    local function inspectArrivingProfile()
+        if not arrivalMode then return end
+        if player:GetAttribute(readyAttribute) == true then
+            arrivalMode = false
+            clearInterface()
+            return
         end
-    end)
+        if player:GetAttribute(errorAttribute) ~= nil and currentStatus ~= "error" then update("error", 0, "") end
+    end
+    arrivalReadyConnection = player:GetAttributeChangedSignal(readyAttribute):Connect(inspectArrivingProfile)
+    arrivalErrorConnection = player:GetAttributeChangedSignal(errorAttribute):Connect(inspectArrivingProfile)
+    inspectArrivingProfile()
 end
 
 task.spawn(function()
