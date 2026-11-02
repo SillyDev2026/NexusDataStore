@@ -147,6 +147,28 @@ local function makeInterface(): ScreenGui
     backgroundGradient.Color = ColorSequence.new(Color3.fromRGB(8, 13, 26), Color3.fromRGB(20, 40, 69))
     backgroundGradient.Parent = backdrop
 
+    -- Decorative grid: lightweight, no rendering loop or texture download.
+    for index = 1, 9 do
+        local gridLine = Instance.new("Frame")
+        gridLine.Name = "GridX" .. index
+        gridLine.Position = UDim2.fromScale(index / 10, 0)
+        gridLine.Size = UDim2.fromScale(0.001, 1)
+        gridLine.BackgroundColor3 = Color3.fromRGB(92, 148, 211)
+        gridLine.BackgroundTransparency = 0.965
+        gridLine.BorderSizePixel = 0
+        gridLine.Parent = backdrop
+    end
+    for index = 1, 6 do
+        local gridLine = Instance.new("Frame")
+        gridLine.Name = "GridY" .. index
+        gridLine.Position = UDim2.fromScale(0, index / 7)
+        gridLine.Size = UDim2.fromScale(1, 0.001)
+        gridLine.BackgroundColor3 = Color3.fromRGB(92, 148, 211)
+        gridLine.BackgroundTransparency = 0.967
+        gridLine.BorderSizePixel = 0
+        gridLine.Parent = backdrop
+    end
+
     local glow = Instance.new("Frame")
     glow.Name = "AmbientGlow"
     glow.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -160,6 +182,21 @@ local function makeInterface(): ScreenGui
     loopTween(glow, TweenInfo.new(4.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {
         Position = UDim2.fromScale(0.7, 0.33),
         BackgroundTransparency = 0.91,
+    }, stageTweens)
+
+    local secondGlow = Instance.new("Frame")
+    secondGlow.Name = "SecondaryGlow"
+    secondGlow.AnchorPoint = Vector2.new(0.5, 0.5)
+    secondGlow.Position = UDim2.fromScale(0.16, 0.78)
+    secondGlow.Size = UDim2.fromScale(0.31, 0.43)
+    secondGlow.BackgroundColor3 = Color3.fromRGB(100, 54, 173)
+    secondGlow.BackgroundTransparency = 0.91
+    secondGlow.BorderSizePixel = 0
+    secondGlow.Parent = backdrop
+    corner(secondGlow, 1)
+    loopTween(secondGlow, TweenInfo.new(5.8, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {
+        Position = UDim2.fromScale(0.27, 0.67),
+        BackgroundTransparency = 0.95,
     }, stageTweens)
 
     local main = Instance.new("Frame")
@@ -187,20 +224,73 @@ local function makeInterface(): ScreenGui
     highlight.BorderSizePixel = 0
     highlight.Parent = main
     corner(highlight, 1)
+    accentLine = highlight
+    loopTween(highlight, TweenInfo.new(3.8, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {Position = UDim2.fromScale(0.62, 0)}, stageTweens)
 
-    local tag = textLabel(main, "Eyebrow", "NEXUS  /  LIVE SERVER UPDATE", Enum.Font.GothamBold, accent, UDim2.fromScale(0.13, 0.10), UDim2.fromScale(0.74, 0.095))
+    -- Circular animated data-core gives each state its own visual identity.
+    local core = Instance.new("Frame")
+    core.Name = "DataCore"
+    core.AnchorPoint = Vector2.new(0.5, 0.5)
+    core.Position = UDim2.fromScale(0.19, 0.355)
+    core.Size = UDim2.fromScale(0.16, 0.24)
+    core.BackgroundColor3 = Color3.fromRGB(25, 55, 87)
+    core.BackgroundTransparency = 0.28
+    core.BorderSizePixel = 0
+    core.Parent = main
+    local coreRatio = Instance.new("UIAspectRatioConstraint")
+    coreRatio.AspectRatio = 1
+    coreRatio.Parent = core
+    corner(core, 1)
+    stroke(core, Color3.fromRGB(92, 188, 247), 0.18)
+    local coreHalo = Instance.new("Frame")
+    coreHalo.Name = "Halo"
+    coreHalo.AnchorPoint = Vector2.new(0.5, 0.5)
+    coreHalo.Position = UDim2.fromScale(0.5, 0.5)
+    coreHalo.Size = UDim2.fromScale(0.85, 0.85)
+    coreHalo.BackgroundTransparency = 1
+    coreHalo.Parent = core
+    corner(coreHalo, 1)
+    local haloStroke = Instance.new("UIStroke")
+    haloStroke.Thickness = 2
+    haloStroke.Color = accent
+    haloStroke.Transparency = 0.12
+    haloStroke.Parent = coreHalo
+    local haloGradient = Instance.new("UIGradient")
+    haloGradient.Color = ColorSequence.new(accent, violetAccent)
+    haloGradient.Rotation = 0
+    haloGradient.Parent = haloStroke
+    loopTween(haloGradient, TweenInfo.new(8, Enum.EasingStyle.Linear, Enum.EasingDirection.Out, -1), {Rotation = 360}, stageTweens)
+    local coreIcon = textLabel(core, "Icon", "◆", Enum.Font.GothamBold, normal, UDim2.fromScale(0.2, 0.18), UDim2.fromScale(0.6, 0.64))
+    coreIcon.TextTransparency = 0.05
+    statusOrb = core
+    loopTween(core, TweenInfo.new(2.4, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {BackgroundTransparency = 0.56}, stageTweens)
+
+    local tag = textLabel(main, "Eyebrow", "NEXUS  /  SERVER MIGRATION", Enum.Font.GothamBold, accent, UDim2.fromScale(0.12, 0.10), UDim2.fromScale(0.76, 0.085))
     tag.TextTransparency = 0.03
 
-    title = textLabel(main, "Title", "Server update scheduled", Enum.Font.GothamBold, normal, UDim2.fromScale(0.08, 0.235), UDim2.fromScale(0.84, 0.205))
-    statusText = textLabel(main, "Status", "Preparing to migrate...", Enum.Font.GothamMedium, accent, UDim2.fromScale(0.1, 0.47), UDim2.fromScale(0.8, 0.10))
-    description = textLabel(main, "Description", "Your progress stays protected while the server updates.", Enum.Font.Gotham, muted, UDim2.fromScale(0.12, 0.6), UDim2.fromScale(0.76, 0.155))
+    title = textLabel(main, "Title", "Server update scheduled", Enum.Font.GothamBold, normal, UDim2.fromScale(0.32, 0.245), UDim2.fromScale(0.58, 0.18), Enum.TextXAlignment.Left)
+    statusText = textLabel(main, "Status", "Preparing to migrate...", Enum.Font.GothamMedium, accent, UDim2.fromScale(0.31, 0.445), UDim2.fromScale(0.59, 0.095), Enum.TextXAlignment.Left)
+    description = textLabel(main, "Description", "Your progress stays protected while the server updates.", Enum.Font.Gotham, muted, UDim2.fromScale(0.12, 0.565), UDim2.fromScale(0.76, 0.123))
 
-    phaseLabel = textLabel(main, "Phase", "CHECKING PROFILE", Enum.Font.GothamBold, muted, UDim2.fromScale(0.11, 0.815), UDim2.fromScale(0.78, 0.075), Enum.TextXAlignment.Left)
+    -- Three-stage timeline shows only server-confirmed milestones, never a made-up percentage.
+    local stepNames = {"01   SAVE", "02   TRANSFER", "03   RESTORE"}
+    table.clear(phaseSteps)
+    for index, label in ipairs(stepNames) do
+        local item = textLabel(main, "Step" .. index, label, Enum.Font.GothamBold, muted,
+            UDim2.fromScale(0.105 + (index - 1) * 0.275, 0.735),
+            UDim2.fromScale(0.24, 0.085))
+        item.BackgroundTransparency = 0.6
+        item.BackgroundColor3 = Color3.fromRGB(38, 67, 103)
+        corner(item, 0.25)
+        table.insert(phaseSteps, item)
+    end
+
+    phaseLabel = textLabel(main, "Phase", "CHECKING PROFILE", Enum.Font.GothamBold, muted, UDim2.fromScale(0.11, 0.845), UDim2.fromScale(0.78, 0.052), Enum.TextXAlignment.Left)
 
     local bar = Instance.new("Frame")
     bar.Name = "ProgressTrack"
     bar.Size = UDim2.fromScale(0.78, 0.023)
-    bar.Position = UDim2.fromScale(0.11, 0.922)
+    bar.Position = UDim2.fromScale(0.11, 0.934)
     bar.BackgroundColor3 = Color3.fromRGB(43, 68, 101)
     bar.BorderSizePixel = 0
     bar.ClipsDescendants = true
@@ -218,6 +308,14 @@ local function makeInterface(): ScreenGui
     corner(fill, 1)
     phaseFill = fill
     loopTween(fill, moveEase, {Position = UDim2.fromScale(0.78, 0)}, stageTweens)
+    local shine = Instance.new("UIGradient")
+    shine.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, accent),
+        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(225, 245, 255)),
+        ColorSequenceKeypoint.new(1, violetAccent),
+    })
+    shine.Parent = fill
+    loopTween(shine, TweenInfo.new(2.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {Offset = Vector2.new(0.5, 0)}, stageTweens)
 
     local notice = Instance.new("CanvasGroup")
     notice.Name = "Banner"
