@@ -393,6 +393,15 @@ local function setPresentation(kind: string, immediate: boolean?)
     activePresentation = kind
     local showStage = kind == "full"
     local showBanner = kind == "banner"
+    if REDUCED_MOTION then
+        stage.Visible = showStage
+        stage.GroupTransparency = showStage and 0 or 1
+        panel.Position = UDim2.fromScale(0.5, 0.5)
+        banner.Visible = showBanner
+        banner.GroupTransparency = showBanner and 0 or 1
+        banner.Position = UDim2.fromScale(0.5, showBanner and 0.06 or -0.11)
+        return
+    end
     for _, tween in ipairs(stageTweens) do if showStage then tween:Play() else tween:Pause() end end
     for _, tween in ipairs(bannerTweens) do if showBanner then tween:Play() else tween:Pause() end end
     if showStage then
@@ -437,6 +446,7 @@ local function clearInterface()
     transitionToken += 1
     if viewportConnection then viewportConnection:Disconnect(); viewportConnection = nil end
     stopTransitions()
+    cancelStatusTweens()
     for _, tween in ipairs(stageTweens) do tween:Cancel() end
     for _, tween in ipairs(bannerTweens) do tween:Cancel() end
     table.clear(stageTweens)
@@ -444,7 +454,8 @@ local function clearInterface()
     if activeGui then activeGui:Destroy() end
     activeGui, stage, banner, panel = nil, nil, nil, nil
     bannerText, bannerTimer, title, statusText, description = nil, nil, nil, nil, nil
-    phaseLabel, progressTrack, phaseFill = nil, nil, nil
+    phaseLabel, progressTrack, phaseFill, accentLine, statusOrb = nil, nil, nil, nil, nil
+    table.clear(phaseSteps)
     currentStatus, activePresentation, restartAt, lastMessage = "idle", "hidden", 0, ""
 end
 
@@ -470,13 +481,32 @@ local function update(status: string, target: number, message: string)
     setPresentation(presentation)
     if not title or not statusText or not description or not phaseLabel then return end
     if status ~= previousStatus then
+        cancelStatusTweens()
         for _, label in ipairs({title, statusText, description, phaseLabel}) do
-            label.TextTransparency = 0.65
-            TweenService:Create(label, fadeEase, {TextTransparency = 0}):Play()
+            label.TextTransparency = REDUCED_MOTION and 0 or 0.9
+            animateState(label, {TextTransparency = 0}, stateTextFade)
+        end
+        local shade = phaseColor(status)
+        animateState(statusText, {TextColor3 = shade})
+        if accentLine then animateState(accentLine, {BackgroundColor3 = shade}) end
+        if statusOrb then animateState(statusOrb, {BackgroundColor3 = status == "error" and Color3.fromRGB(107, 38, 57) or Color3.fromRGB(25, 55, 87)}) end
+        if phaseFill then animateState(phaseFill, {BackgroundColor3 = shade}) end
+
+        -- Explicit stage transitions: save success is not proof of teleport or load success.
+        local currentStep = status == "ready" and 2 or (status == "arriving" or status == "error") and 3 or 1
+        for index, step in ipairs(phaseSteps) do
+            local completed = index < currentStep
+            local active = index == currentStep
+            local tone = completed and successAccent or (active and shade or muted)
+            animateState(step, {TextColor3 = tone, BackgroundTransparency = active and 0.18 or (completed and 0.4 or 0.74)})
+        end
+
+        if status == "error" then
+            for _, tween in ipairs(stageTweens) do tween:Pause() end
+        elseif activePresentation == "full" and not REDUCED_MOTION then
+            for _, tween in ipairs(stageTweens) do tween:Play() end
         end
     end
-    local shade = status == "ready" and Color3.fromRGB(96, 227, 184) or (status == "error" and Color3.fromRGB(255, 139, 145) or accent)
-    TweenService:Create(statusText, fadeEase, {TextColor3 = shade}):Play()
     if status == "scheduled" then
         title.Text = "New update incoming"
         statusText.Text = "Server restart in " .. countdown(seconds)
