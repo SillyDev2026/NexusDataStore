@@ -59,7 +59,12 @@ check("v8.4 uses fresh reserved server and retries", 'ReservedServerId = HttpSer
 check("v8.4 records auto publish and teleport diagnostics", 'AutoPublishDetected = 0' in data and 'AutoPublishTeleportFailed = 0' in data and 'GetAutoPublishStatus()' in data)
 check("v8.4 client distinguishes teleport retry from save retry", '"teleport-retrying"' in client and '"moving"' in client)
 check("v8.4 mock tests integrated", (ROOT / "tests/PortableAutoPublishRegression.luau").exists() and 'PortableAutoPublishRegression.luau' in (ROOT / "tools/run_behavioral_tests.py").read_text(encoding="utf-8"))
-check("v8.4 setup and limitations clearly documented", '## New in 8.4.0' in readme and 'best-effort' in readme and 'reserved/private server' in readme)
+check("v8.4 setup and limitations preserved", '## Previously in 8.4.0' in readme and 'best-effort' in readme and 'reserved/private server' in readme)
+check("v8.4.1 neon horizon procedural background", all(token in client for token in ("buildHorizon(backdrop)", "PerspectiveGridFloor", "HorizonGlow", "HorizonLine", "GridX", "GridY", "DataTower", "DataStar", "HorizonHUDRing", "FloorLightArc", "HorizonScan")))
+check("v8.4.1 optional exact art uses a Roblox ImageLabel", 'BACKGROUND_IMAGE_ID = ""' in client and 'image.ScaleType = Enum.ScaleType.Crop' in client and 'image.Image = BACKGROUND_IMAGE_ID' in client)
+check("v8.4.1 floor perspective responds to viewport geometry", 'math.atan2(dy, dx)' in client and 'entry.Line.Rotation' in client and 'GetPropertyChangedSignal("AbsoluteSize")' in client)
+check("v8.4.1 animated background only on active full screen", 'if horizonScan then horizonScan.Position' in client and 'if not lightweightEffects then' in client and 'if REDUCED_MOTION then return end' in client)
+check("v8.4.1 horizon asset instructions documented", '## New in 8.4.1' in readme and 'BACKGROUND_IMAGE_ID' in readme and 'neon_nexus_data_horizon.png' in readme)
 check("restart setup and publish workflow documented", "## Previously in 7.10.0" in readme and "Restart only servers with outdated versions" in readme)
 local_declaration_pattern = re.compile(r"^[ \t]*local[ \t]+[^=\n]+=[ \t]*$", re.MULTILINE)
 luau_files = [ROOT / "DataStore.lua", ROOT / "Compression.lua", *(ROOT / "tests").glob("*.lua"), *(ROOT / "tests").glob("*.luau")]
