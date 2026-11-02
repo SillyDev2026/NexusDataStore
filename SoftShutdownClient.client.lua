@@ -1,9 +1,9 @@
 --!strict
--- NexusDataStore v8.4.1 neon-horizon restart UI: GIF-inspired background and frame-synced motion.
+-- NexusDataStore v8.4.2 stable neon shutdown interface with adaptive motion and readable type.
 -- Install this LocalScript in ReplicatedFirst and set STORE_NAME to the DataStore Name.
 local STORE_NAME = "PlayerData"
 local REDUCED_MOTION = false -- Set true to disable continuous animations and shorten transitions.
-local BACKGROUND_IMAGE_ID = "" -- Optional exact PNG: upload neon_nexus_data_horizon.png to Roblox, then use "rbxassetid://<id>".
+local BACKGROUND_IMAGE_ID = "" -- Optional image: "rbxassetid://135793690711172" for your uploaded neon artwork.
 local Players = game:GetService("Players")
 local ReplicatedFirst = game:GetService("ReplicatedFirst")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -25,10 +25,10 @@ local violetAccent = Color3.fromRGB(172, 133, 255)
 local normal = Color3.fromRGB(230, 242, 255)
 local muted = Color3.fromRGB(157, 179, 207)
 local panelColor = Color3.fromRGB(17, 31, 55)
-local stateTextFade = TweenInfo.new(0.48, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
-local accentEase = TweenInfo.new(0.55, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
-local infoEase = TweenInfo.new(0.38, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
-local fadeEase = TweenInfo.new(0.28, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local stateTextFade = TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local accentEase = TweenInfo.new(0.28, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local infoEase = TweenInfo.new(0.42, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+local fadeEase = TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 
 local activeGui: ScreenGui? = nil
 local stage: CanvasGroup? = nil
@@ -73,6 +73,7 @@ local slowFrameDuration = 0
 local recoveryDuration = 0
 local lightweightEffects = false
 local diagnosticsAccumulator = 0
+local backgroundAccumulator = 0
 local horizonRays: {{Line: Frame, StartX: number}} = {}
 local horizonScan: Frame? = nil
 local horizonRing: UIGradient? = nil
@@ -92,6 +93,8 @@ local function stroke(parent: Instance, color: Color3, opacity: number)
     item.Parent = parent
 end
 
+-- Keep all UI geometry percentage-based while bounding text size in pixels.
+-- TextScaled alone makes captions microscopic on phones and huge on desktops.
 local function textLabel(parent: Instance, name: string, value: string, font: Enum.Font, color: Color3, pos: UDim2, size: UDim2, alignment: Enum.TextXAlignment?): TextLabel
     local item = Instance.new("TextLabel")
     item.Name = name
@@ -105,6 +108,25 @@ local function textLabel(parent: Instance, name: string, value: string, font: En
     item.TextWrapped = true
     item.TextXAlignment = alignment or Enum.TextXAlignment.Center
     item.TextYAlignment = Enum.TextYAlignment.Center
+    item.TextStrokeTransparency = 0.94
+    local limits = Instance.new("UITextSizeConstraint")
+    limits.Name = "ReadableText"
+    if name == "Title" then
+        limits.MinTextSize, limits.MaxTextSize = 17, 34
+    elseif name == "Status" then
+        limits.MinTextSize, limits.MaxTextSize = 13, 23
+    elseif name == "Description" then
+        limits.MinTextSize, limits.MaxTextSize = 12, 18
+    elseif name == "Icon" then
+        limits.MinTextSize, limits.MaxTextSize = 17, 36
+    elseif name == "Timer" then
+        limits.MinTextSize, limits.MaxTextSize = 13, 23
+    elseif name == "Message" then
+        limits.MinTextSize, limits.MaxTextSize = 12, 19
+    else
+        limits.MinTextSize, limits.MaxTextSize = 10, 16
+    end
+    limits.Parent = item
     item.Parent = parent
     return item
 end
@@ -326,14 +348,14 @@ local function makeInterface(): ScreenGui
     main.Position = UDim2.fromScale(0.5, 0.55)
     main.Size = UDim2.fromScale(0.86, 0.47)
     main.BackgroundColor3 = panelColor
-    main.BackgroundTransparency = 0.035
+    main.BackgroundTransparency = 0.07
     main.BorderSizePixel = 0
     main.Parent = overlay
     corner(main, 0.055)
-    stroke(main, Color3.fromRGB(79, 119, 163), 0.35)
+    stroke(main, Color3.fromRGB(79, 149, 205), 0.44)
     panel = main
     local mainGradient = Instance.new("UIGradient")
-    mainGradient.Color = ColorSequence.new(Color3.fromRGB(20, 37, 62), Color3.fromRGB(13, 24, 44))
+    mainGradient.Color = ColorSequence.new(Color3.fromRGB(16, 33, 58), Color3.fromRGB(9, 19, 38))
     mainGradient.Rotation = 105
     mainGradient.Parent = main
 
@@ -389,9 +411,9 @@ local function makeInterface(): ScreenGui
     local tag = textLabel(main, "Eyebrow", "NEXUS  /  SERVER MIGRATION", Enum.Font.GothamBold, accent, UDim2.fromScale(0.12, 0.10), UDim2.fromScale(0.76, 0.085))
     tag.TextTransparency = 0.03
 
-    title = textLabel(main, "Title", "Server update scheduled", Enum.Font.GothamBold, normal, UDim2.fromScale(0.32, 0.245), UDim2.fromScale(0.58, 0.18), Enum.TextXAlignment.Left)
-    statusText = textLabel(main, "Status", "Preparing to migrate...", Enum.Font.GothamMedium, accent, UDim2.fromScale(0.31, 0.445), UDim2.fromScale(0.59, 0.095), Enum.TextXAlignment.Left)
-    description = textLabel(main, "Description", "Your progress stays protected while the server updates.", Enum.Font.Gotham, muted, UDim2.fromScale(0.12, 0.565), UDim2.fromScale(0.76, 0.123))
+    title = textLabel(main, "Title", "Server update scheduled", Enum.Font.GothamBold, normal, UDim2.fromScale(0.32, 0.235), UDim2.fromScale(0.59, 0.18), Enum.TextXAlignment.Left)
+    statusText = textLabel(main, "Status", "Preparing to migrate...", Enum.Font.GothamMedium, accent, UDim2.fromScale(0.32, 0.44), UDim2.fromScale(0.59, 0.11), Enum.TextXAlignment.Left)
+    description = textLabel(main, "Description", "Your progress stays protected while the server updates.", Enum.Font.Gotham, muted, UDim2.fromScale(0.12, 0.568), UDim2.fromScale(0.76, 0.135))
 
     -- Three-stage timeline shows only server-confirmed milestones, never a made-up percentage.
     local stepNames = {"01   SAVE", "02   TRANSFER", "03   RESTORE"}
@@ -400,7 +422,7 @@ local function makeInterface(): ScreenGui
         local item = textLabel(main, "Step" .. index, label, Enum.Font.GothamBold, muted,
             UDim2.fromScale(0.105 + (index - 1) * 0.275, 0.735),
             UDim2.fromScale(0.24, 0.085))
-        item.BackgroundTransparency = 0.6
+        item.BackgroundTransparency = 0.72
         item.BackgroundColor3 = Color3.fromRGB(38, 67, 103)
         corner(item, 0.25)
         table.insert(phaseSteps, item)
