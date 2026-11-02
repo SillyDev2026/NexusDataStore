@@ -2,19 +2,65 @@
 
 **Typed, session-aware data persistence for Roblox.**
 
-![Version](https://img.shields.io/badge/NexusDataStore-7.9.0-2563eb)
+![Version](https://img.shields.io/badge/NexusDataStore-7.10.0-2563eb)
 ![Codec](https://img.shields.io/badge/Compression-2.6.0-0f766e)
 ![Luau](https://img.shields.io/badge/language-Luau-00a2ff)
 ![Platform](https://img.shields.io/badge/platform-Roblox-222222)
 
 NexusDataStore brings standard Roblox DataStore persistence, session ownership, typed player profiles, validation, migrations, snapshots, adaptive compression, and numeric leaderboards into one server-side library.
 
-**Current version:** `7.9.0` · **Compression:** `2.6.0` / codecs `230`–`233` · **Record format:** `700`
+**Current version:** `7.10.0` · **Compression:** `2.6.0` / codecs `230`–`233` · **Record format:** `700`
 
 > [!IMPORTANT]
 > This documentation describes the current source on `main`. Regression scripts are included, but production reliability and performance have not been certified by live-server load testing. Use a separate test universe before deploying changes to existing player data.
 
-## New in 7.9.0 — Run-length compression for real player profiles
+## New in 7.10.0 — Built-in soft shutdown and session-safe Roblox updates
+
+This version adds a **fully opt-in restart coordinator** and a drop-in, responsive restart screen. It listens for Roblox's supported `game.ServerRestartScheduled` event, saves before the scheduled restart, freezes normal NexusDataStore mutations for the final save, and releases session locks in parallel when the server closes. The **actual teleport is performed by Roblox Restart Servers**; NexusDataStore intentionally does not launch a competing teleport that could strand players or bypass session ownership.
+
+### Install in Roblox Studio
+
+1. Put the newest `DataStore.lua`, `Compression.lua` and `PlayersData` modules in place as usual.
+2. Copy `SoftShutdownClient.client.lua` into **ReplicatedFirst as a LocalScript**. The LocalScript creates its own entire GUI, including mobile-friendly scaling, progress indicator, restart status, countdown and arriving-server screen. No GUI objects need to be manually authored. Set its `STORE_NAME` to match your store's `Name`.
+3. Configure your player store with:
+
+~~~lua
+local Store = NexusDataStore.new({
+    Name = "PlayerData",
+    Template = PlayersData,
+    AutoPlayerLifecycle = true,
+    EnableSoftShutdown = true,
+    SoftShutdownPreSaveSeconds = 20,
+    SoftShutdownFreezeSeconds = 6,
+    SoftShutdownCloseTimeout = 25,
+    WaitForSessionLock = true,
+    LoadTimeout = 60,
+    AutoSave = true,
+    BudgetAware = true,
+})
+-- EnableSoftShutdown automatically binds the store's shutdown callback.
+-- Do not register a duplicate manual SaveAsync/ReleaseAsync shutdown handler.
+~~~
+
+4. Publish the updated scripts to **every server** before using the feature.
+5. On Creator Dashboard, publish your game update, then choose **Server Management > Restart Servers**, preferably **Restart only servers with outdated versions** and a delayed restart of at least one minute. Roblox schedules and migrates the server; the library reacts automatically. A normal publish **without Restart Servers** does not migrate existing players.
+
+### Lifecycle and guarantees
+
+- **Scheduled:** A restart notice and countdown appear to players. Attributes on the per-store server `RemoteEvent` let late-joining clients recover the current state. The feature also handles `RobloxMaintenance` scheduled restarts.
+- **Pre-save:** At 20 seconds remaining (configurable), the coordinator requests a critical flush of active dirty profiles without dropping their session locks. Gameplay may continue in this phase.
+- **Final save:** At six seconds remaining, `Session:Set`, `Increment`, `Mutate`, `Award`, and other NexusDataStore mutation methods return `SOFT_SHUTDOWN_FROZEN`. The final flush retries on errors. **Do not mutate `session.Data` directly**: uncontrolled table edits bypass the mutation freeze.
+- **Migration:** Roblox automatically teleports players to updated servers. `PlayerRemoving` releases departing profiles via the existing verified lock-clearing commit. `BindToClose` makes bounded parallel release attempts across remaining profiles; a failed release is never treated as a successful handoff.
+- **Arrival:** `WaitForSessionLock` is automatically enabled with soft shutdown and defaults to a 60-second load timeout unless overridden. The destination UI remains on the progress screen until `AutoPlayerLifecycle` confirms `NexusDataStoreProfileReady`; if load fails it shows a reconnect-required error instead of claiming success.
+- **Developer diagnostics:** `Store:GetSoftShutdownStatus()`, `Store:On("SoftShutdownStatus", fn)`, `Store:On("SoftShutdownSaveFailed", fn)`, and counters `RestartsScheduled`, `SoftShutdownFlushes` and `SoftShutdownFlushFailed`.
+
+### Important limitations
+
+The restart timestamp is the **earliest scheduled** closure; Roblox may move players later. Scheduled restart notifications are only guaranteed for the **delayed** restart flow and may be absent for immediate/emergency closures. `BindToClose` is the fallback, bounded by Roblox's approximately 30-second shutdown window. Save requests may fail due to data-service outages or budgets: no implementation can guarantee an acknowledged save in those conditions. **Do not store currency/profile state in TeleportData or trust client data**; destination servers must acquire the real DataStore session. The UI depends on the provided LocalScript being installed in both the old and new published versions.
+
+Studio cannot simulate real teleportation. GitHub Luau regressions validate the coordinator state machine and the library compiles, but **real publish/restart tests in a separate Roblox universe are still required**.
+
+## Previously in 7.9.0 — Run-length compression for real player profiles
 
 Compression v2.6.0 adds opt-in **codec 233** for arrays containing repeated **strings, finite numbers, or Booleans**, such as repeated inventory items, progress counters, and status flags. It stores each consecutive run once with its length. No array element, field, or required metadata is discarded.
 
