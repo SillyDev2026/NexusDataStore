@@ -2578,6 +2578,131 @@ function NexusDataStore:_SoftShutdownTick(timestamp: number)
 	end)
 end
 
+-- Best-effort Studio publish detection. InsertService returns asset VERSION IDs,
+-- not PlaceVersion numbers or an authoritative publish notification.
+-- Two consecutive identical changed readings avoid single-sample glitches.
+function NexusDataStore:_CheckAutoPublishVersion(): (boolean, string?)
+	if not self.Config.AutoRestartOnPublish or self.Closing or self.Closed or self.SoftShutdownState then return false, "NOT_MONITORING" end
+	local ran, version = pcall(InsertService.GetLatestAssetVersionAsync, InsertService, game.PlaceId)
+	self.Metrics.AutoPublishChecks += 1
+	if not ran or not safeInteger(version) or version <= 0 then
+		self.Metrics.AutoPublishCheckFailed += 1
+		self.AutoPublishLastError = tostring(version)
+		self:_Fire("AutoPublishCheckFailed", self.AutoPublishLastError)
+		return false, "VERSION_QUERY_FAILED"
+	end
+	self.AutoPublishLastError = nil
+	if self.AutoPublishBaseline == nil then
+		self.AutoPublishBaseline = version
+		return false, "BASELINE_READY"
+	end
+	if version == self.AutoPublishBaseline then
+		self.AutoPublishCandidate = nil
+		self.AutoPublishCandidatesSeen = 0
+		return false, "CURRENT_VERSION"
+	end
+	if self.AutoPublishCandidate ~= version then
+		self.AutoPublishCandidate = version
+		self.AutoPublishCandidatesSeen = 1
+		return false, "CANDIDATE_CHANGED"
+	end
+	self.AutoPublishCandidatesSeen += 1
+	if self.AutoPublishCandidatesSeen < 2 then return false, "CANDIDATE_PENDING" end
+	if self.SoftShutdownState then return false, "RESTART_ALREADY_SCHEDULED" end
+	local scheduleAt = os.time() + self.Config.AutoPublishCountdownSeconds
+	local scheduledStores = 0
+	for store in pairs(activeSoftShutdownStores) do
+		if store.Config.EnableSoftShutdown and not store.Closed and not store.Closing and store.SoftShutdownState == nil then
+			store:_OnServerRestartScheduled(DateTime.fromUnixTimestamp(scheduleAt), {Name = "AutoPublish"}, {
+				message = "A new game update was detected. Securing progress before joining an updated server.",
+			})
+			scheduledStores += 1
+		end
+	end
+	if scheduledStores == 0 then return false, "NO_ACTIVE_STORES" end
+	self.Metrics.AutoPublishDetected += 1
+	self:_Fire("AutoPublishDetected", self.AutoPublishBaseline, version, scheduledStores)
+	return true
+end
+
+function NexusDataStore:_StartAutoPublishWatch()
+	if self.AutoPublishWatchStarted then return end
+	self.AutoPublishWatchStarted = true
+	task.spawn(function()
+		while not self.Closed and not self.Closing and self.SoftShutdownState == nil do
+			self:_CheckAutoPublishVersion()
+			if self.SoftShutdownState then break end
+			task.wait(self.Config.AutoPublishPollInterval)
+		end
+	end)
+	self.AutoPublishTeleportFailureConnection = TeleportService.TeleportInitFailed:Connect(function(player, _, err, placeId)
+		local state = self.SoftShutdownState
+		if not state or state.Source ~= "AutoPublish" or not state.TeleportAttempted then return end
+		if placeId ~= game.PlaceId or player.Parent ~= Players then return end
+		state.TeleportStarted = false
+		state.NextTeleportAttempt = os.time() + 5
+		self.Metrics.AutoPublishTeleportFailed += 1
+		self:_SetSoftShutdownStatus("teleport-retrying")
+		self:_Fire("AutoPublishTeleportFailed", tostring(err))
+	end)
+end
+
+function NexusDataStore:_AutoPublishTeleportTick(timestamp: number)
+	local state = self.SoftShutdownState
+	if not state or state.Source ~= "AutoPublish" or self.Closing or self.Closed then return end
+	if timestamp < state.RestartAt or not state.FinalSaved then return end
+	if self.AutoPublishTeleportBusy or state.TeleportStarted or timestamp < (state.NextTeleportAttempt or 0) then return end
+	for store in pairs(activeSoftShutdownStores) do
+		local peer = store.SoftShutdownState
+		if store.Config.EnableSoftShutdown and not store.Closed and not store.Closing
+			and (not peer or peer.Source ~= "AutoPublish" or not peer.FinalSaved) then return end
+	end
+	local players = Players:GetPlayers()
+	if #players == 0 then return end
+	self.AutoPublishTeleportBusy = true
+	state.TeleportStarted = true
+	state.TeleportAttempted = true
+	self:_SetSoftShutdownStatus("moving")
+	self.Metrics.AutoPublishTeleportAttempts += 1
+	task.spawn(function()
+		local ok, err = pcall(function()
+			if not self.AutoPublishTeleportOptions then
+				local options = Instance.new("TeleportOptions")
+				-- New GUID -> fresh destination, avoids routing players back into outdated public servers.
+				options.ReservedServerId = HttpService:GenerateGUID(false)
+				self.AutoPublishTeleportOptions = options
+			end
+			-- Roblox supports at most 50 players in one TeleportAsync request.
+			for index = 1, #players, 50 do
+				local batch = {}
+				for position = index, math.min(index + 49, #players) do
+					if players[position].Parent == Players then table.insert(batch, players[position]) end
+				end
+				if #batch > 0 then TeleportService:TeleportAsync(game.PlaceId, batch, self.AutoPublishTeleportOptions) end
+			end
+		end)
+		self.AutoPublishTeleportBusy = false
+		if not ok and self.SoftShutdownState == state and not self.Closed then
+			state.TeleportStarted = false
+			state.NextTeleportAttempt = os.time() + 5
+			self.Metrics.AutoPublishTeleportFailed += 1
+			self:_SetSoftShutdownStatus("teleport-retrying")
+			self:_Fire("AutoPublishTeleportFailed", tostring(err))
+		end
+	end)
+end
+
+function NexusDataStore:GetAutoPublishStatus(): {[string]: any}
+	local state = self.SoftShutdownState
+	return {
+		Enabled = self.Config.AutoRestartOnPublish == true, BaselineAssetVersion = self.AutoPublishBaseline,
+		CandidateAssetVersion = self.AutoPublishCandidate, CandidateChecks = self.AutoPublishCandidatesSeen,
+		LastError = self.AutoPublishLastError, RestartScheduled = state ~= nil and state.Source == "AutoPublish",
+		TeleportStarted = state ~= nil and state.TeleportStarted == true,
+		PollInterval = self.Config.AutoPublishPollInterval,
+	}
+end
+
 function NexusDataStore:GetSoftShutdownStatus(): {[string]: any}
 	local state = self.SoftShutdownState
 	if not state then return {Enabled = self.Config.EnableSoftShutdown == true, Status = "idle", Frozen = false} end
