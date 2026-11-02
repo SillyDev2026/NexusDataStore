@@ -122,6 +122,10 @@ export type StoreConfig<T> = {
 	KeyPrefix: string?,
 	PlayerKey: ((player: Player) -> string | number)?,
 	AutoPlayerLifecycle: boolean?,
+	EnableSoftShutdown: boolean?,
+	SoftShutdownPreSaveSeconds: number?,
+	SoftShutdownFreezeSeconds: number?,
+	SoftShutdownCloseTimeout: number?,
 	EnableCrossServerEvents: boolean?,
 	CrossServerTopic: string?,
 	OrderedDataStores: {[string]: OrderedDataStoreConfig<T>}?,
@@ -250,6 +254,7 @@ export type Store<T> = {
 	GetPerformanceReport: (self: Store<T>) -> {[string]: any},
 	GetHealth: (self: Store<T>) -> {[string]: any},
 	AttachPlayerLifecycle: (self: Store<T>) -> (),
+	GetSoftShutdownStatus: (self: Store<T>) -> {[string]: any},
 	BindToClose: (self: Store<T>) -> (),
 	CloseAsync: (self: Store<T>, timeout: number?) -> (boolean, string?),
 	On: (self: Store<T>, eventName: string, callback: (...any) -> ()) -> any,
@@ -280,10 +285,11 @@ local DataStoreService = game:GetService("DataStoreService")
 local HttpService = game:GetService("HttpService")
 local MessagingService = game:GetService("MessagingService")
 local EncodingService = game:GetService("EncodingService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local NexusDataStore: any = {}
 NexusDataStore.__index = NexusDataStore
-NexusDataStore.Version = "7.9.0"
+NexusDataStore.Version = "7.10.0"
 NexusDataStore.RecordFormat = 700
 NexusDataStore.RequiredCompressionVersion = "2.3.0"
 
@@ -2307,6 +2313,7 @@ function NexusDataStore:_BackgroundLoop()
 					table.insert(sessions, session)
 				end
 				local currentTime = now()
+				if self.Config.EnableSoftShutdown then self:_SoftShutdownTick(os.time()) end
 				for _, session in ipairs(sessions) do
 					if session:IsActive() then
 						-- Controlled mutations already mark Dirty. Only scan a clean session for
@@ -2389,10 +2396,16 @@ function NexusDataStore:ReleaseAllAsync(): {[string]: any}
 end
 
 function NexusDataStore:_HandleLifecycleJoin(player: Player)
+	if self.Config.EnableSoftShutdown then player:SetAttribute("NexusDataStoreProfileReady", false) end
 	local session, err = self:OpenPlayerAsync(player)
 	if not session then
+		if self.Config.EnableSoftShutdown and player.Parent == Players then player:SetAttribute("NexusDataStoreProfileError", tostring(err)) end
 		self:_Fire("PlayerLoadFailed", player, err)
 		return
+	end
+	if self.Config.EnableSoftShutdown and player.Parent == Players then
+		player:SetAttribute("NexusDataStoreProfileError", nil)
+		player:SetAttribute("NexusDataStoreProfileReady", true)
 	end
 	if player.Parent ~= Players then
 		local released, releaseErr = self:ReleaseAsync(session)
@@ -2431,13 +2444,90 @@ function NexusDataStore:AttachPlayerLifecycle()
 	end)
 end
 
+-- The platform performs the actual update teleport. NexusDataStore provides
+-- restart UI state, pre-flush, freeze-on-final-save and lock-safe departure.
+function NexusDataStore:_SetSoftShutdownStatus(status: string)
+	local state = self.SoftShutdownState
+	if not state then return end
+	state.Status = status
+	local remote = self.SoftShutdownRemote
+	if remote then
+		remote:SetAttribute("Status", status)
+		remote:SetAttribute("RestartAt", state.RestartAt)
+		remote:SetAttribute("Message", state.Message)
+		remote:SetAttribute("Source", state.Source)
+		remote:FireAllClients(status, state.RestartAt, state.Message, state.Source)
+	end
+	self:_Fire("SoftShutdownStatus", status, state.RestartAt, state.Message)
+end
+
+function NexusDataStore:_OnServerRestartScheduled(restartTime: any, source: any, attributes: any)
+	if not self.Config.EnableSoftShutdown or self.Closed then return end
+	local timestamp = restartTime and restartTime.UnixTimestamp
+	if not finiteNumber(timestamp) then return end
+	local message = typeof(attributes) == "table" and attributes.message or nil
+	if typeof(message) ~= "string" or #message == 0 then message = "Game servers are updating. Your progress is being saved." end
+	message = string.sub(message, 1, 180)
+	local sourceName = source and source.Name or "DeveloperUpdate"
+	self.SoftShutdownState = {Status = "scheduled", RestartAt = timestamp, Source = tostring(sourceName), Message = message,
+		PreSaved = false, FinalSaved = false, SavePending = false, NextAttempt = 0, SaveFailures = 0}
+	self.SoftShutdownFrozen = false
+	self.Metrics.RestartsScheduled += 1
+	self:_SetSoftShutdownStatus("scheduled")
+end
+
+function NexusDataStore:_SoftShutdownTick(timestamp: number)
+	local state = self.SoftShutdownState
+	if not state or self.Closing or self.Closed then return end
+	local remaining = state.RestartAt - timestamp
+	if remaining > self.Config.SoftShutdownPreSaveSeconds then return end
+	local final = remaining <= self.Config.SoftShutdownFreezeSeconds
+	if final and not self.SoftShutdownFrozen then
+		self.SoftShutdownFrozen = true
+		self:_SetSoftShutdownStatus("saving")
+	end
+	if state.SavePending or timestamp < state.NextAttempt then return end
+	if final and state.FinalSaved then
+		if state.Status ~= "ready" then self:_SetSoftShutdownStatus("ready") end
+		return
+	end
+	if not final and state.PreSaved then return end
+	state.SavePending = true
+	local isFinal = final
+	if state.Status ~= "saving" then self:_SetSoftShutdownStatus("saving") end
+	task.spawn(function()
+		local ok, result, err = pcall(self.FlushAsync, self, math.min(self.Config.SaveTimeout, self.Config.SoftShutdownCloseTimeout))
+		state.SavePending = false
+		if self.SoftShutdownState ~= state or self.Closed then return end
+		if ok and result == true then
+			if isFinal then state.FinalSaved = true else state.PreSaved = true end
+			self.Metrics.SoftShutdownFlushes += 1
+			self:_SetSoftShutdownStatus(isFinal and "ready" or "scheduled")
+		else
+			state.SaveFailures += 1
+			state.NextAttempt = os.time() + 2
+			self.Metrics.SoftShutdownFlushFailed += 1
+			self:_SetSoftShutdownStatus("retrying")
+			self:_Fire("SoftShutdownSaveFailed", tostring(ok and err or result))
+		end
+	end)
+end
+
+function NexusDataStore:GetSoftShutdownStatus(): {[string]: any}
+	local state = self.SoftShutdownState
+	if not state then return {Enabled = self.Config.EnableSoftShutdown == true, Status = "idle", Frozen = false} end
+	return {Enabled = true, Status = state.Status, RestartAt = state.RestartAt, Source = state.Source,
+		Message = state.Message, Frozen = self.SoftShutdownFrozen == true, PreSaved = state.PreSaved,
+		FinalSaved = state.FinalSaved, SaveFailures = state.SaveFailures}
+end
+
 function NexusDataStore:BindToClose()
 	if self.BoundToClose then
 		return
 	end
 	self.BoundToClose = true
 	game:BindToClose(function()
-		local ok, err = self:CloseAsync(self.Config.SaveTimeout)
+		local ok, err = self:CloseAsync(self.Config.EnableSoftShutdown and self.Config.SoftShutdownCloseTimeout or self.Config.SaveTimeout)
 		if not ok then warn("[NexusDataStore] BindToClose could not release every session:", err) end
 	end)
 end
@@ -2467,16 +2557,29 @@ function NexusDataStore:CloseAsync(timeout: number?): (boolean, string?)
 		table.insert(sessions, session)
 	end
 	local firstError
-	for _, session in ipairs(sessions) do
-		if now() >= deadline then
-			firstError = firstError or "CLOSE_TIMEOUT"
-			break
+	if self.Config.EnableSoftShutdown then
+		-- Bound total shutdown time; parallel per-key updates are independent.
+		local remaining = 0
+		for _, session in ipairs(sessions) do
+			if session:IsActive() then
+				remaining += 1
+				task.spawn(function()
+					local ran, ok, err = pcall(self.ReleaseAsync, self, session)
+					if not ran or not ok then
+						firstError = firstError or (ran and tostring(err) or "RELEASE_EXCEPTION:" .. tostring(ok))
+					end
+					remaining -= 1
+				end)
+			end
 		end
-		local released, ok, err = pcall(self.ReleaseAsync, self, session)
-		if not released then
-			firstError = firstError or "RELEASE_EXCEPTION:" .. tostring(ok)
-		elseif not ok then
-			firstError = firstError or err or "RELEASE_FAILED"
+		while remaining > 0 and now() < deadline do task.wait(0.03) end
+		if remaining > 0 then firstError = firstError or "CLOSE_TIMEOUT" end
+	else
+		for _, session in ipairs(sessions) do
+			if now() >= deadline then firstError = firstError or "CLOSE_TIMEOUT"; break end
+			local ran, ok, err = pcall(self.ReleaseAsync, self, session)
+			if not ran then firstError = firstError or "RELEASE_EXCEPTION:" .. tostring(ok)
+			elseif not ok then firstError = firstError or err or "RELEASE_FAILED" end
 		end
 	end
 	-- Do not permanently stop heartbeats/saves while any active session
@@ -2492,6 +2595,7 @@ function NexusDataStore:CloseAsync(timeout: number?): (boolean, string?)
 		self:_Fire("CloseFailed", firstError)
 		return false, firstError
 	end
+	if self.ServerRestartConnection then self.ServerRestartConnection:Disconnect() end
 	if self.CrossServerSubscription then
 		pcall(function()
 			self.CrossServerSubscription:Disconnect()
@@ -3177,6 +3281,7 @@ function Session:_CanMutate(): (boolean, string?)
 	if self.Releasing then
 		return false, "SESSION_RELEASING"
 	end
+	if self.Store.SoftShutdownFrozen then return false, "SOFT_SHUTDOWN_FROZEN" end
 	return true
 end
 
@@ -3716,6 +3821,8 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 	assert(config.ProfileOperations == nil or typeof(config.ProfileOperations) == "boolean", "ProfileOperations must be a boolean")
 	assert(config.WaitForSessionLock == nil or typeof(config.WaitForSessionLock) == "boolean", "WaitForSessionLock must be a boolean")
 	assert(config.EnableSessionHandoff == nil or typeof(config.EnableSessionHandoff) == "boolean", "EnableSessionHandoff must be a boolean")
+	assert(config.EnableSoftShutdown == nil or typeof(config.EnableSoftShutdown) == "boolean", "EnableSoftShutdown must be a boolean")
+	assert(config.EnableSoftShutdown ~= true or config.AutoPlayerLifecycle ~= false, "Soft shutdown requires player lifecycle management")
 	assert(config.OrderedDataStores == nil or typeof(config.OrderedDataStores) == "table", "OrderedDataStores must be a table")
 	assert(config.PlayerKey == nil or typeof(config.PlayerKey) == "function", "PlayerKey must be a function")
 	assert(config.KeyPrefix == nil or typeof(config.KeyPrefix) == "string", "KeyPrefix must be a string")
@@ -3761,7 +3868,7 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 		AutoSaveInterval = configNumber(config.AutoSaveInterval, 30, 10, "AutoSaveInterval"),
 		LockTimeout = lockTimeout,
 		HeartbeatInterval = heartbeatInterval,
-		WaitForSessionLock = config.WaitForSessionLock == true or config.EnableSessionHandoff == true,
+		WaitForSessionLock = config.WaitForSessionLock == true or config.EnableSessionHandoff == true or config.EnableSoftShutdown == true,
 		SessionLockRetryInterval = configNumber(config.SessionLockRetryInterval, 2, 0.5, "SessionLockRetryInterval", false, 30),
 		EnableSessionHandoff = config.EnableSessionHandoff == true,
 		SessionHandoffCooldown = configNumber(config.SessionHandoffCooldown, 6, 1, "SessionHandoffCooldown", false, 60),
@@ -3771,7 +3878,7 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 		BudgetAware = config.BudgetAware ~= false,
 		BudgetWaitTimeout = configNumber(config.BudgetWaitTimeout, 10, 1, "BudgetWaitTimeout"),
 		MinimumSaveInterval = configNumber(config.MinimumSaveInterval, 3, 0, "MinimumSaveInterval"),
-		LoadTimeout = configNumber(config.LoadTimeout, 30, 5, "LoadTimeout"),
+		LoadTimeout = configNumber(config.LoadTimeout, config.EnableSoftShutdown == true and 60 or 30, 5, "LoadTimeout"),
 		SaveTimeout = configNumber(config.SaveTimeout, 30, 5, "SaveTimeout"),
 		MaxDataNodes = configNumber(config.MaxDataNodes, 50000, 100, "MaxDataNodes", true),
 		MaxDataBytes = configNumber(config.MaxDataBytes, 3900000, 1000, "MaxDataBytes", true),
@@ -3781,6 +3888,10 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 		KeyPrefix = config.KeyPrefix or "",
 		PlayerKey = config.PlayerKey,
 		AutoPlayerLifecycle = config.AutoPlayerLifecycle == true,
+		EnableSoftShutdown = config.EnableSoftShutdown == true,
+		SoftShutdownPreSaveSeconds = configNumber(config.SoftShutdownPreSaveSeconds, 20, 5, "SoftShutdownPreSaveSeconds"),
+		SoftShutdownFreezeSeconds = configNumber(config.SoftShutdownFreezeSeconds, 6, 1, "SoftShutdownFreezeSeconds"),
+		SoftShutdownCloseTimeout = configNumber(config.SoftShutdownCloseTimeout, 25, 5, "SoftShutdownCloseTimeout"),
 		EnableCrossServerEvents = config.EnableCrossServerEvents == true,
 		CrossServerTopic = crossServerTopic,
 		OrderedDataStores = config.OrderedDataStores or {},
@@ -3814,9 +3925,16 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 	self.Closing = false
 	self.LifecycleAttached = false
 	self.BoundToClose = false
+	self.SoftShutdownFrozen = false
+	self.SoftShutdownState = nil
+	self.SoftShutdownRemote = nil
+	self.ServerRestartConnection = nil
 	self.Metrics = {
 		Opened = 0,
 		Released = 0,
+		RestartsScheduled = 0,
+		SoftShutdownFlushes = 0,
+		SoftShutdownFlushFailed = 0,
 		LoadsFailed = 0,
 		Saved = 0,
 		SaveFailed = 0,
@@ -3910,8 +4028,22 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 		end
 	end
 
+	if self.Config.EnableSoftShutdown then
+		local remoteName = "NexusDataStoreRestart_" .. self.Config.Name
+		local existing = ReplicatedStorage:FindFirstChild(remoteName)
+		assert(existing == nil or existing:IsA("RemoteEvent"), "Soft shutdown remote name occupied by another instance")
+		local remote = existing or Instance.new("RemoteEvent")
+		remote.Name = remoteName
+		remote:SetAttribute("Status", "idle")
+		remote.Parent = ReplicatedStorage
+		self.SoftShutdownRemote = remote
+		self.ServerRestartConnection = game.ServerRestartScheduled:Connect(function(restartTime, source, attributes)
+			self:_OnServerRestartScheduled(restartTime, source, attributes)
+		end)
+		self:BindToClose()
+	end
 	self:_BackgroundLoop()
-	if self.Config.AutoPlayerLifecycle then
+	if self.Config.AutoPlayerLifecycle or self.Config.EnableSoftShutdown then
 		self:AttachPlayerLifecycle()
 	end
 	return self :: Store<Data>
