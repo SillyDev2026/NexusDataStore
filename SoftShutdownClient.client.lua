@@ -479,6 +479,15 @@ local function applyResponsiveLayout()
     local view = stage.AbsoluteSize
     if view.X <= 0 or view.Y <= 0 then return end
     local ratio = view.X / view.Y
+    -- Rotate and resize the floor's perspective lines only when viewport geometry changes.
+    for _, entry in ipairs(horizonRays) do
+        local dx = (entry.StartX - 0.5) * view.X
+        local dy = (1 - 0.645) * view.Y
+        local length = math.sqrt(dx * dx + dy * dy)
+        entry.Line.Size = UDim2.fromScale(length / view.X, 0.0017)
+        entry.Line.Position = UDim2.fromScale((0.5 + entry.StartX) * 0.5, (0.645 + 1) * 0.5)
+        entry.Line.Rotation = math.deg(math.atan2(dy, dx))
+    end
     if ratio < 0.85 then
         panel.Size = UDim2.fromScale(0.88, 0.43)
         banner.Size = UDim2.fromScale(0.9, 0.073)
@@ -580,6 +589,8 @@ local function clearInterface()
     diagnosticsAccumulator = 0
     lightweightEffects = false
     if activeGui then activeGui:Destroy() end
+    table.clear(horizonRays)
+    horizonScan, horizonRing, horizonArc = nil, nil, nil
     activeGui, stage, banner, panel = nil, nil, nil, nil
     bannerText, bannerTimer, title, statusText, description = nil, nil, nil, nil, nil
     phaseLabel, progressTrack, phaseFill, accentLine, statusOrb = nil, nil, nil, nil, nil
@@ -660,6 +671,9 @@ renderStep = function(deltaTime: number)
         end
         if statusOrb then statusOrb.BackgroundTransparency = 0.33 + 0.16 * (0.5 + 0.5 * math.sin(t * 2.1)) end
         if not lightweightEffects then
+            if horizonScan then horizonScan.Position = UDim2.fromScale(-0.23 + ((t * 0.095) % 1.45), 0.643) end
+            if horizonRing then horizonRing.Rotation = (t * 5) % 360 end
+            if horizonArc then horizonArc.Rotation = 11 * math.sin(t * 0.23) end
             if accentLine then accentLine.Position = UDim2.fromScale(0.375 + 0.245 * (0.5 + 0.5 * math.sin(t * 0.8)), 0) end
             if ambientGlow then
                 ambientGlow.Position = UDim2.fromScale(0.76 + 0.06 * math.sin(t * 0.55), 0.28 + 0.05 * math.cos(t * 0.55))
