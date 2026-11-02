@@ -2359,8 +2359,48 @@ function NexusDataStore:_BackgroundLoop()
 	end)
 end
 
+-- Concurrent flush is limited to six workers so large servers don't serialize
+-- every critical profile save, while respecting Roblox request budgets.
+function NexusDataStore:_FlushShutdownConcurrent(deadline: number): (boolean, string?)
+	local sessions = {}
+	for _, session in pairs(self.Sessions) do
+		if session:IsActive() then sessions[#sessions + 1] = session end
+	end
+	if #sessions == 0 then return true end
+	local index = 1
+	local pending = math.min(6, #sessions)
+	local firstError: string? = nil
+	for _ = 1, pending do
+		task.spawn(function()
+			while true do
+				if now() >= deadline then firstError = firstError or "FLUSH_TIMEOUT"; break end
+				local slot = index
+				index += 1
+				if slot > #sessions then break end
+				local session = sessions[slot]
+				if session:IsActive() then
+					local ran, valid, err = pcall(function()
+						self:_DetectDirectChanges(session)
+						if session.Dirty then return self:SaveAsync(session, "critical") end
+						return true
+					end)
+					if not ran then firstError = firstError or "FLUSH_EXCEPTION:" .. tostring(valid)
+					elseif not valid then firstError = firstError or tostring(err) end
+				end
+			end
+			pending -= 1
+		end)
+	end
+	while pending > 0 and now() < deadline do task.wait(0.02) end
+	if pending > 0 then return false, "FLUSH_TIMEOUT" end
+	if firstError then return false, firstError end
+	return true
+end
+
 function NexusDataStore:FlushAsync(timeout: number?): (boolean, string?)
+	if timeout ~= nil and (not finiteNumber(timeout) or timeout <= 0) then return false, "INVALID_FLUSH_TIMEOUT" end
 	local deadline = now() + (timeout or self.Config.SaveTimeout)
+	if self.Config.EnableSoftShutdown and self.SoftShutdownState then return self:_FlushShutdownConcurrent(deadline) end
 	local sessions = {}
 	for _, session in pairs(self.Sessions) do
 		table.insert(sessions, session)
@@ -2463,9 +2503,9 @@ function NexusDataStore:_SetSoftShutdownStatus(status: string)
 end
 
 function NexusDataStore:_OnServerRestartScheduled(restartTime: any, source: any, attributes: any)
-	if not self.Config.EnableSoftShutdown or self.Closed then return end
+	if not self.Config.EnableSoftShutdown or self.Closed or self.Closing then return end
 	local timestamp = restartTime and restartTime.UnixTimestamp
-	if not finiteNumber(timestamp) then return end
+	if not finiteNumber(timestamp) or timestamp < 0 then return end
 	local message = typeof(attributes) == "table" and attributes.message or nil
 	if typeof(message) ~= "string" or #message == 0 then message = "Game servers are updating. Your progress is being saved." end
 	message = string.sub(message, 1, 180)
@@ -2503,7 +2543,14 @@ function NexusDataStore:_SoftShutdownTick(timestamp: number)
 		if ok and result == true then
 			if isFinal then state.FinalSaved = true else state.PreSaved = true end
 			self.Metrics.SoftShutdownFlushes += 1
-			self:_SetSoftShutdownStatus(isFinal and "ready" or "scheduled")
+			if self.SoftShutdownFrozen and not isFinal then
+				-- An early flush finished after the final-save window began.
+				-- Don't claim the update is ready; the final flush is still required.
+				state.NextAttempt = 0
+				self:_SetSoftShutdownStatus("saving")
+			else
+				self:_SetSoftShutdownStatus(isFinal and "ready" or "scheduled")
+			end
 		else
 			state.SaveFailures += 1
 			state.NextAttempt = os.time() + 2
