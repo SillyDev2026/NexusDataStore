@@ -560,7 +560,7 @@ local function setPresentation(kind: string, immediate: boolean?)
         stage.Visible = true
         if not immediate then
             stage.GroupTransparency = 1
-            panel.Position = UDim2.fromScale(0.5, 0.55)
+            panel.Position = UDim2.fromScale(0.5, 0.522)
         end
         fadeTween = TweenService:Create(stage, fadeEase, {GroupTransparency = 0})
         slideTween = TweenService:Create(panel, infoEase, {Position = UDim2.fromScale(0.5, 0.5)})
@@ -579,7 +579,7 @@ local function setPresentation(kind: string, immediate: boolean?)
         banner.Visible = true
         if not immediate then
             banner.GroupTransparency = 1
-            banner.Position = UDim2.fromScale(0.5, -0.11)
+            banner.Position = UDim2.fromScale(0.5, -0.09)
         end
         bannerTween = TweenService:Create(banner, fadeEase, {GroupTransparency = 0, Position = UDim2.fromScale(0.5, 0.06)})
         bannerTween:Play()
@@ -604,6 +604,7 @@ local function clearInterface()
     if arrivalErrorConnection then arrivalErrorConnection:Disconnect(); arrivalErrorConnection = nil end
     animationClock = 0
     countdownAccumulator = 0
+    backgroundAccumulator = 0
     lastCountdownSeconds = -1
     averageFrameTime = 1 / 60
     slowFrameDuration = 0
@@ -692,19 +693,26 @@ renderStep = function(deltaTime: number)
             phaseFill.Position = UDim2.fromScale(sweep * 0.78, 0)
         end
         if statusOrb then statusOrb.BackgroundTransparency = 0.33 + 0.16 * (0.5 + 0.5 * math.sin(t * 2.1)) end
-        if not lightweightEffects then
-            if horizonScan then horizonScan.Position = UDim2.fromScale(-0.23 + ((t * 0.095) % 1.45), 0.643) end
-            if horizonRing then horizonRing.Rotation = (t * 5) % 360 end
-            if horizonArc then horizonArc.Rotation = 11 * math.sin(t * 0.23) end
-            if accentLine then accentLine.Position = UDim2.fromScale(0.375 + 0.245 * (0.5 + 0.5 * math.sin(t * 0.8)), 0) end
+        -- Decorative background runs at most 30 updates/sec; status, core and progress
+        -- still track each rendered frame. This avoids excessive UI recomposition on 120/165Hz.
+        backgroundAccumulator += dt
+        if not lightweightEffects and backgroundAccumulator >= 1 / 30 then
+            backgroundAccumulator = 0
+            if horizonScan then
+                -- Ping-pong easing prevents the visible hard snap at the old modulo boundary.
+                local scan = 0.5 - 0.5 * math.cos(t * 0.72)
+                horizonScan.Position = UDim2.fromScale(-0.23 + scan * 1.44, 0.643)
+            end
+            if horizonRing then horizonRing.Rotation = (t * 4) % 360 end
+            if horizonArc then horizonArc.Rotation = 7 * math.sin(t * 0.2) end
+            if accentLine then accentLine.Position = UDim2.fromScale(0.375 + 0.2 * (0.5 + 0.5 * math.sin(t * 0.56)), 0) end
             if ambientGlow then
-                ambientGlow.Position = UDim2.fromScale(0.76 + 0.06 * math.sin(t * 0.55), 0.28 + 0.05 * math.cos(t * 0.55))
-                ambientGlow.BackgroundTransparency = 0.88 + 0.035 * math.sin(t * 0.7)
+                ambientGlow.Position = UDim2.fromScale(0.77 + 0.045 * math.sin(t * 0.35), 0.28 + 0.03 * math.cos(t * 0.35))
             end
             if secondaryGlow then
-                secondaryGlow.Position = UDim2.fromScale(0.21 + 0.055 * math.sin(t * 0.43), 0.73 + 0.05 * math.cos(t * 0.43))
+                secondaryGlow.Position = UDim2.fromScale(0.22 + 0.035 * math.sin(t * 0.3), 0.72 + 0.03 * math.cos(t * 0.3))
             end
-            if progressShine then progressShine.Offset = Vector2.new(0.35 * math.sin(t * 1.5), 0) end
+            if progressShine then progressShine.Offset = Vector2.new(0.25 * math.sin(t * 1.1), 0) end
         end
     end
 end
@@ -712,6 +720,7 @@ end
 local function update(status: string, target: number, message: string)
     if status == "idle" then return end
     local previousStatus = currentStatus
+    if status == previousStatus and restartAt == target and lastMessage == message then return end
     currentStatus = status
     restartAt = target
     lastMessage = message
@@ -722,8 +731,9 @@ local function update(status: string, target: number, message: string)
     if not title or not statusText or not description or not phaseLabel then return end
     if status ~= previousStatus then
         cancelStatusTweens()
+        -- A gentle 20% opacity reveal replaces the old 90% flash on every phase.
         for _, label in ipairs({title, statusText, description, phaseLabel}) do
-            label.TextTransparency = REDUCED_MOTION and 0 or 0.9
+            label.TextTransparency = REDUCED_MOTION and 0 or 0.2
             animateState(label, {TextTransparency = 0}, stateTextFade)
         end
         local shade = phaseColor(status)
@@ -744,46 +754,46 @@ local function update(status: string, target: number, message: string)
         if status == "error" and phaseFill then phaseFill.Position = UDim2.fromScale(0.39, 0) end
     end
     if status == "scheduled" then
-        title.Text = "New update incoming"
+        title.Text = "Server update incoming"
         statusText.Text = "Server restart in " .. countdown(seconds)
-        description.Text = message ~= "" and message or "Your progress is protected during the update."
+        description.Text = message ~= "" and message or "We will save your progress before the server moves."
         phaseLabel.Text = "PREPARING SERVER UPDATE"
         if bannerText then bannerText.Text = "SERVER UPDATE INCOMING" end
         if bannerTimer then bannerTimer.Text = countdown(seconds) end
     elseif status == "saving" then
         title.Text = "Saving your progress"
-        statusText.Text = "Securing your latest changes..."
-        description.Text = "Please stay connected while we prepare your profile for the new server."
+        statusText.Text = "Saving profile data..."
+        description.Text = "Stay connected while your latest progress is saved securely."
         phaseLabel.Text = "PERSISTING PROFILE DATA"
     elseif status == "retrying" then
         title.Text = "Keeping progress safe"
-        statusText.Text = "Retrying a save request..."
-        description.Text = "The save service is busy. Your session remains protected while it retries."
+        statusText.Text = "Retrying the save..."
+        description.Text = "The data service is busy. Your profile remains protected."
         phaseLabel.Text = "RETRYING SECURE SAVE"
     elseif status == "ready" then
         title.Text = "Your progress is saved"
-        statusText.Text = "Moving to updated server"
-        description.Text = "The server is ready for Roblox to complete the restart."
+        statusText.Text = "Waiting for server transfer..."
+        description.Text = "Save confirmed. Preparing to join the updated server."
         phaseLabel.Text = "AWAITING SERVER MIGRATION"
     elseif status == "moving" then
         title.Text = "Joining the updated server"
-        statusText.Text = "Teleporting your party..."
-        description.Text = "Saved player profiles are being transferred to a fresh server. Your progress stays in DataStore."
+        statusText.Text = "Connecting to the new server..."
+        description.Text = "Your progress is saved. Roblox is moving your party."
         phaseLabel.Text = "TRANSFERRING TO UPDATED SERVER"
     elseif status == "teleport-retrying" then
         title.Text = "Reconnecting players"
-        statusText.Text = "Retrying the server transfer..."
-        description.Text = "Teleport failed to start for one or more players. Saving is complete; retrying the connection."
+        statusText.Text = "Retrying connection..."
+        description.Text = "The transfer was interrupted. Your saved progress is safe."
         phaseLabel.Text = "RETRYING SERVER TRANSFER"
     elseif status == "arriving" then
         title.Text = "Welcome back"
-        statusText.Text = "Acquiring your profile..."
-        description.Text = "Checking your session lock and loading saved progress securely."
+        statusText.Text = "Loading your saved profile..."
+        description.Text = "Waiting for the previous session lock to release."
         phaseLabel.Text = "SYNCING PLAYER DATA"
     elseif status == "error" then
         title.Text = "Unable to load profile"
         statusText.Text = "Please reconnect"
-        description.Text = "The data service or previous session lock is unavailable. Your progress was not overwritten."
+        description.Text = "The profile could not load safely. Please reconnect."
         phaseLabel.Text = "PROFILE LOAD NOT COMPLETED"
     end
 end
