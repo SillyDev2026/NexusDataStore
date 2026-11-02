@@ -54,7 +54,6 @@ Compression.CodecVersion = 230
 Compression.CompactCodecVersion = 231
 Compression.PackedCodecVersion = 232
 Compression.RunLengthCodecVersion = 233
-Compression.RunLengthCodecVersion = 233
 Compression.Magic = 0x4E433233
 Compression.EngineCode = 230
 
