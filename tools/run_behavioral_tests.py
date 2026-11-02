@@ -20,7 +20,7 @@ local Enum = {DataStoreRequestType = {}}
 local task = {spawn = function(callback, ...) callback(...) end}
 local DataStore = (function()
 '''
-tests = (ROOT / 'tests/PortableSessionRegression.luau').read_text() + '\n' + (ROOT / 'tests/PortableCompressionPolicyRegression.luau').read_text() + '\n' + (ROOT / 'tests/PortableSoftShutdownRegression.luau').read_text()
+tests = (ROOT / 'tests/PortableSessionRegression.luau').read_text() + '\n' + (ROOT / 'tests/PortableCompressionPolicyRegression.luau').read_text() + '\n' + (ROOT / 'tests/PortableSoftShutdownRegression.luau').read_text() + '\n' + (ROOT / 'tests/PortableFramePacingRegression.luau').read_text()
 with tempfile.TemporaryDirectory(prefix='nexus-tests-') as directory:
     bundle = Path(directory) / 'suite.luau'
     bundle.write_text(prelude + source + '\nend)()\n' + tests)

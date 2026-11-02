@@ -2,19 +2,41 @@
 
 **Typed, session-aware data persistence for Roblox.**
 
-![Version](https://img.shields.io/badge/NexusDataStore-8.2.0-2563eb)
+![Version](https://img.shields.io/badge/NexusDataStore-8.3.0-2563eb)
 ![Codec](https://img.shields.io/badge/Compression-2.6.1-0f766e)
 ![Luau](https://img.shields.io/badge/language-Luau-00a2ff)
 ![Platform](https://img.shields.io/badge/platform-Roblox-222222)
 
 NexusDataStore brings standard Roblox DataStore persistence, session ownership, typed player profiles, validation, migrations, snapshots, adaptive compression, and numeric leaderboards into one server-side library.
 
-**Current version:** `8.2.0` · **Compression:** `2.6.1` / codecs `230`–`233` · **Record format:** `700`
+**Current version:** `8.3.0` · **Compression:** `2.6.1` / codecs `230`–`233` · **Record format:** `700`
 
 > [!IMPORTANT]
 > This documentation describes the current source on `main`. Regression scripts are included, but production reliability and performance have not been certified by live-server load testing. Use a separate test universe before deploying changes to existing player data.
 
-## New in 8.2.0 — Cinematic, smoother server migration UI
+## New in 8.3.0 — Display-frame-synchronized animations
+
+**Smoothness follows the actual Roblox render FPS on the client** instead of fixed-frequency animation timers. The `SoftShutdownClient.client.lua` now uses one `RunService.PreRender` listener and its `deltaTime` to keep animation duration independent of frame rate. If the game renders at 30, 60, 90, 120, or 165 FPS, each available frame receives a position corresponding to elapsed time. This does **not** read, force, or unlock the device's physical refresh rate: Roblox, platform FPS caps, load and game settings determine effective rendered FPS.
+
+### New animation controller
+
+- **Delta-time-based motion:** Rotating data core, pulsing orb, moving progress strip, light effects, animated accent line and gradient shimmer follow real client render frames rather than a 0.35-second task loop or multiple infinite tweens.
+- **Frame-independent timing:** Animation phases advance using elapsed seconds, not an increment per frame, with a capped recovery step after long stalls to prevent jarring jumps.
+- **Adaptive quality:** A low-pass frame-time estimate reduces decorative glows and shimmer after sustained rendering below approximately 38 FPS; it restores them after sustained recovery above approximately 52 FPS. Save, teleport, text and lock status remain unchanged.
+- **Lightweight frame callback:** Only a small set of visible UI properties changes on each frame. Countdown text refreshes only when the displayed second changes; hidden panels do not animate.
+- **Cleaner lifecycle:** Just one render listener exists while the UI is active; it disconnects when the arriving player profile is ready. The destination loading screen uses player attribute-change signals instead of checking every quarter second.
+- **Smooth transitions preserved:** Panel entrances and state color fades still use local `TweenService` easing, independent of server replication.
+- **Reduced motion:** Set `REDUCED_MOTION = true` near the top of the LocalScript to disable continuous effects and use instant presentation transitions; the countdown and server status remain functional.
+
+The script sets `ObservedRenderFPS` and `MotionQuality` attributes on its `ScreenGui` approximately every two seconds for debugging. These are estimates of **observed frames**, not the display's hardware refresh rate. No FPS-cap or system graphics setting is modified.
+
+### Install
+
+Copy the new `SoftShutdownClient.client.lua` into **ReplicatedFirst** as a LocalScript, with `STORE_NAME` matching the profile store name. Keep `EnableSoftShutdown = true` and `AutoPlayerLifecycle = true` on the server. All `Position` and `Size` values remain `UDim2.fromScale`, and saved record format `700` / Compression `2.6.1` (codecs 230–233) are unchanged.
+
+**Verification:** CI runs Luau compilation, source-contract checks, regression suites and synthetic timing simulations for 30/60/90/120/165 FPS. Those simulated FPS cases are not real device benchmarks; check visual pacing in Roblox Studio and on actual Android, iOS, and Windows devices.
+
+## Previously in 8.2.0 — Cinematic, smoother server migration UI
 
 The built-in `SoftShutdownClient.client.lua` has been rebuilt with a futuristic dark-glass design. The visual changes are **client-side only**: DataStore record format `700`, Compression v2.6.1 and all existing codecs `230`–`233` are unchanged.
 
