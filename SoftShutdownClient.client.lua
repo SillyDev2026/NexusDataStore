@@ -1,5 +1,5 @@
 --!strict
--- NexusDataStore v8.4.2 stable neon shutdown interface with adaptive motion and readable type.
+-- NexusDataStore v8.4.3 readable restart UI: proportional layout and consistent typography.
 -- Install this LocalScript in ReplicatedFirst and set STORE_NAME to the DataStore Name.
 local STORE_NAME = "PlayerData"
 local REDUCED_MOTION = false -- Set true to disable continuous animations and shorten transitions.
@@ -23,8 +23,8 @@ local dangerAccent = Color3.fromRGB(255, 129, 151)
 local warningAccent = Color3.fromRGB(255, 200, 109)
 local violetAccent = Color3.fromRGB(172, 133, 255)
 local normal = Color3.fromRGB(230, 242, 255)
-local muted = Color3.fromRGB(157, 179, 207)
-local panelColor = Color3.fromRGB(17, 31, 55)
+local muted = Color3.fromRGB(196, 212, 232)
+local panelColor = Color3.fromRGB(13, 30, 53)
 local stateTextFade = TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 local accentEase = TweenInfo.new(0.28, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 local infoEase = TweenInfo.new(0.42, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
@@ -45,6 +45,9 @@ local phaseFill: Frame? = nil
 local accentLine: Frame? = nil
 local statusOrb: Frame? = nil
 local phaseSteps: {TextLabel} = {}
+local textElements: {TextLabel} = {}
+local eyebrowLabel: TextLabel? = nil
+local coreIconLabel: TextLabel? = nil
 local statusTweens: {Tween} = {}
 local activePresentation = "hidden"
 local currentStatus = "idle"
@@ -93,8 +96,8 @@ local function stroke(parent: Instance, color: Color3, opacity: number)
     item.Parent = parent
 end
 
--- Keep all UI geometry percentage-based while bounding text size in pixels.
--- TextScaled alone makes captions microscopic on phones and huge on desktops.
+-- The size and position of every label stays percentage-based. Font sizes are
+-- updated on viewport changes instead of shrinking the contents with TextScaled.
 local function textLabel(parent: Instance, name: string, value: string, font: Enum.Font, color: Color3, pos: UDim2, size: UDim2, alignment: Enum.TextXAlignment?): TextLabel
     local item = Instance.new("TextLabel")
     item.Name = name
@@ -104,30 +107,14 @@ local function textLabel(parent: Instance, name: string, value: string, font: En
     item.Text = value
     item.Font = font
     item.TextColor3 = color
-    item.TextScaled = true
-    item.TextWrapped = true
+    item.TextSize = 18
+    item.TextScaled = false
+    item.TextWrapped = name == "Title" or name == "Status" or name == "Description" or name == "Message"
     item.TextXAlignment = alignment or Enum.TextXAlignment.Center
     item.TextYAlignment = Enum.TextYAlignment.Center
-    item.TextStrokeTransparency = 0.94
-    local limits = Instance.new("UITextSizeConstraint")
-    limits.Name = "ReadableText"
-    if name == "Title" then
-        limits.MinTextSize, limits.MaxTextSize = 17, 34
-    elseif name == "Status" then
-        limits.MinTextSize, limits.MaxTextSize = 13, 23
-    elseif name == "Description" then
-        limits.MinTextSize, limits.MaxTextSize = 12, 18
-    elseif name == "Icon" then
-        limits.MinTextSize, limits.MaxTextSize = 17, 36
-    elseif name == "Timer" then
-        limits.MinTextSize, limits.MaxTextSize = 13, 23
-    elseif name == "Message" then
-        limits.MinTextSize, limits.MaxTextSize = 12, 19
-    else
-        limits.MinTextSize, limits.MaxTextSize = 10, 16
-    end
-    limits.Parent = item
+    item.TextStrokeTransparency = 1
     item.Parent = parent
+    table.insert(textElements, item)
     return item
 end
 
@@ -348,14 +335,14 @@ local function makeInterface(): ScreenGui
     main.Position = UDim2.fromScale(0.5, 0.55)
     main.Size = UDim2.fromScale(0.86, 0.47)
     main.BackgroundColor3 = panelColor
-    main.BackgroundTransparency = 0.07
+    main.BackgroundTransparency = 0.06
     main.BorderSizePixel = 0
     main.Parent = overlay
     corner(main, 0.055)
     stroke(main, Color3.fromRGB(79, 149, 205), 0.44)
     panel = main
     local mainGradient = Instance.new("UIGradient")
-    mainGradient.Color = ColorSequence.new(Color3.fromRGB(16, 33, 58), Color3.fromRGB(9, 19, 38))
+    mainGradient.Color = ColorSequence.new(Color3.fromRGB(21, 43, 73), Color3.fromRGB(11, 25, 48))
     mainGradient.Rotation = 105
     mainGradient.Parent = main
 
@@ -404,36 +391,38 @@ local function makeInterface(): ScreenGui
     haloGradient.Parent = haloStroke
     haloGradientRef = haloGradient
     local coreIcon = textLabel(core, "Icon", "◆", Enum.Font.GothamBold, normal, UDim2.fromScale(0.2, 0.18), UDim2.fromScale(0.6, 0.64))
+    coreIconLabel = coreIcon
     coreIcon.TextTransparency = 0.05
     statusOrb = core
 
 
-    local tag = textLabel(main, "Eyebrow", "NEXUS  /  SERVER MIGRATION", Enum.Font.GothamBold, accent, UDim2.fromScale(0.12, 0.10), UDim2.fromScale(0.76, 0.085))
+    local tag = textLabel(main, "Eyebrow", "NEXUS   /   SERVER UPDATE", Enum.Font.GothamMedium, accent, UDim2.fromScale(0.12, 0.095), UDim2.fromScale(0.76, 0.09))
+    eyebrowLabel = tag
     tag.TextTransparency = 0.03
 
-    title = textLabel(main, "Title", "Server update scheduled", Enum.Font.GothamBold, normal, UDim2.fromScale(0.32, 0.235), UDim2.fromScale(0.59, 0.18), Enum.TextXAlignment.Left)
-    statusText = textLabel(main, "Status", "Preparing to migrate...", Enum.Font.GothamMedium, accent, UDim2.fromScale(0.32, 0.44), UDim2.fromScale(0.59, 0.11), Enum.TextXAlignment.Left)
-    description = textLabel(main, "Description", "Your progress stays protected while the server updates.", Enum.Font.Gotham, muted, UDim2.fromScale(0.12, 0.568), UDim2.fromScale(0.76, 0.135))
+    title = textLabel(main, "Title", "Server update scheduled", Enum.Font.GothamBold, normal, UDim2.fromScale(0.30, 0.225), UDim2.fromScale(0.63, 0.205), Enum.TextXAlignment.Left)
+    statusText = textLabel(main, "Status", "Preparing to migrate...", Enum.Font.GothamMedium, accent, UDim2.fromScale(0.30, 0.44), UDim2.fromScale(0.63, 0.13), Enum.TextXAlignment.Left)
+    description = textLabel(main, "Description", "Your progress stays protected while the server updates.", Enum.Font.Gotham, muted, UDim2.fromScale(0.12, 0.605), UDim2.fromScale(0.76, 0.115))
 
     -- Three-stage timeline shows only server-confirmed milestones, never a made-up percentage.
-    local stepNames = {"01   SAVE", "02   TRANSFER", "03   RESTORE"}
+    local stepNames = {"01  Save", "02  Transfer", "03  Restore"}
     table.clear(phaseSteps)
     for index, label in ipairs(stepNames) do
         local item = textLabel(main, "Step" .. index, label, Enum.Font.GothamBold, muted,
-            UDim2.fromScale(0.105 + (index - 1) * 0.275, 0.735),
-            UDim2.fromScale(0.24, 0.085))
+            UDim2.fromScale(0.105 + (index - 1) * 0.275, 0.76),
+            UDim2.fromScale(0.24, 0.11))
         item.BackgroundTransparency = 0.72
         item.BackgroundColor3 = Color3.fromRGB(38, 67, 103)
         corner(item, 0.25)
         table.insert(phaseSteps, item)
     end
 
-    phaseLabel = textLabel(main, "Phase", "CHECKING PROFILE", Enum.Font.GothamBold, muted, UDim2.fromScale(0.11, 0.845), UDim2.fromScale(0.78, 0.052), Enum.TextXAlignment.Left)
+    phaseLabel = textLabel(main, "Phase", "Checking profile", Enum.Font.GothamMedium, muted, UDim2.fromScale(0.11, 0.885), UDim2.fromScale(0.78, 0.06), Enum.TextXAlignment.Left)
 
     local bar = Instance.new("Frame")
     bar.Name = "ProgressTrack"
     bar.Size = UDim2.fromScale(0.78, 0.023)
-    bar.Position = UDim2.fromScale(0.11, 0.934)
+    bar.Position = UDim2.fromScale(0.11, 0.965)
     bar.BackgroundColor3 = Color3.fromRGB(43, 68, 101)
     bar.BorderSizePixel = 0
     bar.ClipsDescendants = true
@@ -510,18 +499,79 @@ local function applyResponsiveLayout()
         entry.Line.Position = UDim2.fromScale((0.5 + entry.StartX) * 0.5, (0.645 + 1) * 0.5)
         entry.Line.Rotation = math.deg(math.atan2(dy, dx))
     end
-    if ratio < 0.85 then
-        panel.Size = UDim2.fromScale(0.88, 0.43)
-        banner.Size = UDim2.fromScale(0.9, 0.073)
+    local portrait = ratio < 0.85
+    local shortLandscape = ratio >= 1.45 and view.Y < 560
+    if portrait then
+        panel.Size = UDim2.fromScale(0.92, 0.56)
+        banner.Size = UDim2.fromScale(0.92, 0.073)
     elseif ratio < 1.45 then
-        panel.Size = UDim2.fromScale(0.76, 0.5)
-        banner.Size = UDim2.fromScale(0.72, 0.088)
-    elseif view.Y < 560 then
-        panel.Size = UDim2.fromScale(0.59, 0.71)
-        banner.Size = UDim2.fromScale(0.56, 0.115)
+        panel.Size = UDim2.fromScale(0.82, 0.58)
+        banner.Size = UDim2.fromScale(0.74, 0.092)
+    elseif shortLandscape then
+        panel.Size = UDim2.fromScale(0.80, 0.82)
+        banner.Size = UDim2.fromScale(0.68, 0.12)
     else
-        panel.Size = UDim2.fromScale(0.58, 0.5)
-        banner.Size = UDim2.fromScale(0.48, 0.085)
+        panel.Size = UDim2.fromScale(0.64, 0.57)
+        banner.Size = UDim2.fromScale(0.52, 0.095)
+    end
+
+    -- Explicit sizes preserve readable hierarchy regardless of sentence length.
+    -- TextScaled is deliberately disabled: long strings wrap rather than shrink.
+    local scale = math.clamp(math.min(view.X / 1000, view.Y / 540), 0.85, 1.25)
+    for _, label in ipairs(textElements) do
+        local name = label.Name
+        local base = 16
+        if name == "Title" then base = 36
+        elseif name == "Status" then base = 25
+        elseif name == "Description" then base = 20
+        elseif name == "Eyebrow" then base = 16
+        elseif name == "Phase" then base = 16
+        elseif name == "Message" then base = 19
+        elseif name == "Timer" then base = 23
+        elseif name == "Icon" then base = 32
+        elseif string.sub(name, 1, 4) == "Step" then base = 18
+        end
+        label.TextSize = math.floor(base * scale + 0.5)
+    end
+
+    if title and statusText and description and statusOrb and phaseLabel then
+        if portrait then
+            statusOrb.Position = UDim2.fromScale(0.5, 0.21)
+            statusOrb.Size = UDim2.fromScale(0.17, 0.14)
+            title.Position = UDim2.fromScale(0.065, 0.315)
+            title.Size = UDim2.fromScale(0.87, 0.18)
+            title.TextXAlignment = Enum.TextXAlignment.Center
+            statusText.Position = UDim2.fromScale(0.07, 0.495)
+            statusText.Size = UDim2.fromScale(0.86, 0.09)
+            statusText.TextXAlignment = Enum.TextXAlignment.Center
+            description.Position = UDim2.fromScale(0.095, 0.61)
+            description.Size = UDim2.fromScale(0.81, 0.12)
+        else
+            statusOrb.Position = UDim2.fromScale(0.19, 0.345)
+            statusOrb.Size = UDim2.fromScale(0.15, 0.235)
+            title.Position = UDim2.fromScale(0.3, 0.23)
+            title.Size = UDim2.fromScale(0.64, 0.20)
+            title.TextXAlignment = Enum.TextXAlignment.Left
+            statusText.Position = UDim2.fromScale(0.3, 0.44)
+            statusText.Size = UDim2.fromScale(0.64, 0.135)
+            statusText.TextXAlignment = Enum.TextXAlignment.Left
+            description.Position = UDim2.fromScale(0.1, 0.603)
+            description.Size = UDim2.fromScale(0.8, 0.12)
+        end
+        phaseLabel.Position = UDim2.fromScale(0.105, 0.885)
+        phaseLabel.Size = UDim2.fromScale(0.79, 0.058)
+    end
+    if eyebrowLabel then
+        eyebrowLabel.Position = UDim2.fromScale(0.095, portrait and 0.07 or 0.095)
+        eyebrowLabel.Size = UDim2.fromScale(0.81, 0.09)
+    end
+    for index, step in ipairs(phaseSteps) do
+        step.Position = UDim2.fromScale(0.105 + (index - 1) * 0.275, 0.758)
+        step.Size = UDim2.fromScale(0.24, 0.103)
+    end
+    if progressTrack then
+        progressTrack.Position = UDim2.fromScale(0.105, 0.965)
+        progressTrack.Size = UDim2.fromScale(0.79, 0.018)
     end
 end
 
@@ -619,6 +669,8 @@ local function clearInterface()
     phaseLabel, progressTrack, phaseFill, accentLine, statusOrb = nil, nil, nil, nil, nil
     ambientGlow, secondaryGlow, haloGradientRef, progressShine, bannerPulse = nil, nil, nil, nil, nil
     table.clear(phaseSteps)
+    table.clear(textElements)
+    eyebrowLabel, coreIconLabel = nil, nil
     currentStatus, activePresentation, restartAt, lastMessage = "idle", "hidden", 0, ""
 end
 
@@ -757,44 +809,44 @@ local function update(status: string, target: number, message: string)
         title.Text = "Server update incoming"
         statusText.Text = "Server restart in " .. countdown(seconds)
         description.Text = message ~= "" and message or "We will save your progress before the server moves."
-        phaseLabel.Text = "PREPARING SERVER UPDATE"
+        phaseLabel.Text = "Preparing update"
         if bannerText then bannerText.Text = "SERVER UPDATE INCOMING" end
         if bannerTimer then bannerTimer.Text = countdown(seconds) end
     elseif status == "saving" then
         title.Text = "Saving your progress"
         statusText.Text = "Saving profile data..."
         description.Text = "Stay connected while your latest progress is saved securely."
-        phaseLabel.Text = "PERSISTING PROFILE DATA"
+        phaseLabel.Text = "Saving profile"
     elseif status == "retrying" then
         title.Text = "Keeping progress safe"
         statusText.Text = "Retrying the save..."
         description.Text = "The data service is busy. Your profile remains protected."
-        phaseLabel.Text = "RETRYING SECURE SAVE"
+        phaseLabel.Text = "Retrying save"
     elseif status == "ready" then
         title.Text = "Your progress is saved"
         statusText.Text = "Waiting for server transfer..."
         description.Text = "Save confirmed. Preparing to join the updated server."
-        phaseLabel.Text = "AWAITING SERVER MIGRATION"
+        phaseLabel.Text = "Waiting for transfer"
     elseif status == "moving" then
         title.Text = "Joining the updated server"
         statusText.Text = "Connecting to the new server..."
         description.Text = "Your progress is saved. Roblox is moving your party."
-        phaseLabel.Text = "TRANSFERRING TO UPDATED SERVER"
+        phaseLabel.Text = "Connecting to server"
     elseif status == "teleport-retrying" then
         title.Text = "Reconnecting players"
         statusText.Text = "Retrying connection..."
         description.Text = "The transfer was interrupted. Your saved progress is safe."
-        phaseLabel.Text = "RETRYING SERVER TRANSFER"
+        phaseLabel.Text = "Retrying transfer"
     elseif status == "arriving" then
         title.Text = "Welcome back"
         statusText.Text = "Loading your saved profile..."
         description.Text = "Waiting for the previous session lock to release."
-        phaseLabel.Text = "SYNCING PLAYER DATA"
+        phaseLabel.Text = "Loading player data"
     elseif status == "error" then
         title.Text = "Unable to load profile"
         statusText.Text = "Please reconnect"
         description.Text = "The profile could not load safely. Please reconnect."
-        phaseLabel.Text = "PROFILE LOAD NOT COMPLETED"
+        phaseLabel.Text = "Profile not loaded"
     end
 end
 
