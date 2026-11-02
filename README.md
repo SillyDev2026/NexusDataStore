@@ -2,19 +2,68 @@
 
 **Typed, session-aware data persistence for Roblox.**
 
-![Version](https://img.shields.io/badge/NexusDataStore-8.3.0-2563eb)
+![Version](https://img.shields.io/badge/NexusDataStore-8.4.0-2563eb)
 ![Codec](https://img.shields.io/badge/Compression-2.6.1-0f766e)
 ![Luau](https://img.shields.io/badge/language-Luau-00a2ff)
 ![Platform](https://img.shields.io/badge/platform-Roblox-222222)
 
 NexusDataStore brings standard Roblox DataStore persistence, session ownership, typed player profiles, validation, migrations, snapshots, adaptive compression, and numeric leaderboards into one server-side library.
 
-**Current version:** `8.3.0` · **Compression:** `2.6.1` / codecs `230`–`233` · **Record format:** `700`
+**Current version:** `8.4.0` · **Compression:** `2.6.1` / codecs `230`–`233` · **Record format:** `700`
 
 > [!IMPORTANT]
 > This documentation describes the current source on `main`. Regression scripts are included, but production reliability and performance have not been certified by live-server load testing. Use a separate test universe before deploying changes to existing player data.
 
-## New in 8.3.0 — Display-frame-synchronized animations
+## New in 8.4.0 — Opt-in auto-migration after a Studio publish
+
+**Goal:** Publishing a new version from Roblox Studio can trigger a live server countdown, save every active player, and initiate a teleport to a **fresh updated server**, without manually choosing Restart Servers in Creator Dashboard.
+
+This is an **optional best-effort in-game approach**, because Roblox does not provide an authoritative server-side `game.Published` event. The automatic detection uses `InsertService:GetLatestAssetVersionAsync(game.PlaceId)` on the old game server, which reports an **asset version ID**, not `game.PlaceVersion`. Roblox documents asset-version lookups, but **does not guarantee the ID changes only after the latest playable place version is published**. Updates can be missed, or a saved-but-unpublished asset version could trigger a premature migration. For guaranteed outdated-server targeting, use Roblox's official Creator Dashboard **Restart Servers** or an external Open Cloud restart automation.
+
+### Enable automatic migration
+
+~~~lua
+local Store = NexusDataStore.new({
+    Name = "PlayerData",
+    Template = PlayersData,
+    AutoSave = true,
+    BudgetAware = true,
+    Compression = true,
+    AutoPlayerLifecycle = true,
+    EnableSoftShutdown = true,
+    AutoRestartOnPublish = true,
+    AutoPublishPollInterval = 60, -- 30 to 600 seconds
+    AutoPublishCountdownSeconds = 45, -- 25 to 600 seconds
+    WaitForSessionLock = true,
+    LoadTimeout = 60,
+})
+~~~
+
+Install `SoftShutdownClient.client.lua` in `ReplicatedFirst` on **both old and new versions** of your game; keep `STORE_NAME = "PlayerData"` (or adjust it to the selected store name). Publish this NexusDataStore update and confirm it is running **before your next game-content publish**; already running servers cannot pick up newly added scripts without an initial migration.
+
+- At startup, the server reads its initial place asset-version ID. Then the watcher polls every 60 seconds by default. A **single changed reading does nothing**; two matching changed readings are required to start the restart (usually taking 1–2 minutes after a publish, subject to Roblox API timing).
+- When triggered, all active stores with `EnableSoftShutdown = true` receive the same restart notice. NexusDataStore runs its existing pre-save and final freeze/save pipeline. It **will not teleport** while any participant's final save is incomplete.
+- Once all final saves succeed, the driver calls `TeleportService:TeleportAsync` with a unique `TeleportOptions.ReservedServerId`. This targets a fresh **reserved/private server**, not ordinary public matchmaking. The destination uses the latest available published place build when Roblox starts it. Players from the same old server can remain grouped.
+- Transient teleport initiation failures use bounded retries with the **same** destination ID. The old server stays active and retains ownership until each player's `PlayerRemoving` releases their profile lock. The new server's `WaitForSessionLock` then safely acquires the saved session.
+- An old server may accept new joins while waiting: unlike official server restarts, this custom flow **does not stop matchmaking to the outdated instance**. It also cannot guarantee that every client will migrate on a platform or network failure.
+- Existing reserved/VIP server behavior is not preserved by this fallback; players may be moved into a new reserved instance. Do **not** enable the feature if your game depends on remaining in a particular VIP or matchmaking server.
+- For games with several NexusDataStore instances, set `AutoRestartOnPublish = true` on **one main player store only**, while keeping `EnableSoftShutdown = true` on all participant stores.
+
+### Testing with one Studio publish
+
+1. In a **separate published test experience**, install the updated server DataStore and client LocalScript, enable the feature, and publish once. This initial publish only deploys the feature.
+2. Join the game from a real Roblox client (not Studio Play), earn test currency, and keep that server running. Confirm `Store:GetAutoPublishStatus().BaselineAssetVersion` is set. You can inspect `AutoPublishChecks`, `AutoPublishCheckFailed`, `AutoPublishDetected`, `AutoPublishTeleportAttempts` and `AutoPublishTeleportFailed` using `Store:GetMetrics()`.
+3. Back in Studio, edit a harmless object and click **File → Publish to Roblox**. Do **not** press Restart Servers.
+4. Allow for two version polls and the countdown. If detection succeeds, the in-game UI progresses through **Saving → Transfer → Restore**; players should be moved into the new reserved server.
+5. Rejoin or inspect a profile to confirm currency and inventory survived. Repeat with a deliberately failed DataStore request and a failed teleport on the test experience; confirm that failures do not falsely acknowledge success or discard locks.
+
+**Troubleshooting:** `Store:GetAutoPublishStatus()` reports the baseline asset-version, current candidate, sample count, last read error, and whether a restart is scheduled. `Store:On("AutoPublishDetected", callback)` and `Store:On("AutoPublishTeleportFailed", callback)` provide server-side events. If `GetLatestAssetVersionAsync` is unavailable, lacks permissions, or returns a version that does not change as expected, **the automatic flow will not reliably trigger**. In that case switch off `AutoRestartOnPublish` and use official Roblox restart automation.
+
+This feature **does not restart or shut down servers from Studio itself**, cannot invoke privileged Open Cloud APIs, and does not guarantee zero disruptions. Roblox naturally retires an old server when all players leave it; your own server scripts must not prevent this with a rejoin loop. No API secrets are required for the in-game fallback.
+
+Saved record format `700`, Compression `2.6.1` and codecs `230`–`233` remain unchanged. Portable GitHub CI runs mocked source and migration paths; it is **not a real multi-server Roblox teleport test**.
+
+## Previously in 8.3.0 — Display-frame-synchronized animations
 
 **Smoothness follows the actual Roblox render FPS on the client** instead of fixed-frequency animation timers. The `SoftShutdownClient.client.lua` now uses one `RunService.PreRender` listener and its `deltaTime` to keep animation duration independent of frame rate. If the game renders at 30, 60, 90, 120, or 165 FPS, each available frame receives a position corresponding to elapsed time. This does **not** read, force, or unlock the device's physical refresh rate: Roblox, platform FPS caps, load and game settings determine effective rendered FPS.
 
