@@ -142,7 +142,8 @@ local function show()
 end
 
 local function hide()
-    closed = true
+    currentStatus = "idle"
+    restartAt = 0
     if activeGui then activeGui:Destroy(); activeGui = nil end
 end
 
