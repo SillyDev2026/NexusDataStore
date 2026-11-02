@@ -21,7 +21,7 @@ This version adds a **fully opt-in restart coordinator** and a drop-in, responsi
 ### Install in Roblox Studio
 
 1. Put the newest `DataStore.lua`, `Compression.lua` and `PlayersData` modules in place as usual.
-2. Copy `SoftShutdownClient.client.lua` into **ReplicatedFirst as a LocalScript**. The LocalScript creates its own entire GUI, including mobile-friendly scaling, progress indicator, restart status, countdown and arriving-server screen. No GUI objects need to be manually authored. Set its `STORE_NAME` to match your store's `Name`.
+2. Copy `SoftShutdownClient.client.lua` into **ReplicatedFirst as a LocalScript**. The LocalScript creates its own entire GUI, including mobile-friendly scaling, a nonblocking top banner during long countdowns, full-screen saving/migration status in the final 30 seconds, a progress indicator and an arriving-server screen. No GUI objects need to be manually authored. Set its `STORE_NAME` to match your store's `Name`.
 3. Configure your player store with:
 
 ~~~lua
