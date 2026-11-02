@@ -22,7 +22,8 @@ local closed = false
 
 local function createGui(): ScreenGui
     local gui = Instance.new("ScreenGui")
-    gui.Name = "NexusRestartGui"
+    gui.Name = "NexusRestartGui_" .. STORE_NAME
+    gui:SetAttribute("StoreName", STORE_NAME)
     gui.ResetOnSpawn = false
     gui.IgnoreGuiInset = true
     gui.DisplayOrder = 1000
@@ -165,6 +166,7 @@ end
 local function hide()
     currentStatus = "idle"
     restartAt = 0
+    statusLabel, detailLabel, titleLabel, bannerLabel = nil, nil, nil, nil
     if activeGui then activeGui:Destroy(); activeGui = nil end
 end
 
@@ -207,17 +209,17 @@ local function update(status: string, target: number, message: string)
     end
 end
 
-if arriving and arriving:IsA("ScreenGui") and arriving.Name == "NexusRestartGui" then
+if arriving and arriving:IsA("ScreenGui") and (arriving.Name == "NexusRestartGui_" .. STORE_NAME or (arriving.Name == "NexusRestartGui" and (arriving:GetAttribute("StoreName") == nil or arriving:GetAttribute("StoreName") == STORE_NAME))) then
     ReplicatedFirst:RemoveDefaultLoadingScreen()
     attach(arriving)
     update("arriving", 0, "")
     task.spawn(function()
         while not closed do
-            if player:GetAttribute("NexusDataStoreProfileReady") == true then
+            if player:GetAttribute("NexusDataStoreProfileReady_" .. STORE_NAME) == true then
                 hide()
                 return
             end
-            local loadError = player:GetAttribute("NexusDataStoreProfileError")
+            local loadError = player:GetAttribute("NexusDataStoreProfileError_" .. STORE_NAME)
             if loadError ~= nil then
                 update("error", 0, "")
                 return
@@ -247,7 +249,7 @@ task.spawn(function()
 end)
 
 task.spawn(function()
-    while not closed do
+    while player.Parent == Players do
         if currentStatus == "scheduled" and statusLabel and restartAt > 0 then
             local seconds = math.max(0, restartAt - DateTime.now().UnixTimestamp)
             local label = string.format("Restart in %02d:%02d", math.floor(seconds / 60), seconds % 60)
