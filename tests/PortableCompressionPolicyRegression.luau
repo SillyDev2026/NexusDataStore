@@ -133,5 +133,47 @@ policyTest("RLE remains optional in adaptive forced-buffer mode", function()
     assert(#calls == 1)
 end)
 
+policyTest("One failing codec candidate does not cancel other valid compressed packets", function()
+    local store, calls = newPolicyStore(90)
+    store.Config.CompressionOptions.RunLengthArrays = true
+    local original = store.CompressionEngine.CompressTablePacket
+    store.CompressionEngine.CompressTablePacket = function(value, options)
+        if options.RunLengthArrays and options.StringDictionary then error("RLE_DICTIONARY_TEMPORARY_FAILURE") end
+        return original(value, options)
+    end
+    local packet, err, report = store:_EncodeRecord({Data = {Coins = 7}})
+    assert(packet and packet.Codec == 233, tostring(err))
+    assert(report.CandidateFailures == 1 and report.AlternativeCodecCandidates == 8)
+    assert(#calls == 7 and report.SelectionReason == "always-compressed-smallest")
+end)
+
+policyTest("All codec failures cannot silently write raw in always-smallest mode", function()
+    local store = newPolicyStore(50)
+    store.CompressionEngine.CompressTablePacket = function() error("ALL_CODECS_FAILED") end
+    local encoded, err = store:_EncodeRecord({Data = {Value = 1}})
+    assert(encoded == nil and string.find(err, "ALL_CODECS_FAILED", 1, true))
+end)
+
+policyTest("Adaptive mode safely writes raw if every compression candidate fails", function()
+    local store = newPolicyStore(50)
+    store.Config.CompressionPolicy = "adaptive"
+    store.Config.CompressionMinBytes = 0
+    store.CompressionEngine.CompressTablePacket = function() error("ALL_CODECS_FAILED") end
+    local encoded, err, report = store:_EncodeRecord({Data = {Value = 1}})
+    assert(encoded and not encoded.Compressed and err == nil)
+    assert(report.SelectionReason == "compression-failed-raw-fallback" and report.CandidateFailures == 1)
+    assert(string.find(report.CompressionError, "ALL_CODECS_FAILED", 1, true))
+end)
+
+policyTest("Adaptive raw fallback still refuses oversized records", function()
+    local store = newPolicyStore(120)
+    store.Config.CompressionPolicy = "adaptive"
+    store.Config.CompressionMinBytes = 0
+    store.Config.MaxStoredBytes = 100
+    store.CompressionEngine.CompressTablePacket = function() error("ALL_CODECS_FAILED") end
+    local encoded, err = store:_EncodeRecord({Data = {Value = 1}})
+    assert(encoded == nil and string.find(err, "ALL_CODECS_FAILED", 1, true))
+end)
+
 print(string.format("Compression policy tests: %d passed, %d failed", policyPassed, policyFailed))
 assert(policyFailed == 0, "Always-smallest policy regressions failed")
