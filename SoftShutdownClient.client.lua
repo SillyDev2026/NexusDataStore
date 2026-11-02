@@ -42,7 +42,9 @@ local lastMessage = ""
 local transitionToken = 0
 local fadeTween: Tween? = nil
 local slideTween: Tween? = nil
-local ambientTweens: {Tween} = {}
+local bannerTween: Tween? = nil
+local stageTweens: {Tween} = {}
+local bannerTweens: {Tween} = {}
 
 local function corner(parent: Instance, radius: number)
     local item = Instance.new("UICorner")
@@ -75,10 +77,9 @@ local function textLabel(parent: Instance, name: string, value: string, font: En
     return item
 end
 
-local function loopTween(object: Instance, config: TweenInfo, properties: {[string]: any})
+local function loopTween(object: Instance, config: TweenInfo, properties: {[string]: any}, bucket: {Tween})
     local tween = TweenService:Create(object, config, properties)
-    table.insert(ambientTweens, tween)
-    tween:Play()
+    table.insert(bucket, tween)
 end
 
 local function makeInterface(): ScreenGui
@@ -124,7 +125,7 @@ local function makeInterface(): ScreenGui
     loopTween(glow, TweenInfo.new(4.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {
         Position = UDim2.fromScale(0.7, 0.33),
         BackgroundTransparency = 0.91,
-    })
+    }, stageTweens)
 
     local main = Instance.new("Frame")
     main.Name = "Panel"
@@ -181,7 +182,7 @@ local function makeInterface(): ScreenGui
     fill.Parent = bar
     corner(fill, 1)
     phaseFill = fill
-    loopTween(fill, moveEase, {Position = UDim2.fromScale(0.78, 0)})
+    loopTween(fill, moveEase, {Position = UDim2.fromScale(0.78, 0)}, stageTweens)
 
     local notice = Instance.new("CanvasGroup")
     notice.Name = "Banner"
@@ -206,7 +207,7 @@ local function makeInterface(): ScreenGui
     orb.BackgroundTransparency = 0.05
     orb.Parent = notice
     corner(orb, 1)
-    loopTween(orb, TweenInfo.new(1.15, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {BackgroundTransparency = 0.8})
+    loopTween(orb, TweenInfo.new(1.15, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {BackgroundTransparency = 0.8}, bannerTweens)
 
     bannerText = textLabel(notice, "Message", "SERVER UPDATE SCHEDULED", Enum.Font.GothamBold, normal, UDim2.fromScale(0.13, 0.12), UDim2.fromScale(0.59, 0.76), Enum.TextXAlignment.Left)
     bannerTimer = textLabel(notice, "Timer", "01:00", Enum.Font.GothamBold, accent, UDim2.fromScale(0.76, 0.12), UDim2.fromScale(0.18, 0.76), Enum.TextXAlignment.Right)
@@ -216,6 +217,7 @@ end
 local function stopTransitions()
     if fadeTween then fadeTween:Cancel(); fadeTween = nil end
     if slideTween then slideTween:Cancel(); slideTween = nil end
+    if bannerTween then bannerTween:Cancel(); bannerTween = nil end
 end
 
 local function ensureInterface()
@@ -234,6 +236,8 @@ local function setPresentation(kind: string, immediate: boolean?)
     activePresentation = kind
     local showStage = kind == "full"
     local showBanner = kind == "banner"
+    for _, tween in ipairs(stageTweens) do if showStage then tween:Play() else tween:Pause() end end
+    for _, tween in ipairs(bannerTweens) do if showBanner then tween:Play() else tween:Pause() end end
     if showStage then
         stage.Visible = true
         if not immediate then
@@ -259,11 +263,12 @@ local function setPresentation(kind: string, immediate: boolean?)
             banner.GroupTransparency = 1
             banner.Position = UDim2.fromScale(0.5, -0.11)
         end
-        local fade = TweenService:Create(banner, fadeEase, {GroupTransparency = 0, Position = UDim2.fromScale(0.5, 0.06)})
-        fade:Play()
+        bannerTween = TweenService:Create(banner, fadeEase, {GroupTransparency = 0, Position = UDim2.fromScale(0.5, 0.06)})
+        bannerTween:Play()
     elseif banner.Visible then
         local oldBanner = banner
         local out = TweenService:Create(oldBanner, fadeEase, {GroupTransparency = 1, Position = UDim2.fromScale(0.5, -0.11)})
+        bannerTween = out
         out.Completed:Connect(function()
             if transitionToken == token and oldBanner.Parent then oldBanner.Visible = false end
         end)
@@ -274,8 +279,10 @@ end
 local function clearInterface()
     transitionToken += 1
     stopTransitions()
-    for _, tween in ipairs(ambientTweens) do tween:Cancel() end
-    table.clear(ambientTweens)
+    for _, tween in ipairs(stageTweens) do tween:Cancel() end
+    for _, tween in ipairs(bannerTweens) do tween:Cancel() end
+    table.clear(stageTweens)
+    table.clear(bannerTweens)
     if activeGui then activeGui:Destroy() end
     activeGui, stage, banner, panel = nil, nil, nil, nil
     bannerText, bannerTimer, title, statusText, description = nil, nil, nil, nil, nil
@@ -295,6 +302,7 @@ end
 
 local function update(status: string, target: number, message: string)
     if status == "idle" then return end
+    local previousStatus = currentStatus
     currentStatus = status
     restartAt = target
     lastMessage = message
@@ -303,6 +311,14 @@ local function update(status: string, target: number, message: string)
     local presentation = status == "scheduled" and seconds > 30 and not arrivalMode and "banner" or "full"
     setPresentation(presentation)
     if not title or not statusText or not description or not phaseLabel then return end
+    if status ~= previousStatus then
+        for _, label in ipairs({title, statusText, description, phaseLabel}) do
+            label.TextTransparency = 0.65
+            TweenService:Create(label, fadeEase, {TextTransparency = 0}):Play()
+        end
+    end
+    local shade = status == "ready" and Color3.fromRGB(96, 227, 184) or (status == "error" and Color3.fromRGB(255, 139, 145) or accent)
+    TweenService:Create(statusText, fadeEase, {TextColor3 = shade}):Play()
     if status == "scheduled" then
         title.Text = "New update incoming"
         statusText.Text = "Server restart in " .. countdown(seconds)
