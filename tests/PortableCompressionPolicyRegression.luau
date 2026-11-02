@@ -9,14 +9,15 @@ end
 
 local function newPolicyStore(rawSize)
     local calls = {}
-    local engine = {CodecVersion = 230, CompactCodecVersion = 231, PackedCodecVersion = 232}
+    local engine = {CodecVersion = 230, CompactCodecVersion = 231, PackedCodecVersion = 232, RunLengthCodecVersion = 233}
     engine.CompressTablePacket = function(_value, options)
         local compact = options.CompactEncoding == true
         local packed = options.BitPackedIntegers == true
+        local rle = options.RunLengthArrays == true
         local dictionary = options.StringDictionary == true
-        table.insert(calls, tostring(compact) .. ":" .. tostring(dictionary) .. ":" .. tostring(packed))
-        local size = packed and 3 or (compact and (dictionary and 9 or 5) or (dictionary and 17 or 11))
-        return buffer.create(size), {CodecVersion = packed and 232 or (compact and 231 or 230), EncodedBytes = size}
+        table.insert(calls, tostring(compact) .. ":" .. tostring(dictionary) .. ":" .. tostring(packed) .. ":" .. tostring(rle))
+        local size = rle and 2 or (packed and 3 or (compact and (dictionary and 9 or 5) or (dictionary and 17 or 11)))
+        return buffer.create(size), {CodecVersion = rle and 233 or (packed and 232 or (compact and 231 or 230)), EncodedBytes = size}
     end
     local store = setmetatable({
         Config = {
@@ -31,7 +32,7 @@ local function newPolicyStore(rawSize)
             MaxStoredBytes = 3900000,
         },
         CompressionEngine = engine,
-        CompressionEngineVersion = "2.5.0",
+        CompressionEngineVersion = "2.6.0",
     }, DataStore)
     store._MeasureStoredValue = function(_self, value)
         if value.Compressed then return 40 + buffer.len(value.Payload) end
@@ -109,6 +110,26 @@ policyTest("Packed mode preserves adaptive force-buffer behavior", function()
     store.Config.CompressionOptions.BitPackedIntegers = true
     local output, _, report = store:_EncodeRecord({Data = {Numbers = {1, 2, 3, 4, 5, 6, 7, 8}}})
     assert(output and output.Codec == 232 and report.AlternativeCodecCandidates == 1)
+    assert(#calls == 1)
+end)
+
+policyTest("Opt-in RLE extends smallest-record search to eight codec variants", function()
+    local store, calls = newPolicyStore(90)
+    store.Config.CompressionOptions.RunLengthArrays = true
+    local output, err, report = store:_EncodeRecord({Data = {Inventory = {"Potion", "Potion", "Potion"}}})
+    assert(output and output.Codec == 233, tostring(err))
+    assert(report.SelectedCodec == 233 and report.RunLengthEncoding)
+    assert(report.AlternativeCodecCandidates == 8 and #calls == 8)
+    assert(store.Config.CompressionOptions.CompactEncoding == false, "Codec selection mutated config")
+end)
+
+policyTest("RLE remains optional in adaptive forced-buffer mode", function()
+    local store, calls = newPolicyStore(10)
+    store.Config.CompressionPolicy = "adaptive"
+    store.Config.ForceCompressedBuffer = true
+    store.Config.CompressionOptions.RunLengthArrays = true
+    local output, _, report = store:_EncodeRecord({Data = {Inventory = {"Potion", "Potion"}}})
+    assert(output and output.Codec == 233 and report.AlternativeCodecCandidates == 1)
     assert(#calls == 1)
 end)
 

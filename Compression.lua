@@ -14,6 +14,7 @@ export type Options = {
 	AllowExpansion: boolean?,
 	CompactEncoding: boolean?,
 	BitPackedIntegers: boolean?,
+	RunLengthArrays: boolean?,
 }
 
 export type Report = {
@@ -23,6 +24,9 @@ export type Report = {
 	PackedIntegerArrays: number?,
 	PackedIntegerValues: number?,
 	PackedIntegerValueBits: number?,
+	RunLengthArrays: number?,
+	RunLengthRuns: number?,
+	RunLengthValues: number?,
 	EncodedBytes: number,
 	EncodedBits: number,
 	PayloadBytes: number,
@@ -49,6 +53,7 @@ local Compression = {}
 Compression.CodecVersion = 230
 Compression.CompactCodecVersion = 231
 Compression.PackedCodecVersion = 232
+Compression.RunLengthCodecVersion = 233
 Compression.Magic = 0x4E433233
 Compression.EngineCode = 230
 
@@ -63,6 +68,7 @@ local TAG_ARRAY = 7
 local TAG_MAP = 8
 local TAG_BOOLEAN_BITS = 9
 local TAG_PACKED_INTEGERS = 10
+local TAG_RLE_ARRAY = 11
 local TAG_SMALL_INTEGER_FIRST = 16
 local TAG_SMALL_INTEGER_LAST = 39
 
@@ -117,6 +123,9 @@ local function normalizeOptions(options: Options?): Options
 	if source.BitPackedIntegers ~= nil and typeof(source.BitPackedIntegers) ~= "boolean" then
 		error("INVALID_OPTION:BitPackedIntegers")
 	end
+	if source.RunLengthArrays ~= nil and typeof(source.RunLengthArrays) ~= "boolean" then
+		error("INVALID_OPTION:RunLengthArrays")
+	end
 	if source.DeterministicMaps ~= nil and typeof(source.DeterministicMaps) ~= "boolean" then
 		error("INVALID_OPTION:DeterministicMaps")
 	end
@@ -131,8 +140,9 @@ local function normalizeOptions(options: Options?): Options
 		DeterministicMaps = source.DeterministicMaps == true,
 		PreallocateLimit = integerOption(source.PreallocateLimit, 4194304, 256, "PreallocateLimit"),
 		AllowExpansion = source.AllowExpansion == true,
-		CompactEncoding = source.CompactEncoding == true or source.BitPackedIntegers == true,
-		BitPackedIntegers = source.BitPackedIntegers == true,
+		CompactEncoding = source.CompactEncoding == true or source.BitPackedIntegers == true or source.RunLengthArrays == true,
+		BitPackedIntegers = source.BitPackedIntegers == true or source.RunLengthArrays == true,
+		RunLengthArrays = source.RunLengthArrays == true,
 	}
 end
 
@@ -574,6 +584,27 @@ local function buildDictionary(value: any, options: Options): ({string}, {[strin
 	return list, lookup, bytes, scanState.Nodes
 end
 
+
+-- Cost of an individual scalar in the existing codec, without allocating a packet.
+local function scalarEncodedCost(value: any, dictionary: {[string]: number}, options: Options): (number?, number?)
+	local kind = typeof(value)
+	if kind == "boolean" then return 1, 1 end
+	if kind == "string" then
+		local index = dictionary[value]
+		return index and (1 + varUIntBytes(index)) or (1 + varUIntBytes(#value) + #value), #value + 4
+	end
+	if kind == "number" then
+		if not finiteNumber(value) then return nil, nil end
+		if options.CompactEncoding and isInteger(value) and value >= -8 and value <= 15 then return 1, 8 end
+		if isInteger(value) and math.abs(value) <= math.floor(MAX_SAFE_INTEGER / 2) then
+			local zigzag = value >= 0 and value * 2 or (-value * 2) - 1
+			return 1 + varUIntBytes(zigzag), 8
+		end
+		return 9, 8
+	end
+	return nil, nil
+end
+
 local function writeValue(
 	writer: WriterObject,
 	value: any,
@@ -638,6 +669,90 @@ local function writeValue(
 
 	local isArray, count = inspectTableShape(value)
 	if isArray then
+		-- v233 run-length compresses repeated scalar arrays, but only when the
+		-- exact representation beats both normal and existing bit-packed encodings.
+		if options.RunLengthArrays and count >= 4 then
+			if depth + 1 > (options.MaxDepth :: number) then error("MAX_DEPTH_EXCEEDED") end
+			if count > (options.MaxNodes :: number) - state.Nodes then error("MAX_NODES_EXCEEDED") end
+			local normalBytes = 1 + varUIntBytes(count)
+			local rleBodyBytes = 0
+			local totalRawBytes = 0
+			local runCount = 0
+			local lastValue = nil
+			local runLength = 0
+			local allBoolean = true
+			local allPackedIntegers = true
+			local maxZigzag = 0
+			local supported = true
+			for index = 1, count do
+				local current = value[index]
+				local encodedBytes, rawBytes = scalarEncodedCost(current, dictionary, options)
+				if encodedBytes == nil then supported = false; break end
+				normalBytes += encodedBytes
+				totalRawBytes += rawBytes :: number
+				if typeof(current) ~= "boolean" then allBoolean = false end
+				if typeof(current) ~= "number" or not isInteger(current) or current < -32768 or current > 32767 then
+					allPackedIntegers = false
+				else
+					local zigzag = current >= 0 and current * 2 or -current * 2 - 1
+					if zigzag > maxZigzag then maxZigzag = zigzag end
+				end
+				if runLength == 0 then
+					lastValue, runLength = current, 1
+				elseif current == lastValue then
+					runLength += 1
+				else
+					local lastCost = scalarEncodedCost(lastValue, dictionary, options)
+					rleBodyBytes += varUIntBytes(runLength) + (lastCost :: number)
+					runCount += 1
+					lastValue, runLength = current, 1
+				end
+			end
+			if supported then
+				local lastCost = scalarEncodedCost(lastValue, dictionary, options)
+				rleBodyBytes += varUIntBytes(runLength) + (lastCost :: number)
+				runCount += 1
+				local competingBytes = normalBytes
+				if allBoolean then competingBytes = math.min(competingBytes, 1 + varUIntBytes(count) + math.ceil(count / 8)) end
+				if allPackedIntegers and count >= 8 then
+					local width = 1
+					while maxZigzag >= 2 ^ width do width += 1 end
+					competingBytes = math.min(competingBytes, 2 + varUIntBytes(count) + math.ceil(count * width / 8))
+				end
+				local rleBytes = 1 + varUIntBytes(count) + varUIntBytes(runCount) + rleBodyBytes
+				if runCount < count and rleBytes < competingBytes then
+					writer:U8(TAG_RLE_ARRAY)
+					writer:VarUInt(count)
+					writer:VarUInt(runCount)
+					local previous = nil
+					local length = 0
+					local writtenRawBytes = 0
+					for index = 1, count do
+						local current = value[index]
+						if length > 0 and current ~= previous then
+							writer:VarUInt(length)
+							writeValue(writer, previous, dictionary, seen, state, options, depth + 1)
+							local _, raw = scalarEncodedCost(previous, dictionary, options)
+							writtenRawBytes += raw :: number
+							length = 0
+						end
+						if length == 0 then previous = current end
+						length += 1
+					end
+					writer:VarUInt(length)
+					writeValue(writer, previous, dictionary, seen, state, options, depth + 1)
+					local _, finalRaw = scalarEncodedCost(previous, dictionary, options)
+					writtenRawBytes += finalRaw :: number
+					state.Nodes += count - runCount
+					state.RawBytes += totalRawBytes - writtenRawBytes
+					state.RunLengthArrays += 1
+					state.RunLengthRuns += runCount
+					state.RunLengthValues += count
+					seen[value] = nil
+					return
+				end
+			end
+		end
 		-- v232 packs signed 16-bit-range integer arrays with only the bits they require.
 		if options.BitPackedIntegers and count >= 8 then
 			local width = 1
@@ -794,6 +909,30 @@ local function readValue(
 			error("INVALID_STRING_REFERENCE")
 		end
 		return value
+	elseif tag == TAG_RLE_ARRAY and options.RunLengthArrays then
+		local count = reader:VarUInt()
+		local runs = reader:VarUInt()
+		if count < 4 or runs < 1 or runs >= count then error("INVALID_RLE_ARRAY_COUNT") end
+		if depth + 1 > (options.MaxDepth :: number) then error("MAX_DEPTH_EXCEEDED") end
+		if count > (options.MaxNodes :: number) - state.Nodes then error("MAX_NODES_EXCEEDED") end
+		if runs > math.floor(reader:Remaining() / 2) then error("INVALID_RLE_RUN_COUNT") end
+		local output = table.create(count)
+		local index = 1
+		local previous = nil
+		for _ = 1, runs do
+			local length = reader:VarUInt()
+			if length < 1 or length > count - index + 1 then error("INVALID_RLE_RUN_LENGTH") end
+			local current = readValue(reader, dictionary, state, options, depth + 1)
+			local kind = typeof(current)
+			if kind ~= "number" and kind ~= "string" and kind ~= "boolean" then error("INVALID_RLE_SCALAR") end
+			if previous ~= nil and previous == current then error("NON_CANONICAL_RLE_RUN") end
+			for position = index, index + length - 1 do output[position] = current end
+			index += length
+			previous = current
+		end
+		if index ~= count + 1 then error("INVALID_RLE_TOTAL_LENGTH") end
+		state.Nodes += count - runs
+		return output
 	elseif tag == TAG_PACKED_INTEGERS and options.BitPackedIntegers then
 		local count = reader:VarUInt()
 		if count < 8 then error("INVALID_PACKED_ARRAY_COUNT") end
@@ -893,13 +1032,13 @@ end
 
 -- Returns the codec version exposed to dependent modules.
 function Compression.Version(): string
-	return "2.5.0"
+	return "2.6.0"
 end
 
 -- Returns the stable table codec mode identifier.
 function Compression.TableMode(_value: any, options: Options?): string
 	local normalized = normalizeOptions(options)
-	return normalized.BitPackedIntegers and "buffer-v232" or (normalized.CompactEncoding and "buffer-v231" or "buffer-v230")
+	return normalized.RunLengthArrays and "buffer-v233" or (normalized.BitPackedIntegers and "buffer-v232" or (normalized.CompactEncoding and "buffer-v231" or "buffer-v230"))
 end
 
 -- Encodes using the unchanged v2.3 packet format with the v2.3.4 engine.
@@ -919,13 +1058,13 @@ function Compression.CompressTablePacket(value: any, options: Options?): (buffer
 		packetWriter:String(text)
 	end
 
-	local writeState = {Nodes = 0, RawBytes = 0, PackedIntegerArrays = 0, PackedIntegerValues = 0, PackedIntegerValueBits = 0}
+	local writeState = {Nodes = 0, RawBytes = 0, PackedIntegerArrays = 0, PackedIntegerValues = 0, PackedIntegerValueBits = 0, RunLengthArrays = 0, RunLengthRuns = 0, RunLengthValues = 0}
 	writeValue(packetWriter, value, lookup, {}, writeState, normalized, 0)
 	local payloadBytes = packetWriter.Position - HEADER_BYTES
 	local checksum = adler32(packetWriter.Buffer, HEADER_BYTES, payloadBytes)
 
 	buffer.writeu32(packetWriter.Buffer, 0, Compression.Magic)
-	buffer.writeu16(packetWriter.Buffer, 4, normalized.BitPackedIntegers and Compression.PackedCodecVersion or (normalized.CompactEncoding and Compression.CompactCodecVersion or Compression.CodecVersion))
+	buffer.writeu16(packetWriter.Buffer, 4, normalized.RunLengthArrays and Compression.RunLengthCodecVersion or (normalized.BitPackedIntegers and Compression.PackedCodecVersion or (normalized.CompactEncoding and Compression.CompactCodecVersion or Compression.CodecVersion)))
 	buffer.writeu8(packetWriter.Buffer, 6, #dictionary > 0 and 1 or 0)
 	buffer.writeu32(packetWriter.Buffer, 7, checksum)
 	local output = packetWriter:Finish()
@@ -946,7 +1085,10 @@ function Compression.CompressTablePacket(value: any, options: Options?): (buffer
 		PackedIntegerArrays = writeState.PackedIntegerArrays,
 		PackedIntegerValues = writeState.PackedIntegerValues,
 		PackedIntegerValueBits = writeState.PackedIntegerValueBits,
-		CodecVersion = normalized.BitPackedIntegers and Compression.PackedCodecVersion or (normalized.CompactEncoding and Compression.CompactCodecVersion or Compression.CodecVersion),
+		RunLengthArrays = writeState.RunLengthArrays,
+		RunLengthRuns = writeState.RunLengthRuns,
+		RunLengthValues = writeState.RunLengthValues,
+		CodecVersion = normalized.RunLengthArrays and Compression.RunLengthCodecVersion or (normalized.BitPackedIntegers and Compression.PackedCodecVersion or (normalized.CompactEncoding and Compression.CompactCodecVersion or Compression.CodecVersion)),
 		EncodedBytes = encodedBytes,
 		EncodedBits = encodedBytes * 8,
 		PayloadBytes = payloadBytes,
@@ -958,7 +1100,7 @@ function Compression.CompressTablePacket(value: any, options: Options?): (buffer
 		SavingsPercent = savings,
 		DictionaryEntries = #dictionary,
 		DictionaryBytes = dictionaryBytes,
-		Codec = normalized.BitPackedIntegers and "NexusBinary232" or (normalized.CompactEncoding and "NexusBinary231" or "NexusBinary230"),
+		Codec = normalized.RunLengthArrays and "NexusBinary233" or (normalized.BitPackedIntegers and "NexusBinary232" or (normalized.CompactEncoding and "NexusBinary231" or "NexusBinary230")),
 		Engine = "Compression",
 		EngineVersion = Compression.Version(),
 		Fields = {},
@@ -976,7 +1118,7 @@ function Compression.DecompressTable(source: buffer, options: Options?): any
 		error("COMPRESSION_MAGIC_MISMATCH")
 	end
 	local version = buffer.readu16(source, 4)
-	if version ~= Compression.CodecVersion and version ~= Compression.CompactCodecVersion and version ~= Compression.PackedCodecVersion then
+	if version ~= Compression.CodecVersion and version ~= Compression.CompactCodecVersion and version ~= Compression.PackedCodecVersion and version ~= Compression.RunLengthCodecVersion then
 		error("UNSUPPORTED_COMPRESSION_VERSION:" .. tostring(version))
 	end
 	local flags = buffer.readu8(source, 6)
@@ -993,7 +1135,8 @@ function Compression.DecompressTable(source: buffer, options: Options?): any
 
 	local normalized = normalizeOptions(options)
 	normalized.CompactEncoding = version ~= Compression.CodecVersion
-	normalized.BitPackedIntegers = version == Compression.PackedCodecVersion
+	normalized.BitPackedIntegers = version == Compression.PackedCodecVersion or version == Compression.RunLengthCodecVersion
+	normalized.RunLengthArrays = version == Compression.RunLengthCodecVersion
 	local reader = Reader.new(source, HEADER_BYTES, payloadLength)
 	local dictionaryCount = reader:VarUInt()
 	if dictionaryCount > (normalized.MaxNodes :: number) then

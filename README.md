@@ -2,19 +2,58 @@
 
 **Typed, session-aware data persistence for Roblox.**
 
-![Version](https://img.shields.io/badge/NexusDataStore-7.8.0-2563eb)
-![Codec](https://img.shields.io/badge/Compression-2.5.0-0f766e)
+![Version](https://img.shields.io/badge/NexusDataStore-7.9.0-2563eb)
+![Codec](https://img.shields.io/badge/Compression-2.6.0-0f766e)
 ![Luau](https://img.shields.io/badge/language-Luau-00a2ff)
 ![Platform](https://img.shields.io/badge/platform-Roblox-222222)
 
 NexusDataStore brings standard Roblox DataStore persistence, session ownership, typed player profiles, validation, migrations, snapshots, adaptive compression, and numeric leaderboards into one server-side library.
 
-**Current version:** `7.8.0` · **Compression:** `2.5.0` / codecs `230`, `231`, `232` · **Record format:** `700`
+**Current version:** `7.9.0` · **Compression:** `2.6.0` / codecs `230`–`233` · **Record format:** `700`
 
 > [!IMPORTANT]
 > This documentation describes the current source on `main`. Regression scripts are included, but production reliability and performance have not been certified by live-server load testing. Use a separate test universe before deploying changes to existing player data.
 
-## New in 7.8.0 — Minimal-width integer bitpacking and storage diagnostics
+## New in 7.9.0 — Run-length compression for real player profiles
+
+Compression v2.6.0 adds opt-in **codec 233** for arrays containing repeated **strings, finite numbers, or Booleans**, such as repeated inventory items, progress counters, and status flags. It stores each consecutive run once with its length. No array element, field, or required metadata is discarded.
+
+- **Exact array-level size choice:** RLE is used only when it is smaller than ordinary scalar encoding and, where applicable, existing Boolean bitsets or minimal-width integer arrays. Non-repeating content keeps its efficient representation.
+- **Existing bitpacking retained:** Codec 233 also understands compact integer and Boolean encoding. All codecs 230, 231 and 232 remain readable.
+- **Strong corruption checks:** Reject zero-length runs, impossible counts, overruns, incomplete arrays, non-scalar run values and adjacent duplicate runs. Preserve checksum and depth/node guards.
+- **Developer diagnostics:** `GetCompressionReport()` now reports `RunLengthArrays`, `RunLengthRuns`, and `RunLengthValues`. `GetStorageForecast()` includes run counts and value counts alongside packed bits and expansion.
+- **Compatible record schema:** Record format 700, session ownership, revisions and migrations are unchanged.
+
+### Enable RLE after upgrading every server
+
+~~~lua
+local Store = NexusDataStore.new({
+    Name = "PlayerData",
+    Template = PlayersData,
+    Compression = true,
+    CompressionPolicy = "always-smallest",
+    CompressionTransport = "auto",
+    CompressionOptions = {
+        StringDictionary = true,
+        BitPackedIntegers = true,
+        RunLengthArrays = true,
+    },
+    AutoSave = true,
+    BudgetAware = true,
+})
+~~~
+
+`RunLengthArrays = true` makes `"always-smallest"` compare **eight** lossless candidates: codecs 230, 231, 232, and 233 with dictionaries enabled and disabled. The smallest complete stored compressed envelope wins. RLE defaults to **false**, preserving the previous v7.8 writes.
+
+**Safe rollout:** Upgrade every running server to DataStore v7.9.0 with Compression v2.6.0 *before* setting `RunLengthArrays = true`. Older decoders cannot open new codec 233 records. Do not downgrade until such records have been safely rewritten with an older codec, and test in a separate Roblox universe.
+
+**Limitations:** Lossless compression cannot make arbitrary high-entropy data smaller. The mode can increase size and CPU usage, especially when searching eight variants. Failed saves must be handled; Studio and live distributed tests are still necessary.
+
+### Next compression opportunities
+
+Future improvements worth evaluating include **delta encoding of sequential numeric values**, **schema-aware dictionary compression of repeated keys**, and **CPU-aware candidate search** during frequent autosaves. Each needs separate compatibility and performance testing.
+
+## Previously in 7.8.0 — Minimal-width integer bitpacking and storage diagnostics
 
 **Compression v2.5.0** adds an optional lossless **codec 232** for dense arrays of signed integers. Where a v231 array stores each small number with its own byte or tag, v232 packs consecutive integer values into one bitstream using the smallest number of bits needed for the array after zigzag encoding.
 
@@ -1163,7 +1202,7 @@ The following are the defaults in **v7.3.0**. Every option goes inside `NexusDat
 | `Debug` | `false` | Debug logging |
 | `ProfileOperations` | `false` | Opt-in per-server operation time/count profiling |
 
-The codec's `CompressionOptions` include opt-in `CompactEncoding` (v231, defaults off) and `BitPackedIntegers` (v232, defaults off), `StringDictionary`, `DictionaryMinLength`, `DictionaryMinUses`, `DictionaryMaxEntries`, `DictionaryMaxCandidates`, `DeterministicMaps`, `MaxDepth`, `MaxNodes`, `PreallocateLimit`, and `AllowExpansion`. Tune only with representative profile benchmarks.
+The codec's `CompressionOptions` include opt-in `CompactEncoding` (v231), `BitPackedIntegers` (v232), and `RunLengthArrays` (v233), all disabled by default, `StringDictionary`, `DictionaryMinLength`, `DictionaryMinUses`, `DictionaryMaxEntries`, `DictionaryMaxCandidates`, `DeterministicMaps`, `MaxDepth`, `MaxNodes`, `PreallocateLimit`, and `AllowExpansion`. Tune only with representative profile benchmarks.
 
 ## API reference
 
@@ -1365,4 +1404,4 @@ For DataStore fundamentals and limits, consult [Roblox Data Stores](https://crea
 
 ---
 
-**Version 7.8.0** · [Source](./DataStore.lua) · [Compression](./Compression.lua) · [Tests](./tests)
+**Version 7.9.0** · [Source](./DataStore.lua) · [Compression](./Compression.lua) · [Tests](./tests)
