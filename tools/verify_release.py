@@ -40,7 +40,7 @@ check("arrival interface works with legacy transfer GUIs", 'arriving.Name == "Ne
 check("v8.1 UI details retained", "## Previously in 8.1.0" in readme and "UDim2.fromScale" in readme)
 check("v8.2 cinematic HUD and status timeline", all(token in client for token in ('DataCore', 'UIAspectRatioConstraint', 'GridX', 'GridY', 'Step1', 'phaseSteps', 'active and shade', 'statusOrb', 'phaseColor')))
 check("v8.2 animations track and cancel stale phase tweens", all(token in client for token in ('cancelStatusTweens()', 'table.clear(statusTweens)', 'animateState(', 'Rotation = 360', 'stageTweens')))
-check("v8.2 true data lifecycle stages without fictitious progress", all(token in client for token in ('"ready"', '"arriving"', '"error"', 'SAVE', 'TRANSFER', 'RESTORE', 'indeterminate')) if False else all(token in client for token in ('"ready"', '"arriving"', '"error"', 'SAVE', 'TRANSFER', 'RESTORE')))
+check("v8.2 true save, transfer and restore states", all(token in client for token in ('"ready"', '"arriving"', '"error"', 'SAVE', 'TRANSFER', 'RESTORE', 'currentStep')))
 check("v8.2 reduced-motion option", 'local REDUCED_MOTION = false' in client and 'if REDUCED_MOTION then' in client)
 check("v8.2 release setup and no codec changes", '## New in 8.2.0' in readme and 'Compression v2.6.1' in readme and 'record format' in readme)
 check("restart setup and publish workflow documented", "## Previously in 7.10.0" in readme and "Restart only servers with outdated versions" in readme)
