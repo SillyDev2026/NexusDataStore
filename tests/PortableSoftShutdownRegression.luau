@@ -139,6 +139,7 @@ end)
 
 shutdownTest("Parallel shutdown flush saves every dirty profile exactly once", function()
     local store = newShutdownStore()
+    store.FlushAsync = nil -- Exercise the real method rather than the earlier isolated flush stub.
     local saved = {}
     store.Sessions = {}
     store.SoftShutdownState = {Status = "saving"}
@@ -163,6 +164,7 @@ end)
 
 shutdownTest("Partial flush failure is reported rather than falsely acknowledged", function()
     local store = newShutdownStore()
+    store.FlushAsync = nil -- Exercise the real method rather than the earlier isolated flush stub.
     store.Sessions = {}
     store.SoftShutdownState = {Status = "saving"}
     store._DetectDirectChanges = function() end
@@ -183,6 +185,7 @@ end)
 
 shutdownTest("Invalid flush deadlines are rejected before touching player sessions", function()
     local store = newShutdownStore()
+    store.FlushAsync = nil -- Exercise the real method rather than the earlier isolated flush stub.
     local ok, err = store:FlushAsync(-1)
     assert(not ok and err == "INVALID_FLUSH_TIMEOUT")
 end)

@@ -4063,10 +4063,10 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 	end
 
 	local templateOK, templateErr = self:Validate(self.Template)
-	assert(templateOK, "Invalid NexusDataStore v7 template: " .. tostring(templateErr))
+	assert(templateOK,  "Invalid NexusDataStore v8 template: " .. tostring(templateErr))
 	if self.Config.Compression then
 		local codecOK, codecErr = pcall(self.CompressionEngine.CompressTablePacket, self:_BuildNewRecord(clone(self.Template)), self.Config.CompressionOptions)
-		assert(codecOK, "Invalid Compression v2.3.x configuration or template: " .. tostring(codecErr))
+		assert(codecOK, "Invalid Compression v2.3.x–v2.6.x configuration or template: " .. tostring(codecErr))
 	end
 
 	if self.Config.EnableCrossServerEvents or self.Config.EnableSessionHandoff then
@@ -4116,7 +4116,7 @@ NexusDataStore.OrderedDataStore = table.freeze({
 
 NexusDataStore.Compression = table.freeze({
 	RequiredVersion = REQUIRED_COMPRESSION_VERSION,
-	CompatibleSeries = "2.3.x or 2.4.x",
+	CompatibleSeries = "2.3.x–2.6.x",
 	CompactCodecVersion = 231,
 	CodecVersion = 230,
 	RecordFormat = RECORD_FORMAT,
