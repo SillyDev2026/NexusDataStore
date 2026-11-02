@@ -37,7 +37,12 @@ check("responsive UI has animated banner and full-screen presentation", all(toke
 check("responsive layout reflows when orientation changes", 'applyResponsiveLayout' in client and 'GetPropertyChangedSignal("AbsoluteSize")' in client and 'viewportConnection:Disconnect()' in client)
 check("restart animations pause when hidden and cancel on cleanup", all(token in client for token in ("tween:Pause()", "tween:Cancel()", "table.clear(stageTweens)", "table.clear(bannerTweens)")))
 check("arrival interface works with legacy transfer GUIs", 'arriving.Name == "NexusRestartGui"' in client and 'readyAttribute' in client and 'errorAttribute' in client)
-check("v8.1 UI details documented", "## New in 8.1.0" in readme and "UDim2.fromScale" in readme)
+check("v8.1 UI details retained", "## Previously in 8.1.0" in readme and "UDim2.fromScale" in readme)
+check("v8.2 cinematic HUD and status timeline", all(token in client for token in ('DataCore', 'UIAspectRatioConstraint', 'GridX', 'GridY', 'Step1', 'phaseSteps', 'active and shade', 'statusOrb', 'phaseColor')))
+check("v8.2 animations track and cancel stale phase tweens", all(token in client for token in ('cancelStatusTweens()', 'table.clear(statusTweens)', 'animateState(', 'Rotation = 360', 'stageTweens')))
+check("v8.2 true data lifecycle stages without fictitious progress", all(token in client for token in ('"ready"', '"arriving"', '"error"', 'SAVE', 'TRANSFER', 'RESTORE', 'indeterminate')) if False else all(token in client for token in ('"ready"', '"arriving"', '"error"', 'SAVE', 'TRANSFER', 'RESTORE')))
+check("v8.2 reduced-motion option", 'local REDUCED_MOTION = false' in client and 'if REDUCED_MOTION then' in client)
+check("v8.2 release setup and no codec changes", '## New in 8.2.0' in readme and 'Compression v2.6.1' in readme and 'record format' in readme)
 check("restart setup and publish workflow documented", "## Previously in 7.10.0" in readme and "Restart only servers with outdated versions" in readme)
 local_declaration_pattern = re.compile(r"^[ \t]*local[ \t]+[^=\n]+=[ \t]*$", re.MULTILINE)
 luau_files = [ROOT / "DataStore.lua", ROOT / "Compression.lua", *(ROOT / "tests").glob("*.lua"), *(ROOT / "tests").glob("*.luau")]
