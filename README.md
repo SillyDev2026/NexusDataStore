@@ -2,19 +2,41 @@
 
 **Typed, session-aware data persistence for Roblox.**
 
-![Version](https://img.shields.io/badge/NexusDataStore-8.1.0-2563eb)
+![Version](https://img.shields.io/badge/NexusDataStore-8.2.0-2563eb)
 ![Codec](https://img.shields.io/badge/Compression-2.6.1-0f766e)
 ![Luau](https://img.shields.io/badge/language-Luau-00a2ff)
 ![Platform](https://img.shields.io/badge/platform-Roblox-222222)
 
 NexusDataStore brings standard Roblox DataStore persistence, session ownership, typed player profiles, validation, migrations, snapshots, adaptive compression, and numeric leaderboards into one server-side library.
 
-**Current version:** `8.1.0` · **Compression:** `2.6.1` / codecs `230`–`233` · **Record format:** `700`
+**Current version:** `8.2.0` · **Compression:** `2.6.1` / codecs `230`–`233` · **Record format:** `700`
 
 > [!IMPORTANT]
 > This documentation describes the current source on `main`. Regression scripts are included, but production reliability and performance have not been certified by live-server load testing. Use a separate test universe before deploying changes to existing player data.
 
-## New in 8.1.0 — Fully responsive soft-shutdown interface
+## New in 8.2.0 — Cinematic, smoother server migration UI
+
+The built-in `SoftShutdownClient.client.lua` has been rebuilt with a futuristic dark-glass design. The visual changes are **client-side only**: DataStore record format `700`, Compression v2.6.1 and all existing codecs `230`–`233` are unchanged.
+
+### New visual design and animations
+
+- **Animated data-core emblem:** A softly pulsing circular core with a slow rotating gradient ring changes tone with the real update state.
+- **Subtle holographic grid and layered atmospheric lights:** Gentle blue/violet glow motion and a luminous accent strip, without images, external assets, or per-frame loops.
+- **Honest three-phase timeline:** SAVE → TRANSFER → RESTORE. Active, completed, and pending phases use distinct colors; **no fabricated progress percentages or success acknowledgements**.
+- **Smoother phase transitions:** Quint eased text reveals and color morphs; the main panel still slides in when a delayed restart approaches. Previously running status tweens are canceled on phase changes.
+- **Performance-conscious motion:** Expensive decorative loops are paused when their view is hidden; a single indeterminate progress strip indicates activity. The display remains useful if continuous motion is disabled.
+- **Improved responsive layout:** Every `Position` and `Size` remains percentage-based via `UDim2.fromScale`, with orientation-aware breakpoints for portrait mobile, tablet, desktop and short landscape views.
+- **Persistent teleport arrival UI:** The destination server waits for `NexusDataStoreProfileReady_<Name>`; an error remains visible if lock acquisition fails. Roblox still owns actual migration through **Restart Servers**.
+
+### Install and customize
+
+Replace your existing `SoftShutdownClient.client.lua` with the new version in **ReplicatedFirst**, as a `LocalScript`. At the start of the script, match `STORE_NAME = "PlayerData"` to the datastore name. Set `REDUCED_MOTION = true` to turn off continuous decorative animation and use instant mode transitions; the session and saving behavior is unaffected. Existing `EnableSoftShutdown = true` and `AutoPlayerLifecycle = true` settings remain valid.
+
+Use **Server Management → Restart Servers** after publishing to activate Roblox's update migration. The countdown notification remains compact during early notice, expanding to full-screen near restart and during actual saving/retry/loading.
+
+**Validation:** CI compiles the LocalScript and runs static UI contracts plus session, compression and shutdown regression suites. Test small-phone portrait, short-landscape, large tablet, desktop and a published teleport migration in Roblox Studio/test universe before deploying this visual update.
+
+## Previously in 8.1.0 — Fully responsive soft-shutdown interface
 
 The built-in restart LocalScript has been **fully redesigned**. Every UI object's `Position` and `Size` uses `UDim2.fromScale` (relative percentages); there are no pixel-based layout offsets or `UISizeConstraint` widths/heights. The script also switches between portrait-phone, tablet, desktop and short-landscape percentage layouts when the viewport changes, without hand-tuning dimensions.
 
