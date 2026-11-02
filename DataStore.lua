@@ -123,6 +123,9 @@ export type StoreConfig<T> = {
 	PlayerKey: ((player: Player) -> string | number)?,
 	AutoPlayerLifecycle: boolean?,
 	EnableSoftShutdown: boolean?,
+	AutoRestartOnPublish: boolean?,
+	AutoPublishPollInterval: number?,
+	AutoPublishCountdownSeconds: number?,
 	SoftShutdownPreSaveSeconds: number?,
 	SoftShutdownFreezeSeconds: number?,
 	SoftShutdownCloseTimeout: number?,
@@ -255,6 +258,7 @@ export type Store<T> = {
 	GetHealth: (self: Store<T>) -> {[string]: any},
 	AttachPlayerLifecycle: (self: Store<T>) -> (),
 	GetSoftShutdownStatus: (self: Store<T>) -> {[string]: any},
+	GetAutoPublishStatus: (self: Store<T>) -> {[string]: any},
 	BindToClose: (self: Store<T>) -> (),
 	CloseAsync: (self: Store<T>, timeout: number?) -> (boolean, string?),
 	On: (self: Store<T>, eventName: string, callback: (...any) -> ()) -> any,
@@ -286,10 +290,14 @@ local HttpService = game:GetService("HttpService")
 local MessagingService = game:GetService("MessagingService")
 local EncodingService = game:GetService("EncodingService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local InsertService = game:GetService("InsertService")
+local TeleportService = game:GetService("TeleportService")
+local RunService = game:GetService("RunService")
+local activeSoftShutdownStores = setmetatable({}, {__mode = "k"})
 
 local NexusDataStore: any = {}
 NexusDataStore.__index = NexusDataStore
-NexusDataStore.Version = "8.3.0"
+NexusDataStore.Version = "8.4.0"
 NexusDataStore.RecordFormat = 700
 NexusDataStore.RequiredCompressionVersion = "2.3.0"
 
@@ -2320,7 +2328,10 @@ function NexusDataStore:_BackgroundLoop()
 					table.insert(sessions, session)
 				end
 				local currentTime = now()
-				if self.Config.EnableSoftShutdown then self:_SoftShutdownTick(os.time()) end
+				if self.Config.EnableSoftShutdown then
+					self:_SoftShutdownTick(os.time())
+					if self.Config.AutoRestartOnPublish then self:_AutoPublishTeleportTick(os.time()) end
+				end
 				for _, session in ipairs(sessions) do
 					if session:IsActive() then
 						-- Controlled mutations already mark Dirty. Only scan a clean session for
@@ -2535,7 +2546,7 @@ function NexusDataStore:_SoftShutdownTick(timestamp: number)
 	end
 	if state.SavePending or timestamp < state.NextAttempt then return end
 	if final and state.FinalSaved then
-		if state.Status ~= "ready" then self:_SetSoftShutdownStatus("ready") end
+		if state.Source ~= "AutoPublish" and state.Status ~= "ready" then self:_SetSoftShutdownStatus("ready") end
 		return
 	end
 	if not final and state.PreSaved then return end
@@ -2653,6 +2664,7 @@ function NexusDataStore:CloseAsync(timeout: number?): (boolean, string?)
 		self:_Fire("CloseFailed", firstError)
 		return false, firstError
 	end
+	activeSoftShutdownStores[self] = nil
 	if self.ServerRestartConnection then self.ServerRestartConnection:Disconnect() end
 	if self.CrossServerSubscription then
 		pcall(function()
@@ -3880,6 +3892,8 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 	assert(config.WaitForSessionLock == nil or typeof(config.WaitForSessionLock) == "boolean", "WaitForSessionLock must be a boolean")
 	assert(config.EnableSessionHandoff == nil or typeof(config.EnableSessionHandoff) == "boolean", "EnableSessionHandoff must be a boolean")
 	assert(config.EnableSoftShutdown == nil or typeof(config.EnableSoftShutdown) == "boolean", "EnableSoftShutdown must be a boolean")
+	assert(config.AutoRestartOnPublish == nil or typeof(config.AutoRestartOnPublish) == "boolean", "AutoRestartOnPublish must be a boolean")
+	assert(config.AutoRestartOnPublish ~= true or config.EnableSoftShutdown == true, "AutoRestartOnPublish requires EnableSoftShutdown = true")
 	assert(config.EnableSoftShutdown ~= true or config.AutoPlayerLifecycle ~= false, "Soft shutdown requires player lifecycle management")
 	assert(config.SoftShutdownFreezeSeconds == nil or config.SoftShutdownPreSaveSeconds == nil or config.SoftShutdownFreezeSeconds <= config.SoftShutdownPreSaveSeconds, "SoftShutdownFreezeSeconds must not exceed SoftShutdownPreSaveSeconds")
 	assert(config.OrderedDataStores == nil or typeof(config.OrderedDataStores) == "table", "OrderedDataStores must be a table")
@@ -3948,6 +3962,9 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 		PlayerKey = config.PlayerKey,
 		AutoPlayerLifecycle = config.AutoPlayerLifecycle == true,
 		EnableSoftShutdown = config.EnableSoftShutdown == true,
+		AutoRestartOnPublish = config.AutoRestartOnPublish == true,
+		AutoPublishPollInterval = configNumber(config.AutoPublishPollInterval, 60, 30, "AutoPublishPollInterval", false, 600),
+		AutoPublishCountdownSeconds = configNumber(config.AutoPublishCountdownSeconds, 45, 25, "AutoPublishCountdownSeconds", false, 600),
 		SoftShutdownPreSaveSeconds = configNumber(config.SoftShutdownPreSaveSeconds, 20, 5, "SoftShutdownPreSaveSeconds"),
 		SoftShutdownFreezeSeconds = configNumber(config.SoftShutdownFreezeSeconds, 6, 1, "SoftShutdownFreezeSeconds"),
 		SoftShutdownCloseTimeout = configNumber(config.SoftShutdownCloseTimeout, 25, 5, "SoftShutdownCloseTimeout", false, 28),
@@ -3989,10 +4006,21 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 	self.SoftShutdownState = nil
 	self.SoftShutdownRemote = nil
 	self.ServerRestartConnection = nil
+	self.AutoPublishBaseline = nil
+	self.AutoPublishCandidate = nil
+	self.AutoPublishCandidatesSeen = 0
+	self.AutoPublishLastError = nil
+	self.AutoPublishTeleportOptions = nil
+	self.AutoPublishTeleportBusy = false
 	self.Metrics = {
 		Opened = 0,
 		Released = 0,
 		RestartsScheduled = 0,
+		AutoPublishChecks = 0,
+		AutoPublishCheckFailed = 0,
+		AutoPublishDetected = 0,
+		AutoPublishTeleportAttempts = 0,
+		AutoPublishTeleportFailed = 0,
 		SoftShutdownFlushes = 0,
 		SoftShutdownFlushFailed = 0,
 		LoadsFailed = 0,
@@ -4101,8 +4129,10 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 			self:_OnServerRestartScheduled(restartTime, source, attributes)
 		end)
 		self:BindToClose()
+		activeSoftShutdownStores[self] = true
 	end
 	self:_BackgroundLoop()
+	if self.Config.AutoRestartOnPublish and not RunService:IsStudio() and game.PlaceId > 0 then self:_StartAutoPublishWatch() end
 	if self.Config.AutoPlayerLifecycle or self.Config.EnableSoftShutdown then
 		self:AttachPlayerLifecycle()
 	end
