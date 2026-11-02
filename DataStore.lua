@@ -289,7 +289,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local NexusDataStore: any = {}
 NexusDataStore.__index = NexusDataStore
-NexusDataStore.Version = "7.10.0"
+NexusDataStore.Version = "8.0.0"
 NexusDataStore.RecordFormat = 700
 NexusDataStore.RequiredCompressionVersion = "2.3.0"
 
@@ -1222,6 +1222,47 @@ function NexusDataStore:_EncodeRecord(record: any): (any?, string?, any?)
 	local rleEnabled = self.Config.CompressionOptions.RunLengthArrays == true
 	local packedEnabled = self.Config.CompressionOptions.BitPackedIntegers == true or rleEnabled
 	local codecModes = alwaysCompressed and (rleEnabled and {"legacy", "compact", "packed", "rle"} or (packedEnabled and {"legacy", "compact", "packed"} or {"legacy", "compact"})) or {rleEnabled and "rle" or (packedEnabled and "packed" or (self.Config.CompressionOptions.CompactEncoding == true and "compact" or "legacy"))}
+	-- A failed optional candidate must not invalidate other encodings of this record.
+	-- Preserve strict refusal when all candidates fail; never silently discard data.
+	local candidateFailures = 0
+	local firstCandidateError: string? = nil
+	local function evaluateCandidate(options: any): (any?, number, string?, any?, string?)
+		local ok, encoded, report = pcall(self.CompressionEngine.CompressTablePacket, storageRecord, options)
+		if not ok then return nil, math.huge, nil, nil, "COMPRESSED_ENCODE_FAILED:" .. tostring(encoded) end
+		if typeof(encoded) ~= "buffer" then return nil, math.huge, nil, nil, "COMPRESSED_ENCODE_INVALID_BUFFER" end
+		if typeof(report) ~= "table" then report = {EngineVersion = self.CompressionEngineVersion, EncodedBytes = buffer.len(encoded)} end
+		local selectedCodec = tonumber(report.CodecVersion) or codec
+		if selectedCodec ~= 230 and selectedCodec ~= 231 and selectedCodec ~= 232 and selectedCodec ~= 233 then return nil, math.huge, nil, nil, "UNSUPPORTED_COMPRESSION_CODEC:" .. tostring(selectedCodec) end
+		if selectedCodec == 231 and tonumber(self.CompressionEngine.CompactCodecVersion) ~= 231 then return nil, math.huge, nil, nil, "COMPACT_COMPRESSION_UNAVAILABLE" end
+		if selectedCodec == 232 and tonumber(self.CompressionEngine.PackedCodecVersion) ~= 232 then return nil, math.huge, nil, nil, "PACKED_COMPRESSION_UNAVAILABLE" end
+		if selectedCodec == 233 and tonumber(self.CompressionEngine.RunLengthCodecVersion) ~= 233 then return nil, math.huge, nil, nil, "RLE_COMPRESSION_UNAVAILABLE" end
+		local candidate, candidateBytes, candidateTransport = nil, math.huge, nil
+		local transportError: string? = nil
+		if transport == "auto" or transport == "buffer" then
+			local envelope = {Format = RECORD_FORMAT, Codec = selectedCodec, Compressed = true, Encoding = "buffer", Payload = encoded}
+			local bytes, sizeError = self:_MeasureStoredValue(envelope)
+			if bytes ~= nil then candidate, candidateBytes, candidateTransport = envelope, bytes, "buffer"
+			else transportError = "BUFFER_TRANSPORT_SIZE_MEASURE_FAILED:" .. tostring(sizeError) end
+		end
+		if transport == "auto" or transport == "base64" then
+			local success, base64Buffer = pcall(EncodingService.Base64Encode, EncodingService, encoded)
+			if success then
+				local payload = buffer.tostring(base64Buffer)
+				local envelope = {Format = RECORD_FORMAT, Codec = selectedCodec, Compressed = true, Encoding = "base64", Payload = payload}
+				local size = self.CompressedEnvelopeBaseBytes + #payload
+				if alwaysCompressed then
+					local measured, measureErr = self:_MeasureStoredValue(envelope)
+					if measured ~= nil then size = measured
+					else size = math.huge; transportError = transportError or "BASE64_TRANSPORT_SIZE_MEASURE_FAILED:" .. tostring(measureErr) end
+				end
+				if size < candidateBytes then candidate, candidateBytes, candidateTransport = envelope, size, "base64" end
+			else
+				transportError = transportError or "BASE64_ENCODE_FAILED:" .. tostring(base64Buffer)
+			end
+		end
+		if candidate == nil then return nil, math.huge, nil, nil, transportError or "NO_COMPRESSION_TRANSPORT_AVAILABLE" end
+		return candidate, candidateBytes, candidateTransport, report, nil
+	end
 	for _, codecMode in ipairs(codecModes) do
 		for _, dictionaryEnabled in ipairs(variants) do
 			local options = self.Config.CompressionOptions
@@ -1234,54 +1275,11 @@ function NexusDataStore:_EncodeRecord(record: any): (any?, string?, any?)
 					options.RunLengthArrays = codecMode == "rle"
 				end
 			end
-			local ok, encoded, report = pcall(self.CompressionEngine.CompressTablePacket, storageRecord, options)
-			if not ok then
-				return nil, "COMPRESSED_ENCODE_FAILED:" .. tostring(encoded)
-			end
-			if typeof(encoded) ~= "buffer" then
-				return nil, "COMPRESSED_ENCODE_INVALID_BUFFER"
-			end
-			if typeof(report) ~= "table" then
-				report = {EngineVersion = self.CompressionEngineVersion, EncodedBytes = buffer.len(encoded)}
-			end
-			local selectedCodec = tonumber(report.CodecVersion) or codec
-			if selectedCodec ~= 230 and selectedCodec ~= 231 and selectedCodec ~= 232 and selectedCodec ~= 233 then return nil, "UNSUPPORTED_COMPRESSION_CODEC:" .. tostring(selectedCodec) end
-			if selectedCodec == 231 and tonumber(self.CompressionEngine.CompactCodecVersion) ~= 231 then return nil, "COMPACT_COMPRESSION_UNAVAILABLE" end
-			if selectedCodec == 232 and tonumber(self.CompressionEngine.PackedCodecVersion) ~= 232 then return nil, "PACKED_COMPRESSION_UNAVAILABLE" end
-			if selectedCodec == 233 and tonumber(self.CompressionEngine.RunLengthCodecVersion) ~= 233 then return nil, "RLE_COMPRESSION_UNAVAILABLE" end
-			local candidate, candidateBytes, candidateTransport = nil, math.huge, nil
-			if transport == "auto" or transport == "buffer" then
-				local envelope = {Format = RECORD_FORMAT, Codec = selectedCodec, Compressed = true, Encoding = "buffer", Payload = encoded}
-				local bytes, sizeError = self:_MeasureStoredValue(envelope)
-				if bytes ~= nil then
-					candidate, candidateBytes, candidateTransport = envelope, bytes, "buffer"
-				elseif transport == "buffer" then
-					return nil, "BUFFER_TRANSPORT_SIZE_MEASURE_FAILED:" .. tostring(sizeError)
-				end
-			end
-			if transport == "auto" or transport == "base64" then
-				local success, base64Buffer = pcall(EncodingService.Base64Encode, EncodingService, encoded)
-				if not success then
-					if transport == "base64" or candidate == nil then
-						return nil, "BASE64_ENCODE_FAILED:" .. tostring(base64Buffer)
-					end
-				else
-					local payload = buffer.tostring(base64Buffer)
-					local envelope = {Format = RECORD_FORMAT, Codec = selectedCodec, Compressed = true, Encoding = "base64", Payload = payload}
-					local size = self.CompressedEnvelopeBaseBytes + #payload
-					if alwaysCompressed then
-						-- Measure the full persisted envelope for exact size-first selection.
-						local measured, measureErr = self:_MeasureStoredValue(envelope)
-						if measured == nil then return nil, "BASE64_TRANSPORT_SIZE_MEASURE_FAILED:" .. tostring(measureErr) end
-						size = measured
-					end
-					if size < candidateBytes then
-						candidate = envelope
-						candidateBytes, candidateTransport = size, "base64"
-					end
-				end
-			end
-			if candidate ~= nil and candidateBytes < bestBytes then
+			local candidate, candidateBytes, candidateTransport, report, failure = evaluateCandidate(options)
+			if candidate == nil then
+				candidateFailures += 1
+				firstCandidateError = firstCandidateError or failure
+			elseif candidateBytes < bestBytes then
 				bestEnvelope, bestBytes, bestTransport, bestReport = candidate, candidateBytes, candidateTransport, report
 				bestReport.DictionaryEnabled = dictionaryEnabled
 				bestReport.CompactEncoding = codecMode ~= "legacy"
@@ -1291,8 +1289,9 @@ function NexusDataStore:_EncodeRecord(record: any): (any?, string?, any?)
 		end
 	end
 	if bestEnvelope == nil then
-		return nil, "NO_COMPRESSION_TRANSPORT_AVAILABLE"
+		return nil, firstCandidateError or "NO_COMPRESSION_TRANSPORT_AVAILABLE"
 	end
+	bestReport.CandidateFailures = candidateFailures
 	bestReport.RawStorageEstimate = rawBytes
 	bestReport.CompactLock = hasCompactLock
 	bestReport.AlternativeCodecCandidates = #variants * #codecModes
@@ -1301,12 +1300,14 @@ function NexusDataStore:_EncodeRecord(record: any): (any?, string?, any?)
 	local forceEncode = self.Config.CompressionStrategy == "balanced" and self.Config.CompressionOptions.AllowExpansion == true
 	if not enforceCompressed and rawBytes <= self.Config.MaxStoredBytes and not forceEncode and bestBytes >= rawBytes then
 		rawReport.DictionaryEnabled = bestReport.DictionaryEnabled
-		rawReport.AlternativeCodecCandidates = #variants
+		rawReport.AlternativeCodecCandidates = #variants * #codecModes
+		rawReport.CandidateFailures = candidateFailures
 		rawReport.SelectionReason = "raw-smaller-or-equal"
 		return storageRecord, nil, rawReport
 	end
 	if bestBytes > self.Config.MaxStoredBytes then
 		if not enforceCompressed and rawBytes <= self.Config.MaxStoredBytes then
+			rawReport.CandidateFailures = candidateFailures
 			rawReport.SelectionReason = "compressed-exceeds-limit"
 			return storageRecord, nil, rawReport
 		end
@@ -2739,7 +2740,7 @@ function NexusDataStore:GetStorageForecast(dataOrSession: any, warningRatio: num
 		Transport = report.Transport, IncludesSessionLock = sessionReport, RawStorageEstimate = report.RawStorageEstimate,
 		SelectedCodec = report.SelectedCodec, Compressed = report.PersistedCompressed, SelectionReason = report.SelectionReason,
 		SavedStorageBytes = report.SavedStorageBytes, ExpansionBytes = report.ExpansionBytes,
-		CandidatesChecked = report.AlternativeCodecCandidates, RunLengthRuns = report.RunLengthRuns, RunLengthValues = report.RunLengthValues,
+		CandidatesChecked = report.AlternativeCodecCandidates, CandidateFailures = report.CandidateFailures, RunLengthRuns = report.RunLengthRuns, RunLengthValues = report.RunLengthValues,
 		PackedIntegerValues = report.PackedIntegerValues,
 		PackedIntegerValueBits = report.PackedIntegerValueBits}
 end
