@@ -1,5 +1,5 @@
 --!strict
--- Roblox Studio server regression tests for Compression v2.5.0 (legacy 230, compact 231, packed 232).
+-- Roblox Studio server regression tests for Compression v2.6.0 (legacy 230, compact 231, packed 232, RLE 233).
 -- Place this Script beside a ModuleScript named Compression and run Play/Run.
 local Compression = require(script.Parent:WaitForChild("Compression"))
 
@@ -39,9 +39,9 @@ local function makePacket(payload: {number}, codec: number?): buffer
     return packet
 end
 
-assert(Compression.Version() == "2.5.0", "Unexpected compression version")
-assert(Compression.CodecVersion == 230 and Compression.CompactCodecVersion == 231 and Compression.PackedCodecVersion == 232, "Codec compatibility changed")
-assert(Compression.TableMode({}) == "buffer-v230" and Compression.TableMode({}, {CompactEncoding = true}) == "buffer-v231" and Compression.TableMode({}, {BitPackedIntegers = true}) == "buffer-v232", "Packet modes changed")
+assert(Compression.Version() == "2.6.0", "Unexpected compression version")
+assert(Compression.CodecVersion == 230 and Compression.CompactCodecVersion == 231 and Compression.PackedCodecVersion == 232 and Compression.RunLengthCodecVersion == 233, "Codec compatibility changed")
+assert(Compression.TableMode({}) == "buffer-v230" and Compression.TableMode({}, {CompactEncoding = true}) == "buffer-v231" and Compression.TableMode({}, {BitPackedIntegers = true}) == "buffer-v232" and Compression.TableMode({}, {RunLengthArrays = true}) == "buffer-v233", "Packet modes changed")
 
 local fixtures = {
     {Name = "empty table", Value = {}},
@@ -180,4 +180,54 @@ passed += 1
 assertRejected(makePacket({0, 10, 8, 1, 0}, 231), "UNKNOWN_TAG")
 passed += 1
 
-print(("Compression v2.5.0 codec230/231/232 regression PASS: %d cases"):format(passed))
+
+-- RLE chooses the smallest representation for runs of repeated inventory strings,
+-- flat values and flags; mixed and alternating arrays retain safe legacy encoding.
+local repeatedStrings, repeatedIntegers, repeatedBooleans = {}, {}, {}
+for i = 1, 256 do
+    repeatedStrings[i] = i <= 128 and "Potion" or "Sword"
+    repeatedIntegers[i] = 0
+    repeatedBooleans[i] = true
+end
+for _, fixture in ipairs({
+    {Name = "inventory", Value = {Inventory = repeatedStrings}},
+    {Name = "counters", Value = {Counters = repeatedIntegers}},
+    {Name = "flags", Value = {Flags = repeatedBooleans}},
+}) do
+    local base = Compression.CompressTablePacket(fixture.Value, {BitPackedIntegers = true, StringDictionary = true})
+    local packed, report = Compression.CompressTablePacket(fixture.Value, {RunLengthArrays = true, StringDictionary = true})
+    assert(report.CodecVersion == 233 and report.RunLengthArrays >= 1, "Expected RLE: " .. fixture.Name)
+    assert(report.RunLengthValues >= 256, "Missing RLE value metrics")
+    assert(buffer.len(packed) < buffer.len(base), "RLE did not reduce bytes: " .. fixture.Name)
+    assert(equals(Compression.DecompressTable(packed), fixture.Value), "RLE roundtrip changed values")
+    print(("RLE %s packet: %d -> %d bytes"):format(fixture.Name, buffer.len(base), buffer.len(packed)))
+    passed += 1
+end
+for length = 0, 255 do
+    local values = {}
+    for i = 1, length do
+        local item = (math.floor(i / 3) + length) % 5
+        values[i] = item == 0 and "Ruby" or (item == 1 and false or (item == 2 and 4 or (item == 3 and "Bow" or 1.5)))
+    end
+    local original = {Items = values, Status = true}
+    local encoded, report = Compression.CompressTablePacket(original, {RunLengthArrays = true, StringDictionary = length % 2 == 0})
+    assert(report.CodecVersion == 233)
+    assert(equals(Compression.DecompressTable(encoded), original), "RLE mixed boundary loss " .. tostring(length))
+    passed += 1
+end
+assertRejected(makePacket({0, 11, 4, 1, 0, 2}, 233), "INVALID_RLE_RUN_LENGTH")
+passed += 1
+assertRejected(makePacket({0, 11, 4, 1, 5, 2}, 233), "INVALID_RLE_RUN_LENGTH")
+passed += 1
+assertRejected(makePacket({0, 11, 4, 1, 2, 2}, 233), "INVALID_RLE_TOTAL_LENGTH")
+passed += 1
+assertRejected(makePacket({0, 11, 4, 2, 2, 2, 2, 2}, 233), "NON_CANONICAL_RLE_RUN")
+passed += 1
+assertRejected(makePacket({0, 11, 4, 1, 4, 0}, 233), "INVALID_RLE_SCALAR")
+passed += 1
+assertRejected(makePacket({0, 11, 4, 4}, 233), "INVALID_RLE_ARRAY_COUNT")
+passed += 1
+assertRejected(makePacket({0, 11, 4, 1, 4, 2}, 232), "UNKNOWN_TAG")
+passed += 1
+
+print(("Compression v2.6.0 codec230/231/232/233 regression PASS: %d cases"):format(passed))
