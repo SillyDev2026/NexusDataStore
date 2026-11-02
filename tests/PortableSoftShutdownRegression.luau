@@ -104,5 +104,38 @@ shutdownTest("Disabled feature ignores restart event and remains idle", function
     assert(store:GetSoftShutdownStatus().Status == "idle" and not store.SoftShutdownFrozen)
 end)
 
+shutdownTest("Shutdown closes independent profiles without leaving locks", function()
+    local store = newShutdownStore()
+    store.OpenInFlight = 0
+    store.Sessions = {}
+    local released = 0
+    for i = 1, 8 do
+        local session = {Active = true}
+        session.IsActive = function(self) return self.Active end
+        store.Sessions[tostring(i)] = session
+    end
+    store.ReleaseAsync = function(_self, session)
+        released += 1
+        session.Active = false
+        return true
+    end
+    local ok, err = store:CloseAsync(5)
+    assert(ok and err == nil and released == 8 and store.Closed, tostring(err))
+end)
+
+shutdownTest("Failed lock release does not report close success or freeze store permanently", function()
+    local store = newShutdownStore()
+    store.OpenInFlight = 0
+    local session = {Active = true}
+    session.IsActive = function(self) return self.Active end
+    store.Sessions = {Player = session}
+    store.ReleaseAsync = function() return false, "BUDGET_TIMEOUT" end
+    local ok, err = store:CloseAsync(5)
+    assert(not ok and err == "BUDGET_TIMEOUT")
+    assert(not store.Closed and not store.Closing and not store.SoftShutdownFrozen and session.Active)
+    store.ReleaseAsync = function(_self, item) item.Active = false; return true end
+    assert(store:CloseAsync(5), "Failed close could not be retried")
+end)
+
 print(string.format("Soft shutdown tests: %d passed, %d failed", shutdownPass, shutdownFail))
 assert(shutdownFail == 0, "Soft shutdown regression failed")
