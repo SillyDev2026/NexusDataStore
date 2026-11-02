@@ -2,19 +2,63 @@
 
 **Typed, session-aware data persistence for Roblox.**
 
-![Version](https://img.shields.io/badge/NexusDataStore-7.10.0-2563eb)
-![Codec](https://img.shields.io/badge/Compression-2.6.0-0f766e)
+![Version](https://img.shields.io/badge/NexusDataStore-8.0.0-2563eb)
+![Codec](https://img.shields.io/badge/Compression-2.6.1-0f766e)
 ![Luau](https://img.shields.io/badge/language-Luau-00a2ff)
 ![Platform](https://img.shields.io/badge/platform-Roblox-222222)
 
 NexusDataStore brings standard Roblox DataStore persistence, session ownership, typed player profiles, validation, migrations, snapshots, adaptive compression, and numeric leaderboards into one server-side library.
 
-**Current version:** `7.10.0` · **Compression:** `2.6.0` / codecs `230`–`233` · **Record format:** `700`
+**Current version:** `8.0.0` · **Compression:** `2.6.1` / codecs `230`–`233` · **Record format:** `700`
 
 > [!IMPORTANT]
 > This documentation describes the current source on `main`. Regression scripts are included, but production reliability and performance have not been certified by live-server load testing. Use a separate test universe before deploying changes to existing player data.
 
-## New in 7.10.0 — Built-in soft shutdown and session-safe Roblox updates
+## New in 8.0.0 — Reliability, compression correctness and restart hardening
+
+NexusDataStore **v8.0.0** is a major maintenance release built on v7.10.0. It preserves existing data, record format `700`, codecs `230`–`233`, and the soft-shutdown feature. There is **no mandatory migration for saved records**.
+
+### Compression v2.6.1
+
+- **Lossless signed zero:** Integer tagging could previously turn IEEE-754 `-0.0` into `0.0`. It now uses a floating-point tag and is excluded from lossy run grouping; v230–v233 readers remain compatible.
+- **Candidate isolation:** An optional codec/transport failure cannot abort other valid candidate encodings. Compression reports and forecasts expose `CandidateFailures`.
+- **Safe fallback:** Adaptive mode can persist the validated raw record when every compressor fails and the raw value fits storage limits. Mandatory compression modes **never** silently fall back to raw.
+- No data is discarded; size improvements depend on actual player data.
+
+### Soft-shutdown and save/load
+
+- **Concurrent critical flush:** A pool of up to six workers saves different player profiles during the restart window. Each profile retains its authoritative session lock and `UpdateAsync` commit fencing.
+- **Pre-save/final-save race:** A delayed early flush no longer claims the final save is ready. Final freeze and flush are still required.
+- **Restart recovery:** Failed releases do not count as successful and the store can retry closing safely.
+- **Multi-store isolation:** Restart UI identity and replicated profile-ready/error attributes are keyed by the configured store `Name`. The UI still accepts legacy v7.10 transfer screens.
+- **Cleanup:** Transferred UI references are cleared after profile loading, and its countdown loop terminates when the player leaves.
+
+### Recommended configuration
+
+~~~lua
+local Store = NexusDataStore.new({
+    Name = "PlayerData",
+    Template = PlayersData,
+    Compression = true,
+    CompressionPolicy = "always-smallest",
+    CompressionTransport = "auto",
+    CompressionOptions = {StringDictionary = true, BitPackedIntegers = true, RunLengthArrays = true},
+    AutoPlayerLifecycle = true,
+    EnableSoftShutdown = true,
+    WaitForSessionLock = true,
+    SoftShutdownPreSaveSeconds = 20,
+    SoftShutdownFreezeSeconds = 6,
+    SoftShutdownCloseTimeout = 25,
+    AutoSave = true,
+    BudgetAware = true,
+})
+~~~
+
+Install the current `SoftShutdownClient.client.lua` as a **LocalScript in ReplicatedFirst** and make its `STORE_NAME` match your `Name`. Roblox Creator Dashboard **Restart Servers**, not a normal publish, performs the update migration. As before, deploy compatible decoders across all running servers before enabling any new codec.
+
+**Production limitations:** Automated Luau and simulated failures do not certify Roblox infrastructure. Test delayed updates, loading, failed writes, and multiple simultaneous sessions in a published test universe before relying on v8 in production.
+
+## Previously in 7.10.0 — Built-in soft shutdown and session-safe Roblox updates
 
 This version adds a **fully opt-in restart coordinator** and a drop-in, responsive restart screen. It listens for Roblox's supported `game.ServerRestartScheduled` event, saves before the scheduled restart, freezes normal NexusDataStore mutations for the final save, and releases session locks in parallel when the server closes. The **actual teleport is performed by Roblox Restart Servers**; NexusDataStore intentionally does not launch a competing teleport that could strand players or bypass session ownership.
 
