@@ -109,7 +109,7 @@ required = (
     "SchemaMigrationRegression.server.lua", "CompressionRegression.server.lua",
     "ForcedBufferRegression.server.lua", "SessionLockWaitRegression.server.lua", "SessionHandoffRegression.server.lua",
     "AlwaysCompressedRegression.server.lua", "PortableCompressionPolicyRegression.luau",
-    "CompactCodecRegression.server.lua", "PackedIntegerCodecRegression.server.lua",
+    "CompactCodecRegression.server.lua", "PackedIntegerCodecRegression.server.lua", "RunLengthPersistenceRegression.server.lua",
     "MillionLocalBenchmark.server.lua", "MillionMockBackendBenchmark.server.lua",
 )
 check("core regression and benchmark scripts exist", all((test_dir / name).is_file() for name in required))
@@ -130,6 +130,8 @@ compact_test = (test_dir / "CompactCodecRegression.server.lua").read_text(encodi
 check("v230/v231 cross-format record regression present", all(token in compact_test for token in ("COMPRESSED_ENVELOPE_CODEC_MISMATCH", "Codec == 230", "Codec == 231", "StorageBytes")))
 packed_test = (test_dir / "PackedIntegerCodecRegression.server.lua").read_text(encoding="utf-8")
 check("v232 Studio mocks and byte reporting", all(token in packed_test for token in ("Codec == 232", "PackedIntegerValueBits", "GetStorageForecast", "COMPRESSED_ENVELOPE_CODEC_MISMATCH")))
+rle_test = (test_dir / "RunLengthPersistenceRegression.server.lua").read_text(encoding="utf-8")
+check("RLE Studio mock covers load/save/release, cross-decode and byte savings", all(token in rle_test for token in ("OpenAsync", "SaveAsync", "ReleaseAsync", "RunLengthArrays", "StorageBytes < oldReport.StorageBytes")))
 for filename, required_count in (
     ("MillionLocalBenchmark.server.lua", 32),
     ("MillionMockBackendBenchmark.server.lua", 21),
