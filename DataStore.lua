@@ -297,7 +297,7 @@ local activeSoftShutdownStores = setmetatable({}, {__mode = "k"})
 
 local NexusDataStore: any = {}
 NexusDataStore.__index = NexusDataStore
-NexusDataStore.Version = "8.4.1"
+NexusDataStore.Version = "8.4.2"
 NexusDataStore.RecordFormat = 700
 NexusDataStore.RequiredCompressionVersion = "2.3.0"
 

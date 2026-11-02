@@ -2,19 +2,36 @@
 
 **Typed, session-aware data persistence for Roblox.**
 
-![Version](https://img.shields.io/badge/NexusDataStore-8.4.1-2563eb)
+![Version](https://img.shields.io/badge/NexusDataStore-8.4.2-2563eb)
 ![Codec](https://img.shields.io/badge/Compression-2.6.1-0f766e)
 ![Luau](https://img.shields.io/badge/language-Luau-00a2ff)
 ![Platform](https://img.shields.io/badge/platform-Roblox-222222)
 
 NexusDataStore brings standard Roblox DataStore persistence, session ownership, typed player profiles, validation, migrations, snapshots, adaptive compression, and numeric leaderboards into one server-side library.
 
-**Current version:** `8.4.1` · **Compression:** `2.6.1` / codecs `230`–`233` · **Record format:** `700`
+**Current version:** `8.4.2` · **Compression:** `2.6.1` / codecs `230`–`233` · **Record format:** `700`
 
 > [!IMPORTANT]
 > This documentation describes the current source on `main`. Regression scripts are included, but production reliability and performance have not been certified by live-server load testing. Use a separate test universe before deploying changes to existing player data.
 
-## New in 8.4.1 — Neon Horizon animated shutdown background
+## New in 8.4.2 — Cleaner shutdown animations and readable typography
+
+The `ReplicatedFirst/SoftShutdownClient.client.lua` animation has been refined for smoother motion and less visual clutter, while keeping the same neon-blue GIF-style horizon, Save → Transfer → Restore states, and session-safe update system.
+
+- **No more snapping light scan.** The old modulo-based scan jumped straight back to the beginning each loop. The light now eases back and forth continuously.
+- **Reduced rendering overhead.** Core and progress animations still run from `RunService.PreRender` and use true elapsed-frame time, but decorative background properties update at most 30 times per second. In reduced-FPS mode, decorative updates remain paused.
+- **Subtle phase transitions.** Text changes use a short 0.22-second fade instead of disappearing to 90% transparency. Intro slide distance and ambient motion have also been reduced.
+- **Readable typography.** The title, status, description, banner, phase timeline and icon use `UITextSizeConstraint` with role-specific minimum and maximum sizes. `TextScaled` remains active, and every UI `Position` and `Size` remains `UDim2.fromScale`.
+- **Simplified text.** Saving, retrying, teleporting and restoring messages are shorter and clearer. Status updates that repeat identical information are ignored rather than restarting animations.
+- **No save behavior changes.** `DataStore.lua` is version-bumped, but the actual save/load, auto-publish, session locking, record format 700 and Compression 2.6.1 remain unchanged.
+
+### Installation
+
+Replace `ReplicatedFirst/SoftShutdownClient.client.lua` with the latest file. Set `STORE_NAME = "PlayerData"` and optionally `BACKGROUND_IMAGE_ID = "rbxassetid://135793690711172"` for the previously uploaded image. No extra ScreenGui setup is needed. `REDUCED_MOTION = true` disables continuous effects.
+
+**Testing:** Run a Studio-local preview using the restart RemoteEvent to show `scheduled`, `saving`, `retrying`, `ready`, `moving`, `arriving` and `error` states; test phone portrait and landscape emulation. The browser-only mockups and CI checks do **not** certify live Roblox rendering. Verify real teleportation separately in a published test place.
+
+## Previously in 8.4.1 — Neon Horizon animated shutdown background
 
 The actual **ReplicatedFirst LocalScript** now uses the cinematic blue/violet horizon background from the NexusDataStore GIF-style preview: a glowing horizon, converging perspective floor, blue-lit data towers, distant stars, a partial rotating HUD ring, sweeping floor arcs, and a subtle cyan scan streak. The current glassy Save → Transfer → Restore card and phase colors are preserved.
 
