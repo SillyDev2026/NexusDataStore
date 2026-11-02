@@ -16,7 +16,7 @@ local store: any = DataStore.new({
     BudgetAware = false,
     RetryAttempts = 1,
 })
-assert(store:GetVersion() == "8.3.0")
+assert(store:GetVersion() == "8.4.0")
 assert(compression.Version() == "2.6.1")
 local stored: any = nil
 local failNextAcknowledgement = false
@@ -66,4 +66,4 @@ assert(session:ReleaseAsync())
 assert(not session:IsActive())
 assert(store:CloseAsync())
 assert(uncachedReads == 2 and updates >= 4, "Unexpected backend request accounting")
-print("NexusDataStore v8.3.0 load/save acknowledgement and codec regression PASS")
+print("NexusDataStore v8.4.0 load/save acknowledgement and codec regression PASS")

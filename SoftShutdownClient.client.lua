@@ -121,7 +121,7 @@ end
 
 local function phaseColor(status: string): Color3
     if status == "ready" or status == "arriving" then return successAccent end
-    if status == "retrying" then return warningAccent end
+    if status == "retrying" or status == "teleport-retrying" then return warningAccent end
     if status == "error" then return dangerAccent end
     return accent
 end
@@ -579,7 +579,7 @@ local function update(status: string, target: number, message: string)
         if phaseFill then animateState(phaseFill, {BackgroundColor3 = shade}) end
 
         -- Explicit stage transitions: save success is not proof of teleport or load success.
-        local currentStep = status == "ready" and 2 or (status == "arriving" or status == "error") and 3 or 1
+        local currentStep = (status == "ready" or status == "moving" or status == "teleport-retrying") and 2 or (status == "arriving" or status == "error") and 3 or 1
         for index, step in ipairs(phaseSteps) do
             local completed = index < currentStep
             local active = index == currentStep
@@ -611,6 +611,16 @@ local function update(status: string, target: number, message: string)
         statusText.Text = "Moving to updated server"
         description.Text = "The server is ready for Roblox to complete the restart."
         phaseLabel.Text = "AWAITING SERVER MIGRATION"
+    elseif status == "moving" then
+        title.Text = "Joining the updated server"
+        statusText.Text = "Teleporting your party..."
+        description.Text = "Saved player profiles are being transferred to a fresh server. Your progress stays in DataStore."
+        phaseLabel.Text = "TRANSFERRING TO UPDATED SERVER"
+    elseif status == "teleport-retrying" then
+        title.Text = "Reconnecting players"
+        statusText.Text = "Retrying the server transfer..."
+        description.Text = "Teleport failed to start for one or more players. Saving is complete; retrying the connection."
+        phaseLabel.Text = "RETRYING SERVER TRANSFER"
     elseif status == "arriving" then
         title.Text = "Welcome back"
         statusText.Text = "Acquiring your profile..."

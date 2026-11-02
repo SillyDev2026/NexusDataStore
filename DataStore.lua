@@ -123,6 +123,9 @@ export type StoreConfig<T> = {
 	PlayerKey: ((player: Player) -> string | number)?,
 	AutoPlayerLifecycle: boolean?,
 	EnableSoftShutdown: boolean?,
+	AutoRestartOnPublish: boolean?,
+	AutoPublishPollInterval: number?,
+	AutoPublishCountdownSeconds: number?,
 	SoftShutdownPreSaveSeconds: number?,
 	SoftShutdownFreezeSeconds: number?,
 	SoftShutdownCloseTimeout: number?,
@@ -255,6 +258,7 @@ export type Store<T> = {
 	GetHealth: (self: Store<T>) -> {[string]: any},
 	AttachPlayerLifecycle: (self: Store<T>) -> (),
 	GetSoftShutdownStatus: (self: Store<T>) -> {[string]: any},
+	GetAutoPublishStatus: (self: Store<T>) -> {[string]: any},
 	BindToClose: (self: Store<T>) -> (),
 	CloseAsync: (self: Store<T>, timeout: number?) -> (boolean, string?),
 	On: (self: Store<T>, eventName: string, callback: (...any) -> ()) -> any,
@@ -286,10 +290,14 @@ local HttpService = game:GetService("HttpService")
 local MessagingService = game:GetService("MessagingService")
 local EncodingService = game:GetService("EncodingService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local InsertService = game:GetService("InsertService")
+local TeleportService = game:GetService("TeleportService")
+local RunService = game:GetService("RunService")
+local activeSoftShutdownStores = setmetatable({}, {__mode = "k"})
 
 local NexusDataStore: any = {}
 NexusDataStore.__index = NexusDataStore
-NexusDataStore.Version = "8.3.0"
+NexusDataStore.Version = "8.4.0"
 NexusDataStore.RecordFormat = 700
 NexusDataStore.RequiredCompressionVersion = "2.3.0"
 
@@ -2320,7 +2328,10 @@ function NexusDataStore:_BackgroundLoop()
 					table.insert(sessions, session)
 				end
 				local currentTime = now()
-				if self.Config.EnableSoftShutdown then self:_SoftShutdownTick(os.time()) end
+				if self.Config.EnableSoftShutdown then
+					self:_SoftShutdownTick(os.time())
+					if self.Config.AutoRestartOnPublish then self:_AutoPublishTeleportTick(os.time()) end
+				end
 				for _, session in ipairs(sessions) do
 					if session:IsActive() then
 						-- Controlled mutations already mark Dirty. Only scan a clean session for
@@ -2535,7 +2546,7 @@ function NexusDataStore:_SoftShutdownTick(timestamp: number)
 	end
 	if state.SavePending or timestamp < state.NextAttempt then return end
 	if final and state.FinalSaved then
-		if state.Status ~= "ready" then self:_SetSoftShutdownStatus("ready") end
+		if state.Source ~= "AutoPublish" and state.Status ~= "ready" then self:_SetSoftShutdownStatus("ready") end
 		return
 	end
 	if not final and state.PreSaved then return end
@@ -2565,6 +2576,141 @@ function NexusDataStore:_SoftShutdownTick(timestamp: number)
 			self:_Fire("SoftShutdownSaveFailed", tostring(ok and err or result))
 		end
 	end)
+end
+
+-- Best-effort Studio publish detection. InsertService returns asset VERSION IDs,
+-- not PlaceVersion numbers or an authoritative publish notification.
+-- Two consecutive identical changed readings avoid single-sample glitches.
+function NexusDataStore:_CheckAutoPublishVersion(): (boolean, string?)
+	if not self.Config.AutoRestartOnPublish or self.Closing or self.Closed or self.SoftShutdownState then return false, "NOT_MONITORING" end
+	local ran, version = pcall(InsertService.GetLatestAssetVersionAsync, InsertService, game.PlaceId)
+	self.Metrics.AutoPublishChecks += 1
+	if not ran or not safeInteger(version) or version <= 0 then
+		self.Metrics.AutoPublishCheckFailed += 1
+		self.AutoPublishLastError = tostring(version)
+		self:_Fire("AutoPublishCheckFailed", self.AutoPublishLastError)
+		return false, "VERSION_QUERY_FAILED"
+	end
+	self.AutoPublishLastError = nil
+	if self.AutoPublishBaseline == nil then
+		self.AutoPublishBaseline = version
+		return false, "BASELINE_READY"
+	end
+	if version == self.AutoPublishBaseline then
+		self.AutoPublishCandidate = nil
+		self.AutoPublishCandidatesSeen = 0
+		return false, "CURRENT_VERSION"
+	end
+	if self.AutoPublishCandidate ~= version then
+		self.AutoPublishCandidate = version
+		self.AutoPublishCandidatesSeen = 1
+		return false, "CANDIDATE_CHANGED"
+	end
+	self.AutoPublishCandidatesSeen += 1
+	if self.AutoPublishCandidatesSeen < 2 then return false, "CANDIDATE_PENDING" end
+	if self.SoftShutdownState then return false, "RESTART_ALREADY_SCHEDULED" end
+	local scheduleAt = os.time() + self.Config.AutoPublishCountdownSeconds
+	self:_OnServerRestartScheduled(DateTime.fromUnixTimestamp(scheduleAt), {Name = "AutoPublish"}, {
+		message = "A new game update was detected. Securing progress before joining an updated server.",
+	})
+	local scheduledStores = 1
+	for store in pairs(activeSoftShutdownStores) do
+		if store ~= self and store.Config.EnableSoftShutdown and not store.Closed and not store.Closing and store.SoftShutdownState == nil then
+			store:_OnServerRestartScheduled(DateTime.fromUnixTimestamp(scheduleAt), {Name = "AutoPublish"}, {
+				message = "A new game update was detected. Securing progress before joining an updated server.",
+			})
+			scheduledStores += 1
+		end
+	end
+	if scheduledStores == 0 then return false, "NO_ACTIVE_STORES" end
+	self.Metrics.AutoPublishDetected += 1
+	self:_Fire("AutoPublishDetected", self.AutoPublishBaseline, version, scheduledStores)
+	return true
+end
+
+function NexusDataStore:_StartAutoPublishWatch()
+	if self.AutoPublishWatchStarted then return end
+	self.AutoPublishWatchStarted = true
+	task.spawn(function()
+		while not self.Closed and not self.Closing and self.SoftShutdownState == nil do
+			self:_CheckAutoPublishVersion()
+			if self.SoftShutdownState then break end
+			task.wait(self.Config.AutoPublishPollInterval)
+		end
+	end)
+	self.AutoPublishTeleportFailureConnection = TeleportService.TeleportInitFailed:Connect(function(player, _, err, placeId)
+		local state = self.SoftShutdownState
+		if not state or state.Source ~= "AutoPublish" or not state.TeleportAttempted then return end
+		if placeId ~= game.PlaceId or player.Parent ~= Players then return end
+		state.TeleportStarted = false
+		state.NextTeleportAttempt = os.time() + 5
+		self.Metrics.AutoPublishTeleportFailed += 1
+		self:_SetSoftShutdownStatus("teleport-retrying")
+		self:_Fire("AutoPublishTeleportFailed", tostring(err))
+	end)
+end
+
+function NexusDataStore:_AutoPublishTeleportTick(timestamp: number)
+	local state = self.SoftShutdownState
+	if not state or state.Source ~= "AutoPublish" or self.Closing or self.Closed then return end
+	if timestamp < state.RestartAt or not state.FinalSaved then return end
+	if state.TeleportStarted and timestamp >= (state.TeleportStartedAt or timestamp) + 30 then
+		-- In case teleport initiation succeeded but a player remained with no failure callback.
+		state.TeleportStarted = false
+		state.NextTeleportAttempt = timestamp + 5
+		self:_SetSoftShutdownStatus("teleport-retrying")
+	end
+	if self.AutoPublishTeleportBusy or state.TeleportStarted or timestamp < (state.NextTeleportAttempt or 0) then return end
+	for store in pairs(activeSoftShutdownStores) do
+		local peer = store.SoftShutdownState
+		if store.Config.EnableSoftShutdown and not store.Closed and not store.Closing
+			and (not peer or peer.Source ~= "AutoPublish" or not peer.FinalSaved) then return end
+	end
+	local players = Players:GetPlayers()
+	if #players == 0 then return end
+	self.AutoPublishTeleportBusy = true
+	state.TeleportStarted = true
+	state.TeleportStartedAt = timestamp
+	state.TeleportAttempted = true
+	self:_SetSoftShutdownStatus("moving")
+	self.Metrics.AutoPublishTeleportAttempts += 1
+	task.spawn(function()
+		local ok, err = pcall(function()
+			if not self.AutoPublishTeleportOptions then
+				local options = Instance.new("TeleportOptions")
+				-- New GUID -> fresh destination, avoids routing players back into outdated public servers.
+				options.ReservedServerId = HttpService:GenerateGUID(false)
+				self.AutoPublishTeleportOptions = options
+			end
+			-- Roblox supports at most 50 players in one TeleportAsync request.
+			for index = 1, #players, 50 do
+				local batch = {}
+				for position = index, math.min(index + 49, #players) do
+					if players[position].Parent == Players then table.insert(batch, players[position]) end
+				end
+				if #batch > 0 then TeleportService:TeleportAsync(game.PlaceId, batch, self.AutoPublishTeleportOptions) end
+			end
+		end)
+		self.AutoPublishTeleportBusy = false
+		if not ok and self.SoftShutdownState == state and not self.Closed then
+			state.TeleportStarted = false
+			state.NextTeleportAttempt = os.time() + 5
+			self.Metrics.AutoPublishTeleportFailed += 1
+			self:_SetSoftShutdownStatus("teleport-retrying")
+			self:_Fire("AutoPublishTeleportFailed", tostring(err))
+		end
+	end)
+end
+
+function NexusDataStore:GetAutoPublishStatus(): {[string]: any}
+	local state = self.SoftShutdownState
+	return {
+		Enabled = self.Config.AutoRestartOnPublish == true, BaselineAssetVersion = self.AutoPublishBaseline,
+		CandidateAssetVersion = self.AutoPublishCandidate, CandidateChecks = self.AutoPublishCandidatesSeen,
+		LastError = self.AutoPublishLastError, RestartScheduled = state ~= nil and state.Source == "AutoPublish",
+		TeleportStarted = state ~= nil and state.TeleportStarted == true,
+		PollInterval = self.Config.AutoPublishPollInterval,
+	}
 end
 
 function NexusDataStore:GetSoftShutdownStatus(): {[string]: any}
@@ -2653,6 +2799,8 @@ function NexusDataStore:CloseAsync(timeout: number?): (boolean, string?)
 		self:_Fire("CloseFailed", firstError)
 		return false, firstError
 	end
+	activeSoftShutdownStores[self] = nil
+	if self.AutoPublishTeleportFailureConnection then self.AutoPublishTeleportFailureConnection:Disconnect() end
 	if self.ServerRestartConnection then self.ServerRestartConnection:Disconnect() end
 	if self.CrossServerSubscription then
 		pcall(function()
@@ -3880,6 +4028,8 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 	assert(config.WaitForSessionLock == nil or typeof(config.WaitForSessionLock) == "boolean", "WaitForSessionLock must be a boolean")
 	assert(config.EnableSessionHandoff == nil or typeof(config.EnableSessionHandoff) == "boolean", "EnableSessionHandoff must be a boolean")
 	assert(config.EnableSoftShutdown == nil or typeof(config.EnableSoftShutdown) == "boolean", "EnableSoftShutdown must be a boolean")
+	assert(config.AutoRestartOnPublish == nil or typeof(config.AutoRestartOnPublish) == "boolean", "AutoRestartOnPublish must be a boolean")
+	assert(config.AutoRestartOnPublish ~= true or config.EnableSoftShutdown == true, "AutoRestartOnPublish requires EnableSoftShutdown = true")
 	assert(config.EnableSoftShutdown ~= true or config.AutoPlayerLifecycle ~= false, "Soft shutdown requires player lifecycle management")
 	assert(config.SoftShutdownFreezeSeconds == nil or config.SoftShutdownPreSaveSeconds == nil or config.SoftShutdownFreezeSeconds <= config.SoftShutdownPreSaveSeconds, "SoftShutdownFreezeSeconds must not exceed SoftShutdownPreSaveSeconds")
 	assert(config.OrderedDataStores == nil or typeof(config.OrderedDataStores) == "table", "OrderedDataStores must be a table")
@@ -3948,6 +4098,9 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 		PlayerKey = config.PlayerKey,
 		AutoPlayerLifecycle = config.AutoPlayerLifecycle == true,
 		EnableSoftShutdown = config.EnableSoftShutdown == true,
+		AutoRestartOnPublish = config.AutoRestartOnPublish == true,
+		AutoPublishPollInterval = configNumber(config.AutoPublishPollInterval, 60, 30, "AutoPublishPollInterval", false, 600),
+		AutoPublishCountdownSeconds = configNumber(config.AutoPublishCountdownSeconds, 45, 25, "AutoPublishCountdownSeconds", false, 600),
 		SoftShutdownPreSaveSeconds = configNumber(config.SoftShutdownPreSaveSeconds, 20, 5, "SoftShutdownPreSaveSeconds"),
 		SoftShutdownFreezeSeconds = configNumber(config.SoftShutdownFreezeSeconds, 6, 1, "SoftShutdownFreezeSeconds"),
 		SoftShutdownCloseTimeout = configNumber(config.SoftShutdownCloseTimeout, 25, 5, "SoftShutdownCloseTimeout", false, 28),
@@ -3989,10 +4142,23 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 	self.SoftShutdownState = nil
 	self.SoftShutdownRemote = nil
 	self.ServerRestartConnection = nil
+	self.AutoPublishBaseline = nil
+	self.AutoPublishCandidate = nil
+	self.AutoPublishCandidatesSeen = 0
+	self.AutoPublishLastError = nil
+	self.AutoPublishTeleportOptions = nil
+	self.AutoPublishTeleportBusy = false
+	self.AutoPublishTeleportFailureConnection = nil
+	self.AutoPublishWatchStarted = false
 	self.Metrics = {
 		Opened = 0,
 		Released = 0,
 		RestartsScheduled = 0,
+		AutoPublishChecks = 0,
+		AutoPublishCheckFailed = 0,
+		AutoPublishDetected = 0,
+		AutoPublishTeleportAttempts = 0,
+		AutoPublishTeleportFailed = 0,
 		SoftShutdownFlushes = 0,
 		SoftShutdownFlushFailed = 0,
 		LoadsFailed = 0,
@@ -4101,8 +4267,10 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 			self:_OnServerRestartScheduled(restartTime, source, attributes)
 		end)
 		self:BindToClose()
+		activeSoftShutdownStores[self] = true
 	end
 	self:_BackgroundLoop()
+	if self.Config.AutoRestartOnPublish and not RunService:IsStudio() and game.PlaceId > 0 then self:_StartAutoPublishWatch() end
 	if self.Config.AutoPlayerLifecycle or self.Config.EnableSoftShutdown then
 		self:AttachPlayerLifecycle()
 	end
