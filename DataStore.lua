@@ -289,7 +289,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local NexusDataStore: any = {}
 NexusDataStore.__index = NexusDataStore
-NexusDataStore.Version = "7.10.0"
+NexusDataStore.Version = "8.0.0"
 NexusDataStore.RecordFormat = 700
 NexusDataStore.RequiredCompressionVersion = "2.3.0"
 
@@ -1222,6 +1222,47 @@ function NexusDataStore:_EncodeRecord(record: any): (any?, string?, any?)
 	local rleEnabled = self.Config.CompressionOptions.RunLengthArrays == true
 	local packedEnabled = self.Config.CompressionOptions.BitPackedIntegers == true or rleEnabled
 	local codecModes = alwaysCompressed and (rleEnabled and {"legacy", "compact", "packed", "rle"} or (packedEnabled and {"legacy", "compact", "packed"} or {"legacy", "compact"})) or {rleEnabled and "rle" or (packedEnabled and "packed" or (self.Config.CompressionOptions.CompactEncoding == true and "compact" or "legacy"))}
+	-- A failed optional candidate must not invalidate other encodings of this record.
+	-- Preserve strict refusal when all candidates fail; never silently discard data.
+	local candidateFailures = 0
+	local firstCandidateError: string? = nil
+	local function evaluateCandidate(options: any): (any?, number, string?, any?, string?)
+		local ok, encoded, report = pcall(self.CompressionEngine.CompressTablePacket, storageRecord, options)
+		if not ok then return nil, math.huge, nil, nil, "COMPRESSED_ENCODE_FAILED:" .. tostring(encoded) end
+		if typeof(encoded) ~= "buffer" then return nil, math.huge, nil, nil, "COMPRESSED_ENCODE_INVALID_BUFFER" end
+		if typeof(report) ~= "table" then report = {EngineVersion = self.CompressionEngineVersion, EncodedBytes = buffer.len(encoded)} end
+		local selectedCodec = tonumber(report.CodecVersion) or codec
+		if selectedCodec ~= 230 and selectedCodec ~= 231 and selectedCodec ~= 232 and selectedCodec ~= 233 then return nil, math.huge, nil, nil, "UNSUPPORTED_COMPRESSION_CODEC:" .. tostring(selectedCodec) end
+		if selectedCodec == 231 and tonumber(self.CompressionEngine.CompactCodecVersion) ~= 231 then return nil, math.huge, nil, nil, "COMPACT_COMPRESSION_UNAVAILABLE" end
+		if selectedCodec == 232 and tonumber(self.CompressionEngine.PackedCodecVersion) ~= 232 then return nil, math.huge, nil, nil, "PACKED_COMPRESSION_UNAVAILABLE" end
+		if selectedCodec == 233 and tonumber(self.CompressionEngine.RunLengthCodecVersion) ~= 233 then return nil, math.huge, nil, nil, "RLE_COMPRESSION_UNAVAILABLE" end
+		local candidate, candidateBytes, candidateTransport = nil, math.huge, nil
+		local transportError: string? = nil
+		if transport == "auto" or transport == "buffer" then
+			local envelope = {Format = RECORD_FORMAT, Codec = selectedCodec, Compressed = true, Encoding = "buffer", Payload = encoded}
+			local bytes, sizeError = self:_MeasureStoredValue(envelope)
+			if bytes ~= nil then candidate, candidateBytes, candidateTransport = envelope, bytes, "buffer"
+			else transportError = "BUFFER_TRANSPORT_SIZE_MEASURE_FAILED:" .. tostring(sizeError) end
+		end
+		if transport == "auto" or transport == "base64" then
+			local success, base64Buffer = pcall(EncodingService.Base64Encode, EncodingService, encoded)
+			if success then
+				local payload = buffer.tostring(base64Buffer)
+				local envelope = {Format = RECORD_FORMAT, Codec = selectedCodec, Compressed = true, Encoding = "base64", Payload = payload}
+				local size = self.CompressedEnvelopeBaseBytes + #payload
+				if alwaysCompressed then
+					local measured, measureErr = self:_MeasureStoredValue(envelope)
+					if measured ~= nil then size = measured
+					else size = math.huge; transportError = transportError or "BASE64_TRANSPORT_SIZE_MEASURE_FAILED:" .. tostring(measureErr) end
+				end
+				if size < candidateBytes then candidate, candidateBytes, candidateTransport = envelope, size, "base64" end
+			else
+				transportError = transportError or "BASE64_ENCODE_FAILED:" .. tostring(base64Buffer)
+			end
+		end
+		if candidate == nil then return nil, math.huge, nil, nil, transportError or "NO_COMPRESSION_TRANSPORT_AVAILABLE" end
+		return candidate, candidateBytes, candidateTransport, report, nil
+	end
 	for _, codecMode in ipairs(codecModes) do
 		for _, dictionaryEnabled in ipairs(variants) do
 			local options = self.Config.CompressionOptions
@@ -1234,54 +1275,11 @@ function NexusDataStore:_EncodeRecord(record: any): (any?, string?, any?)
 					options.RunLengthArrays = codecMode == "rle"
 				end
 			end
-			local ok, encoded, report = pcall(self.CompressionEngine.CompressTablePacket, storageRecord, options)
-			if not ok then
-				return nil, "COMPRESSED_ENCODE_FAILED:" .. tostring(encoded)
-			end
-			if typeof(encoded) ~= "buffer" then
-				return nil, "COMPRESSED_ENCODE_INVALID_BUFFER"
-			end
-			if typeof(report) ~= "table" then
-				report = {EngineVersion = self.CompressionEngineVersion, EncodedBytes = buffer.len(encoded)}
-			end
-			local selectedCodec = tonumber(report.CodecVersion) or codec
-			if selectedCodec ~= 230 and selectedCodec ~= 231 and selectedCodec ~= 232 and selectedCodec ~= 233 then return nil, "UNSUPPORTED_COMPRESSION_CODEC:" .. tostring(selectedCodec) end
-			if selectedCodec == 231 and tonumber(self.CompressionEngine.CompactCodecVersion) ~= 231 then return nil, "COMPACT_COMPRESSION_UNAVAILABLE" end
-			if selectedCodec == 232 and tonumber(self.CompressionEngine.PackedCodecVersion) ~= 232 then return nil, "PACKED_COMPRESSION_UNAVAILABLE" end
-			if selectedCodec == 233 and tonumber(self.CompressionEngine.RunLengthCodecVersion) ~= 233 then return nil, "RLE_COMPRESSION_UNAVAILABLE" end
-			local candidate, candidateBytes, candidateTransport = nil, math.huge, nil
-			if transport == "auto" or transport == "buffer" then
-				local envelope = {Format = RECORD_FORMAT, Codec = selectedCodec, Compressed = true, Encoding = "buffer", Payload = encoded}
-				local bytes, sizeError = self:_MeasureStoredValue(envelope)
-				if bytes ~= nil then
-					candidate, candidateBytes, candidateTransport = envelope, bytes, "buffer"
-				elseif transport == "buffer" then
-					return nil, "BUFFER_TRANSPORT_SIZE_MEASURE_FAILED:" .. tostring(sizeError)
-				end
-			end
-			if transport == "auto" or transport == "base64" then
-				local success, base64Buffer = pcall(EncodingService.Base64Encode, EncodingService, encoded)
-				if not success then
-					if transport == "base64" or candidate == nil then
-						return nil, "BASE64_ENCODE_FAILED:" .. tostring(base64Buffer)
-					end
-				else
-					local payload = buffer.tostring(base64Buffer)
-					local envelope = {Format = RECORD_FORMAT, Codec = selectedCodec, Compressed = true, Encoding = "base64", Payload = payload}
-					local size = self.CompressedEnvelopeBaseBytes + #payload
-					if alwaysCompressed then
-						-- Measure the full persisted envelope for exact size-first selection.
-						local measured, measureErr = self:_MeasureStoredValue(envelope)
-						if measured == nil then return nil, "BASE64_TRANSPORT_SIZE_MEASURE_FAILED:" .. tostring(measureErr) end
-						size = measured
-					end
-					if size < candidateBytes then
-						candidate = envelope
-						candidateBytes, candidateTransport = size, "base64"
-					end
-				end
-			end
-			if candidate ~= nil and candidateBytes < bestBytes then
+			local candidate, candidateBytes, candidateTransport, report, failure = evaluateCandidate(options)
+			if candidate == nil then
+				candidateFailures += 1
+				firstCandidateError = firstCandidateError or failure
+			elseif candidateBytes < bestBytes then
 				bestEnvelope, bestBytes, bestTransport, bestReport = candidate, candidateBytes, candidateTransport, report
 				bestReport.DictionaryEnabled = dictionaryEnabled
 				bestReport.CompactEncoding = codecMode ~= "legacy"
@@ -1291,8 +1289,15 @@ function NexusDataStore:_EncodeRecord(record: any): (any?, string?, any?)
 		end
 	end
 	if bestEnvelope == nil then
-		return nil, "NO_COMPRESSION_TRANSPORT_AVAILABLE"
+		if not enforceCompressed and rawBytes <= self.Config.MaxStoredBytes then
+			rawReport.SelectionReason = "compression-failed-raw-fallback"
+			rawReport.CandidateFailures = candidateFailures
+			rawReport.CompressionError = firstCandidateError
+			return storageRecord, nil, rawReport
+		end
+		return nil, firstCandidateError or "NO_COMPRESSION_TRANSPORT_AVAILABLE"
 	end
+	bestReport.CandidateFailures = candidateFailures
 	bestReport.RawStorageEstimate = rawBytes
 	bestReport.CompactLock = hasCompactLock
 	bestReport.AlternativeCodecCandidates = #variants * #codecModes
@@ -1301,12 +1306,14 @@ function NexusDataStore:_EncodeRecord(record: any): (any?, string?, any?)
 	local forceEncode = self.Config.CompressionStrategy == "balanced" and self.Config.CompressionOptions.AllowExpansion == true
 	if not enforceCompressed and rawBytes <= self.Config.MaxStoredBytes and not forceEncode and bestBytes >= rawBytes then
 		rawReport.DictionaryEnabled = bestReport.DictionaryEnabled
-		rawReport.AlternativeCodecCandidates = #variants
+		rawReport.AlternativeCodecCandidates = #variants * #codecModes
+		rawReport.CandidateFailures = candidateFailures
 		rawReport.SelectionReason = "raw-smaller-or-equal"
 		return storageRecord, nil, rawReport
 	end
 	if bestBytes > self.Config.MaxStoredBytes then
 		if not enforceCompressed and rawBytes <= self.Config.MaxStoredBytes then
+			rawReport.CandidateFailures = candidateFailures
 			rawReport.SelectionReason = "compressed-exceeds-limit"
 			return storageRecord, nil, rawReport
 		end
@@ -2358,8 +2365,48 @@ function NexusDataStore:_BackgroundLoop()
 	end)
 end
 
+-- Concurrent flush is limited to six workers so large servers don't serialize
+-- every critical profile save, while respecting Roblox request budgets.
+function NexusDataStore:_FlushShutdownConcurrent(deadline: number): (boolean, string?)
+	local sessions = {}
+	for _, session in pairs(self.Sessions) do
+		if session:IsActive() then sessions[#sessions + 1] = session end
+	end
+	if #sessions == 0 then return true end
+	local index = 1
+	local pending = math.min(6, #sessions)
+	local firstError: string? = nil
+	for _ = 1, pending do
+		task.spawn(function()
+			while true do
+				if now() >= deadline then firstError = firstError or "FLUSH_TIMEOUT"; break end
+				local slot = index
+				index += 1
+				if slot > #sessions then break end
+				local session = sessions[slot]
+				if session:IsActive() then
+					local ran, valid, err = pcall(function()
+						self:_DetectDirectChanges(session)
+						if session.Dirty then return self:SaveAsync(session, "critical") end
+						return true
+					end)
+					if not ran then firstError = firstError or "FLUSH_EXCEPTION:" .. tostring(valid)
+					elseif not valid then firstError = firstError or tostring(err) end
+				end
+			end
+			pending -= 1
+		end)
+	end
+	while pending > 0 and now() < deadline do task.wait(0.02) end
+	if pending > 0 then return false, "FLUSH_TIMEOUT" end
+	if firstError then return false, firstError end
+	return true
+end
+
 function NexusDataStore:FlushAsync(timeout: number?): (boolean, string?)
+	if timeout ~= nil and (not finiteNumber(timeout) or timeout <= 0) then return false, "INVALID_FLUSH_TIMEOUT" end
 	local deadline = now() + (timeout or self.Config.SaveTimeout)
+	if self.Config.EnableSoftShutdown and self.SoftShutdownState then return self:_FlushShutdownConcurrent(deadline) end
 	local sessions = {}
 	for _, session in pairs(self.Sessions) do
 		table.insert(sessions, session)
@@ -2396,16 +2443,16 @@ function NexusDataStore:ReleaseAllAsync(): {[string]: any}
 end
 
 function NexusDataStore:_HandleLifecycleJoin(player: Player)
-	if self.Config.EnableSoftShutdown then player:SetAttribute("NexusDataStoreProfileReady", false) end
+	if self.Config.EnableSoftShutdown then player:SetAttribute("NexusDataStoreProfileReady_" .. self.Config.Name, false) end
 	local session, err = self:OpenPlayerAsync(player)
 	if not session then
-		if self.Config.EnableSoftShutdown and player.Parent == Players then player:SetAttribute("NexusDataStoreProfileError", tostring(err)) end
+		if self.Config.EnableSoftShutdown and player.Parent == Players then player:SetAttribute("NexusDataStoreProfileError_" .. self.Config.Name, tostring(err)) end
 		self:_Fire("PlayerLoadFailed", player, err)
 		return
 	end
 	if self.Config.EnableSoftShutdown and player.Parent == Players then
-		player:SetAttribute("NexusDataStoreProfileError", nil)
-		player:SetAttribute("NexusDataStoreProfileReady", true)
+		player:SetAttribute("NexusDataStoreProfileError_" .. self.Config.Name, nil)
+		player:SetAttribute("NexusDataStoreProfileReady_" .. self.Config.Name, true)
 	end
 	if player.Parent ~= Players then
 		local released, releaseErr = self:ReleaseAsync(session)
@@ -2462,9 +2509,9 @@ function NexusDataStore:_SetSoftShutdownStatus(status: string)
 end
 
 function NexusDataStore:_OnServerRestartScheduled(restartTime: any, source: any, attributes: any)
-	if not self.Config.EnableSoftShutdown or self.Closed then return end
+	if not self.Config.EnableSoftShutdown or self.Closed or self.Closing then return end
 	local timestamp = restartTime and restartTime.UnixTimestamp
-	if not finiteNumber(timestamp) then return end
+	if not finiteNumber(timestamp) or timestamp < 0 then return end
 	local message = typeof(attributes) == "table" and attributes.message or nil
 	if typeof(message) ~= "string" or #message == 0 then message = "Game servers are updating. Your progress is being saved." end
 	message = string.sub(message, 1, 180)
@@ -2502,7 +2549,14 @@ function NexusDataStore:_SoftShutdownTick(timestamp: number)
 		if ok and result == true then
 			if isFinal then state.FinalSaved = true else state.PreSaved = true end
 			self.Metrics.SoftShutdownFlushes += 1
-			self:_SetSoftShutdownStatus(isFinal and "ready" or "scheduled")
+			if self.SoftShutdownFrozen and not isFinal then
+				-- An early flush finished after the final-save window began.
+				-- Don't claim the update is ready; the final flush is still required.
+				state.NextAttempt = 0
+				self:_SetSoftShutdownStatus("saving")
+			else
+				self:_SetSoftShutdownStatus(isFinal and "ready" or "scheduled")
+			end
 		else
 			state.SaveFailures += 1
 			state.NextAttempt = os.time() + 2
@@ -2739,7 +2793,7 @@ function NexusDataStore:GetStorageForecast(dataOrSession: any, warningRatio: num
 		Transport = report.Transport, IncludesSessionLock = sessionReport, RawStorageEstimate = report.RawStorageEstimate,
 		SelectedCodec = report.SelectedCodec, Compressed = report.PersistedCompressed, SelectionReason = report.SelectionReason,
 		SavedStorageBytes = report.SavedStorageBytes, ExpansionBytes = report.ExpansionBytes,
-		CandidatesChecked = report.AlternativeCodecCandidates, RunLengthRuns = report.RunLengthRuns, RunLengthValues = report.RunLengthValues,
+		CandidatesChecked = report.AlternativeCodecCandidates, CandidateFailures = report.CandidateFailures, RunLengthRuns = report.RunLengthRuns, RunLengthValues = report.RunLengthValues,
 		PackedIntegerValues = report.PackedIntegerValues,
 		PackedIntegerValueBits = report.PackedIntegerValueBits}
 end

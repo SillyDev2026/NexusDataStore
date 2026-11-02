@@ -99,11 +99,17 @@ local function varUIntBytes(value: number): number
 	return count
 end
 
+-- Preserve IEEE-754 signed zero: integer tags and run equality would erase its sign.
+local function isNegativeZero(value: number): boolean
+	return value == 0 and 1 / value == -math.huge
+end
+
 local function isInteger(value: number): boolean
 	return finiteNumber(value)
 		and value >= -MAX_SAFE_INTEGER
 		and value <= MAX_SAFE_INTEGER
 		and value % 1 == 0
+		and not isNegativeZero(value)
 end
 
 local function normalizeOptions(options: Options?): Options
@@ -687,7 +693,7 @@ local function writeValue(
 			for index = 1, count do
 				local current = value[index]
 				local encodedBytes, rawBytes = scalarEncodedCost(current, dictionary, options)
-				if encodedBytes == nil then supported = false; break end
+				if encodedBytes == nil or (typeof(current) == "number" and isNegativeZero(current)) then supported = false; break end
 				normalBytes += encodedBytes
 				totalRawBytes += rawBytes :: number
 				if typeof(current) ~= "boolean" then allBoolean = false end
@@ -1032,7 +1038,7 @@ end
 
 -- Returns the codec version exposed to dependent modules.
 function Compression.Version(): string
-	return "2.6.0"
+	return "2.6.1"
 end
 
 -- Returns the stable table codec mode identifier.
@@ -1041,7 +1047,7 @@ function Compression.TableMode(_value: any, options: Options?): string
 	return normalized.RunLengthArrays and "buffer-v233" or (normalized.BitPackedIntegers and "buffer-v232" or (normalized.CompactEncoding and "buffer-v231" or "buffer-v230"))
 end
 
--- Encodes using the unchanged v2.3 packet format with the v2.3.4 engine.
+-- Encodes v230-v233 packets without altering the existing on-disk wire format.
 function Compression.CompressTablePacket(value: any, options: Options?): (buffer, Report)
 	local normalized = normalizeOptions(options)
 	local dictionary, lookup, dictionaryBytes, scannedNodes = buildDictionary(value, normalized)
@@ -1108,7 +1114,7 @@ function Compression.CompressTablePacket(value: any, options: Options?): (buffer
 	return output, report
 end
 
--- Decodes and validates a v2.3 packet with allocation and corruption guards.
+-- Decodes legacy and extended packets with bounded allocation and corruption guards.
 function Compression.DecompressTable(source: buffer, options: Options?): any
 	assert(typeof(source) == "buffer", "DecompressTable expects a buffer")
 	if buffer.len(source) < HEADER_BYTES then

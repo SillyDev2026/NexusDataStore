@@ -1,5 +1,5 @@
 --!strict
--- Roblox Studio server regression tests for Compression v2.6.0 (legacy 230, compact 231, packed 232, RLE 233).
+-- Roblox Studio server regression tests for Compression v2.6.1 (legacy 230, compact 231, packed 232, RLE 233).
 -- Place this Script beside a ModuleScript named Compression and run Play/Run.
 local Compression = require(script.Parent:WaitForChild("Compression"))
 
@@ -39,7 +39,7 @@ local function makePacket(payload: {number}, codec: number?): buffer
     return packet
 end
 
-assert(Compression.Version() == "2.6.0", "Unexpected compression version")
+assert(Compression.Version() == "2.6.1", "Unexpected compression version")
 assert(Compression.CodecVersion == 230 and Compression.CompactCodecVersion == 231 and Compression.PackedCodecVersion == 232 and Compression.RunLengthCodecVersion == 233, "Codec compatibility changed")
 assert(Compression.TableMode({}) == "buffer-v230" and Compression.TableMode({}, {CompactEncoding = true}) == "buffer-v231" and Compression.TableMode({}, {BitPackedIntegers = true}) == "buffer-v232" and Compression.TableMode({}, {RunLengthArrays = true}) == "buffer-v233", "Packet modes changed")
 
@@ -230,4 +230,29 @@ passed += 1
 assertRejected(makePacket({0, 11, 4, 1, 4, 2}, 232), "UNKNOWN_TAG")
 passed += 1
 
-print(("Compression v2.6.0 codec230/231/232/233 regression PASS: %d cases"):format(passed))
+
+-- Prevent a subtle but real lossless-codec bug: IEEE negative zero must not
+-- become positive zero through small-integer, packed-array, or RLE tags.
+local negativeZero = -0.0
+assert(1 / negativeZero == -math.huge, "Luau fixture did not preserve negative zero")
+for _, options in ipairs({
+    {StringDictionary = false},
+    {CompactEncoding = true, StringDictionary = false},
+    {BitPackedIntegers = true, StringDictionary = false},
+    {RunLengthArrays = true, StringDictionary = false},
+}) do
+    local values = {}
+    for i = 1, 96 do values[i] = i % 4 == 0 and negativeZero or (i % 4 == 1 and 0 or (i % 4 == 2 and 1 or -1)) end
+    local packet = Compression.CompressTablePacket({Values = values, Zero = negativeZero}, options)
+    local decoded = Compression.DecompressTable(packet)
+    assert(1 / decoded.Zero == -math.huge, "Scalar negative zero sign lost")
+    for i = 1, #values do
+        assert(decoded.Values[i] == values[i], "Array numerical value changed")
+        if values[i] == 0 then
+            assert(1 / decoded.Values[i] == 1 / values[i], "Array negative-zero sign lost")
+        end
+    end
+    passed += 1
+end
+
+print(("Compression v2.6.1 codec230/231/232/233 regression PASS: %d cases"):format(passed))

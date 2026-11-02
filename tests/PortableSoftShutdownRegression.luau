@@ -137,5 +137,55 @@ shutdownTest("Failed lock release does not report close success or freeze store 
     assert(store:CloseAsync(5), "Failed close could not be retried")
 end)
 
+shutdownTest("Parallel shutdown flush saves every dirty profile exactly once", function()
+    local store = newShutdownStore()
+    local saved = {}
+    store.Sessions = {}
+    store.SoftShutdownState = {Status = "saving"}
+    store._DetectDirectChanges = function() end
+    store.SaveAsync = function(_self, session, priority)
+        assert(priority == "critical")
+        saved[session.Key] = (saved[session.Key] or 0) + 1
+        session.Dirty = false
+        return true
+    end
+    for index = 1, 24 do
+        local session = {Active = true, Dirty = true, Key = tostring(index)}
+        session.IsActive = function(self) return self.Active end
+        store.Sessions[session.Key] = session
+    end
+    local ok, err = store:FlushAsync(5)
+    assert(ok and err == nil, tostring(err))
+    local count = 0
+    for _, calls in pairs(saved) do assert(calls == 1); count += 1 end
+    assert(count == 24, "Not every dirty session was saved")
+end)
+
+shutdownTest("Partial flush failure is reported rather than falsely acknowledged", function()
+    local store = newShutdownStore()
+    store.Sessions = {}
+    store.SoftShutdownState = {Status = "saving"}
+    store._DetectDirectChanges = function() end
+    store.SaveAsync = function(_self, session)
+        if session.Key == "2" then return false, "SIMULATED_BUDGET_ERROR" end
+        session.Dirty = false
+        return true
+    end
+    for i = 1, 12 do
+        local session = {Active = true, Dirty = true, Key = tostring(i)}
+        session.IsActive = function(self) return self.Active end
+        store.Sessions[session.Key] = session
+    end
+    local ok, err = store:FlushAsync(5)
+    assert(not ok and err == "SIMULATED_BUDGET_ERROR", tostring(err))
+    assert(store.Sessions["2"].Dirty, "Failed record was incorrectly marked clean")
+end)
+
+shutdownTest("Invalid flush deadlines are rejected before touching player sessions", function()
+    local store = newShutdownStore()
+    local ok, err = store:FlushAsync(-1)
+    assert(not ok and err == "INVALID_FLUSH_TIMEOUT")
+end)
+
 print(string.format("Soft shutdown tests: %d passed, %d failed", shutdownPass, shutdownFail))
 assert(shutdownFail == 0, "Soft shutdown regression failed")
