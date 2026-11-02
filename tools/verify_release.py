@@ -48,7 +48,7 @@ check("RLE encoder compares exact array costs", 'local competingBytes = normalBy
 check("RLE decoder rejects hostile run lengths", 'NON_CANONICAL_RLE_RUN' in codec and 'INVALID_RLE_TOTAL_LENGTH' in codec and 'INVALID_RLE_SCALAR' in codec)
 check("RLE does not mutate source and exposes diagnostics", 'RunLengthRuns = writeState.RunLengthRuns' in codec and 'RunLengthValues = report.RunLengthValues' in data)
 check("RLE selection supports eight candidates", '"legacy", "compact", "packed", "rle"' in data and 'selectedCodec ~= 233' in data)
-check("v7.9 documented opt-in and safe rollout", '## New in 7.9.0' in readme and 'RunLengthArrays = true' in readme and 'Safe rollout' in readme)
+check("v7.9 documented opt-in and safe rollout", '## Previously in 7.9.0' in readme and 'RunLengthArrays = true' in readme and 'Safe rollout' in readme)
 check("v7.8 README documents rolling upgrades", '## Previously in 7.8.0' in readme and 'BitPackedIntegers = true' in readme and 'Safe rollout' in readme)
 check("store envelope carries selected packet codec", 'Codec = selectedCodec' in data and 'COMPRESSED_ENVELOPE_CODEC_MISMATCH' in data)
 check("compact setting documented with staged rollout", '## Previously in 7.6.0' in readme and 'CompactEncoding = true' in readme and 'Safe deployment order' in readme)
