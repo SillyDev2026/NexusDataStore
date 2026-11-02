@@ -50,4 +50,4 @@ local compactPacket = Compression.CompressTablePacket(template, {CompactEncoding
 assert(buffer.readu16(legacyPacket, 4) == 230 and buffer.readu16(compactPacket, 4) == 231)
 assert(Compression.DecompressTable(compactPacket).Flags[64] == flags[64])
 assert(oldStore:CloseAsync() and newStore:CloseAsync())
-print(("NexusDataStore v8.1.0 record codec regression PASS: %d -> %d record bytes"):format(oldReport.StorageBytes, compactReport.StorageBytes))
+print(("NexusDataStore v8.2.0 record codec regression PASS: %d -> %d record bytes"):format(oldReport.StorageBytes, compactReport.StorageBytes))

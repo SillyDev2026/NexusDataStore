@@ -1,7 +1,8 @@
 --!strict
--- NexusDataStore v8.1 restart interface: scale-only layout, animated notices and teleport arrival.
+-- NexusDataStore v8.2 cinematic restart UI: responsive scale-only layout, stage-aware motion.
 -- Install this LocalScript in ReplicatedFirst and set STORE_NAME to the DataStore Name.
 local STORE_NAME = "PlayerData"
+local REDUCED_MOTION = false -- Set true to disable continuous animations and shorten transitions.
 local Players = game:GetService("Players")
 local ReplicatedFirst = game:GetService("ReplicatedFirst")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -15,9 +16,15 @@ local guiName = "NexusRestartGui_" .. STORE_NAME
 local readyAttribute = "NexusDataStoreProfileReady_" .. STORE_NAME
 local errorAttribute = "NexusDataStoreProfileError_" .. STORE_NAME
 local accent = Color3.fromRGB(86, 191, 255)
+local successAccent = Color3.fromRGB(101, 236, 186)
+local dangerAccent = Color3.fromRGB(255, 129, 151)
+local warningAccent = Color3.fromRGB(255, 200, 109)
+local violetAccent = Color3.fromRGB(172, 133, 255)
 local normal = Color3.fromRGB(230, 242, 255)
 local muted = Color3.fromRGB(157, 179, 207)
 local panelColor = Color3.fromRGB(17, 31, 55)
+local stateTextFade = TweenInfo.new(0.48, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+local accentEase = TweenInfo.new(0.55, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
 local infoEase = TweenInfo.new(0.38, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
 local fadeEase = TweenInfo.new(0.28, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 local moveEase = TweenInfo.new(1.55, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true)
@@ -34,6 +41,10 @@ local description: TextLabel? = nil
 local phaseLabel: TextLabel? = nil
 local progressTrack: Frame? = nil
 local phaseFill: Frame? = nil
+local accentLine: Frame? = nil
+local statusOrb: Frame? = nil
+local phaseSteps: {TextLabel} = {}
+local statusTweens: {Tween} = {}
 local activePresentation = "hidden"
 local currentStatus = "idle"
 local restartAt = 0
@@ -79,8 +90,31 @@ local function textLabel(parent: Instance, name: string, value: string, font: En
 end
 
 local function loopTween(object: Instance, config: TweenInfo, properties: {[string]: any}, bucket: {Tween})
+    if REDUCED_MOTION then return end
     local tween = TweenService:Create(object, config, properties)
     table.insert(bucket, tween)
+end
+
+local function cancelStatusTweens()
+    for _, tween in ipairs(statusTweens) do tween:Cancel() end
+    table.clear(statusTweens)
+end
+
+local function animateState(object: Instance, properties: {[string]: any}, info: TweenInfo?)
+    if REDUCED_MOTION then
+        for key, value in pairs(properties) do (object :: any)[key] = value end
+        return
+    end
+    local tween = TweenService:Create(object, info or accentEase, properties)
+    table.insert(statusTweens, tween)
+    tween:Play()
+end
+
+local function phaseColor(status: string): Color3
+    if status == "ready" or status == "arriving" then return successAccent end
+    if status == "retrying" then return warningAccent end
+    if status == "error" then return dangerAccent end
+    return accent
 end
 
 local function makeInterface(): ScreenGui
@@ -113,6 +147,28 @@ local function makeInterface(): ScreenGui
     backgroundGradient.Color = ColorSequence.new(Color3.fromRGB(8, 13, 26), Color3.fromRGB(20, 40, 69))
     backgroundGradient.Parent = backdrop
 
+    -- Decorative grid: lightweight, no rendering loop or texture download.
+    for index = 1, 9 do
+        local gridLine = Instance.new("Frame")
+        gridLine.Name = "GridX" .. index
+        gridLine.Position = UDim2.fromScale(index / 10, 0)
+        gridLine.Size = UDim2.fromScale(0.001, 1)
+        gridLine.BackgroundColor3 = Color3.fromRGB(92, 148, 211)
+        gridLine.BackgroundTransparency = 0.965
+        gridLine.BorderSizePixel = 0
+        gridLine.Parent = backdrop
+    end
+    for index = 1, 6 do
+        local gridLine = Instance.new("Frame")
+        gridLine.Name = "GridY" .. index
+        gridLine.Position = UDim2.fromScale(0, index / 7)
+        gridLine.Size = UDim2.fromScale(1, 0.001)
+        gridLine.BackgroundColor3 = Color3.fromRGB(92, 148, 211)
+        gridLine.BackgroundTransparency = 0.967
+        gridLine.BorderSizePixel = 0
+        gridLine.Parent = backdrop
+    end
+
     local glow = Instance.new("Frame")
     glow.Name = "AmbientGlow"
     glow.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -126,6 +182,21 @@ local function makeInterface(): ScreenGui
     loopTween(glow, TweenInfo.new(4.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {
         Position = UDim2.fromScale(0.7, 0.33),
         BackgroundTransparency = 0.91,
+    }, stageTweens)
+
+    local secondGlow = Instance.new("Frame")
+    secondGlow.Name = "SecondaryGlow"
+    secondGlow.AnchorPoint = Vector2.new(0.5, 0.5)
+    secondGlow.Position = UDim2.fromScale(0.16, 0.78)
+    secondGlow.Size = UDim2.fromScale(0.31, 0.43)
+    secondGlow.BackgroundColor3 = Color3.fromRGB(100, 54, 173)
+    secondGlow.BackgroundTransparency = 0.91
+    secondGlow.BorderSizePixel = 0
+    secondGlow.Parent = backdrop
+    corner(secondGlow, 1)
+    loopTween(secondGlow, TweenInfo.new(5.8, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {
+        Position = UDim2.fromScale(0.27, 0.67),
+        BackgroundTransparency = 0.95,
     }, stageTweens)
 
     local main = Instance.new("Frame")
@@ -153,20 +224,73 @@ local function makeInterface(): ScreenGui
     highlight.BorderSizePixel = 0
     highlight.Parent = main
     corner(highlight, 1)
+    accentLine = highlight
+    loopTween(highlight, TweenInfo.new(3.8, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {Position = UDim2.fromScale(0.62, 0)}, stageTweens)
 
-    local tag = textLabel(main, "Eyebrow", "NEXUS  /  LIVE SERVER UPDATE", Enum.Font.GothamBold, accent, UDim2.fromScale(0.13, 0.10), UDim2.fromScale(0.74, 0.095))
+    -- Circular animated data-core gives each state its own visual identity.
+    local core = Instance.new("Frame")
+    core.Name = "DataCore"
+    core.AnchorPoint = Vector2.new(0.5, 0.5)
+    core.Position = UDim2.fromScale(0.19, 0.355)
+    core.Size = UDim2.fromScale(0.16, 0.24)
+    core.BackgroundColor3 = Color3.fromRGB(25, 55, 87)
+    core.BackgroundTransparency = 0.28
+    core.BorderSizePixel = 0
+    core.Parent = main
+    local coreRatio = Instance.new("UIAspectRatioConstraint")
+    coreRatio.AspectRatio = 1
+    coreRatio.Parent = core
+    corner(core, 1)
+    stroke(core, Color3.fromRGB(92, 188, 247), 0.18)
+    local coreHalo = Instance.new("Frame")
+    coreHalo.Name = "Halo"
+    coreHalo.AnchorPoint = Vector2.new(0.5, 0.5)
+    coreHalo.Position = UDim2.fromScale(0.5, 0.5)
+    coreHalo.Size = UDim2.fromScale(0.85, 0.85)
+    coreHalo.BackgroundTransparency = 1
+    coreHalo.Parent = core
+    corner(coreHalo, 1)
+    local haloStroke = Instance.new("UIStroke")
+    haloStroke.Thickness = 2
+    haloStroke.Color = accent
+    haloStroke.Transparency = 0.12
+    haloStroke.Parent = coreHalo
+    local haloGradient = Instance.new("UIGradient")
+    haloGradient.Color = ColorSequence.new(accent, violetAccent)
+    haloGradient.Rotation = 0
+    haloGradient.Parent = haloStroke
+    loopTween(haloGradient, TweenInfo.new(8, Enum.EasingStyle.Linear, Enum.EasingDirection.Out, -1), {Rotation = 360}, stageTweens)
+    local coreIcon = textLabel(core, "Icon", "◆", Enum.Font.GothamBold, normal, UDim2.fromScale(0.2, 0.18), UDim2.fromScale(0.6, 0.64))
+    coreIcon.TextTransparency = 0.05
+    statusOrb = core
+    loopTween(core, TweenInfo.new(2.4, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {BackgroundTransparency = 0.56}, stageTweens)
+
+    local tag = textLabel(main, "Eyebrow", "NEXUS  /  SERVER MIGRATION", Enum.Font.GothamBold, accent, UDim2.fromScale(0.12, 0.10), UDim2.fromScale(0.76, 0.085))
     tag.TextTransparency = 0.03
 
-    title = textLabel(main, "Title", "Server update scheduled", Enum.Font.GothamBold, normal, UDim2.fromScale(0.08, 0.235), UDim2.fromScale(0.84, 0.205))
-    statusText = textLabel(main, "Status", "Preparing to migrate...", Enum.Font.GothamMedium, accent, UDim2.fromScale(0.1, 0.47), UDim2.fromScale(0.8, 0.10))
-    description = textLabel(main, "Description", "Your progress stays protected while the server updates.", Enum.Font.Gotham, muted, UDim2.fromScale(0.12, 0.6), UDim2.fromScale(0.76, 0.155))
+    title = textLabel(main, "Title", "Server update scheduled", Enum.Font.GothamBold, normal, UDim2.fromScale(0.32, 0.245), UDim2.fromScale(0.58, 0.18), Enum.TextXAlignment.Left)
+    statusText = textLabel(main, "Status", "Preparing to migrate...", Enum.Font.GothamMedium, accent, UDim2.fromScale(0.31, 0.445), UDim2.fromScale(0.59, 0.095), Enum.TextXAlignment.Left)
+    description = textLabel(main, "Description", "Your progress stays protected while the server updates.", Enum.Font.Gotham, muted, UDim2.fromScale(0.12, 0.565), UDim2.fromScale(0.76, 0.123))
 
-    phaseLabel = textLabel(main, "Phase", "CHECKING PROFILE", Enum.Font.GothamBold, muted, UDim2.fromScale(0.11, 0.815), UDim2.fromScale(0.78, 0.075), Enum.TextXAlignment.Left)
+    -- Three-stage timeline shows only server-confirmed milestones, never a made-up percentage.
+    local stepNames = {"01   SAVE", "02   TRANSFER", "03   RESTORE"}
+    table.clear(phaseSteps)
+    for index, label in ipairs(stepNames) do
+        local item = textLabel(main, "Step" .. index, label, Enum.Font.GothamBold, muted,
+            UDim2.fromScale(0.105 + (index - 1) * 0.275, 0.735),
+            UDim2.fromScale(0.24, 0.085))
+        item.BackgroundTransparency = 0.6
+        item.BackgroundColor3 = Color3.fromRGB(38, 67, 103)
+        corner(item, 0.25)
+        table.insert(phaseSteps, item)
+    end
+
+    phaseLabel = textLabel(main, "Phase", "CHECKING PROFILE", Enum.Font.GothamBold, muted, UDim2.fromScale(0.11, 0.845), UDim2.fromScale(0.78, 0.052), Enum.TextXAlignment.Left)
 
     local bar = Instance.new("Frame")
     bar.Name = "ProgressTrack"
     bar.Size = UDim2.fromScale(0.78, 0.023)
-    bar.Position = UDim2.fromScale(0.11, 0.922)
+    bar.Position = UDim2.fromScale(0.11, 0.934)
     bar.BackgroundColor3 = Color3.fromRGB(43, 68, 101)
     bar.BorderSizePixel = 0
     bar.ClipsDescendants = true
@@ -184,6 +308,14 @@ local function makeInterface(): ScreenGui
     corner(fill, 1)
     phaseFill = fill
     loopTween(fill, moveEase, {Position = UDim2.fromScale(0.78, 0)}, stageTweens)
+    local shine = Instance.new("UIGradient")
+    shine.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, accent),
+        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(225, 245, 255)),
+        ColorSequenceKeypoint.new(1, violetAccent),
+    })
+    shine.Parent = fill
+    loopTween(shine, TweenInfo.new(2.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {Offset = Vector2.new(0.5, 0)}, stageTweens)
 
     local notice = Instance.new("CanvasGroup")
     notice.Name = "Banner"
@@ -261,6 +393,15 @@ local function setPresentation(kind: string, immediate: boolean?)
     activePresentation = kind
     local showStage = kind == "full"
     local showBanner = kind == "banner"
+    if REDUCED_MOTION then
+        stage.Visible = showStage
+        stage.GroupTransparency = showStage and 0 or 1
+        panel.Position = UDim2.fromScale(0.5, 0.5)
+        banner.Visible = showBanner
+        banner.GroupTransparency = showBanner and 0 or 1
+        banner.Position = UDim2.fromScale(0.5, showBanner and 0.06 or -0.11)
+        return
+    end
     for _, tween in ipairs(stageTweens) do if showStage then tween:Play() else tween:Pause() end end
     for _, tween in ipairs(bannerTweens) do if showBanner then tween:Play() else tween:Pause() end end
     if showStage then
@@ -305,6 +446,7 @@ local function clearInterface()
     transitionToken += 1
     if viewportConnection then viewportConnection:Disconnect(); viewportConnection = nil end
     stopTransitions()
+    cancelStatusTweens()
     for _, tween in ipairs(stageTweens) do tween:Cancel() end
     for _, tween in ipairs(bannerTweens) do tween:Cancel() end
     table.clear(stageTweens)
@@ -312,7 +454,8 @@ local function clearInterface()
     if activeGui then activeGui:Destroy() end
     activeGui, stage, banner, panel = nil, nil, nil, nil
     bannerText, bannerTimer, title, statusText, description = nil, nil, nil, nil, nil
-    phaseLabel, progressTrack, phaseFill = nil, nil, nil
+    phaseLabel, progressTrack, phaseFill, accentLine, statusOrb = nil, nil, nil, nil, nil
+    table.clear(phaseSteps)
     currentStatus, activePresentation, restartAt, lastMessage = "idle", "hidden", 0, ""
 end
 
@@ -338,13 +481,32 @@ local function update(status: string, target: number, message: string)
     setPresentation(presentation)
     if not title or not statusText or not description or not phaseLabel then return end
     if status ~= previousStatus then
+        cancelStatusTweens()
         for _, label in ipairs({title, statusText, description, phaseLabel}) do
-            label.TextTransparency = 0.65
-            TweenService:Create(label, fadeEase, {TextTransparency = 0}):Play()
+            label.TextTransparency = REDUCED_MOTION and 0 or 0.9
+            animateState(label, {TextTransparency = 0}, stateTextFade)
+        end
+        local shade = phaseColor(status)
+        animateState(statusText, {TextColor3 = shade})
+        if accentLine then animateState(accentLine, {BackgroundColor3 = shade}) end
+        if statusOrb then animateState(statusOrb, {BackgroundColor3 = status == "error" and Color3.fromRGB(107, 38, 57) or Color3.fromRGB(25, 55, 87)}) end
+        if phaseFill then animateState(phaseFill, {BackgroundColor3 = shade}) end
+
+        -- Explicit stage transitions: save success is not proof of teleport or load success.
+        local currentStep = status == "ready" and 2 or (status == "arriving" or status == "error") and 3 or 1
+        for index, step in ipairs(phaseSteps) do
+            local completed = index < currentStep
+            local active = index == currentStep
+            local tone = completed and successAccent or (active and shade or muted)
+            animateState(step, {TextColor3 = tone, BackgroundTransparency = active and 0.18 or (completed and 0.4 or 0.74)})
+        end
+
+        if status == "error" then
+            for _, tween in ipairs(stageTweens) do tween:Pause() end
+        elseif activePresentation == "full" and not REDUCED_MOTION then
+            for _, tween in ipairs(stageTweens) do tween:Play() end
         end
     end
-    local shade = status == "ready" and Color3.fromRGB(96, 227, 184) or (status == "error" and Color3.fromRGB(255, 139, 145) or accent)
-    TweenService:Create(statusText, fadeEase, {TextColor3 = shade}):Play()
     if status == "scheduled" then
         title.Text = "New update incoming"
         statusText.Text = "Server restart in " .. countdown(seconds)

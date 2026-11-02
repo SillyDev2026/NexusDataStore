@@ -289,7 +289,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local NexusDataStore: any = {}
 NexusDataStore.__index = NexusDataStore
-NexusDataStore.Version = "8.1.0"
+NexusDataStore.Version = "8.2.0"
 NexusDataStore.RecordFormat = 700
 NexusDataStore.RequiredCompressionVersion = "2.3.0"
 
