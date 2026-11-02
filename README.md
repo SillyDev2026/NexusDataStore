@@ -29,7 +29,7 @@ The new interface includes:
 
 ### Installation
 
-Copy <SoftShutdownClient.client.lua> into **ReplicatedFirst** as a `LocalScript`, and set its `STORE_NAME` to the configured `Name` (default `"PlayerData"`). Use `EnableSoftShutdown = true` and `AutoPlayerLifecycle = true` in your store configuration. Both the old and new experience builds should include this LocalScript for seamless UI transfer. No manual ScreenGui elements are needed.
+Copy `SoftShutdownClient.client.lua` into **ReplicatedFirst** as a `LocalScript`, and set its `STORE_NAME` to the configured `Name` (default `"PlayerData"`). Use `EnableSoftShutdown = true` and `AutoPlayerLifecycle = true` in your store configuration. Both the old and new experience builds should include this LocalScript for seamless UI transfer. No manual ScreenGui elements are needed.
 
 This changes only UI presentation and library version; the **saved record format (700) and Compression v2.6.1 codecs 230–233 are unchanged**. Existing stored player data does not need conversion. Automated Luau compilation and static UI-contract checks run in GitHub Actions; visually inspect portrait/landscape mobile and desktop screens in Roblox Studio and a published test universe before shipping.
 
