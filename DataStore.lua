@@ -2610,9 +2610,12 @@ function NexusDataStore:_CheckAutoPublishVersion(): (boolean, string?)
 	if self.AutoPublishCandidatesSeen < 2 then return false, "CANDIDATE_PENDING" end
 	if self.SoftShutdownState then return false, "RESTART_ALREADY_SCHEDULED" end
 	local scheduleAt = os.time() + self.Config.AutoPublishCountdownSeconds
-	local scheduledStores = 0
+	self:_OnServerRestartScheduled(DateTime.fromUnixTimestamp(scheduleAt), {Name = "AutoPublish"}, {
+		message = "A new game update was detected. Securing progress before joining an updated server.",
+	})
+	local scheduledStores = 1
 	for store in pairs(activeSoftShutdownStores) do
-		if store.Config.EnableSoftShutdown and not store.Closed and not store.Closing and store.SoftShutdownState == nil then
+		if store ~= self and store.Config.EnableSoftShutdown and not store.Closed and not store.Closing and store.SoftShutdownState == nil then
 			store:_OnServerRestartScheduled(DateTime.fromUnixTimestamp(scheduleAt), {Name = "AutoPublish"}, {
 				message = "A new game update was detected. Securing progress before joining an updated server.",
 			})
@@ -2651,6 +2654,12 @@ function NexusDataStore:_AutoPublishTeleportTick(timestamp: number)
 	local state = self.SoftShutdownState
 	if not state or state.Source ~= "AutoPublish" or self.Closing or self.Closed then return end
 	if timestamp < state.RestartAt or not state.FinalSaved then return end
+	if state.TeleportStarted and timestamp >= (state.TeleportStartedAt or timestamp) + 30 then
+		-- In case teleport initiation succeeded but a player remained with no failure callback.
+		state.TeleportStarted = false
+		state.NextTeleportAttempt = timestamp + 5
+		self:_SetSoftShutdownStatus("teleport-retrying")
+	end
 	if self.AutoPublishTeleportBusy or state.TeleportStarted or timestamp < (state.NextTeleportAttempt or 0) then return end
 	for store in pairs(activeSoftShutdownStores) do
 		local peer = store.SoftShutdownState
@@ -2661,6 +2670,7 @@ function NexusDataStore:_AutoPublishTeleportTick(timestamp: number)
 	if #players == 0 then return end
 	self.AutoPublishTeleportBusy = true
 	state.TeleportStarted = true
+	state.TeleportStartedAt = timestamp
 	state.TeleportAttempted = true
 	self:_SetSoftShutdownStatus("moving")
 	self.Metrics.AutoPublishTeleportAttempts += 1
@@ -2790,6 +2800,7 @@ function NexusDataStore:CloseAsync(timeout: number?): (boolean, string?)
 		return false, firstError
 	end
 	activeSoftShutdownStores[self] = nil
+	if self.AutoPublishTeleportFailureConnection then self.AutoPublishTeleportFailureConnection:Disconnect() end
 	if self.ServerRestartConnection then self.ServerRestartConnection:Disconnect() end
 	if self.CrossServerSubscription then
 		pcall(function()
@@ -4137,6 +4148,8 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 	self.AutoPublishLastError = nil
 	self.AutoPublishTeleportOptions = nil
 	self.AutoPublishTeleportBusy = false
+	self.AutoPublishTeleportFailureConnection = nil
+	self.AutoPublishWatchStarted = false
 	self.Metrics = {
 		Opened = 0,
 		Released = 0,
