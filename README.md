@@ -2,19 +2,38 @@
 
 **Typed, session-aware data persistence for Roblox.**
 
-![Version](https://img.shields.io/badge/NexusDataStore-8.4.2-2563eb)
+![Version](https://img.shields.io/badge/NexusDataStore-8.4.3-2563eb)
 ![Codec](https://img.shields.io/badge/Compression-2.6.1-0f766e)
 ![Luau](https://img.shields.io/badge/language-Luau-00a2ff)
 ![Platform](https://img.shields.io/badge/platform-Roblox-222222)
 
 NexusDataStore brings standard Roblox DataStore persistence, session ownership, typed player profiles, validation, migrations, snapshots, adaptive compression, and numeric leaderboards into one server-side library.
 
-**Current version:** `8.4.2` · **Compression:** `2.6.1` / codecs `230`–`233` · **Record format:** `700`
+**Current version:** `8.4.3` · **Compression:** `2.6.1` / codecs `230`–`233` · **Record format:** `700`
 
 > [!IMPORTANT]
 > This documentation describes the current source on `main`. Regression scripts are included, but production reliability and performance have not been certified by live-server load testing. Use a separate test universe before deploying changes to existing player data.
 
-## New in 8.4.2 — Cleaner shutdown animations and readable typography
+## New in 8.4.3 — Fix tiny unreadable shutdown text
+
+The shutdown UI has been repaired after an actual Roblox Studio screenshot exposed **tiny countdown, description, stage and footer text inside an oversized panel**. This release changes the real `ReplicatedFirst/SoftShutdownClient.client.lua`, not just an illustration.
+
+### What changed
+
+- **No universal TextScaled:** Roblox's `TextScaled = true` silently shrank strings to fit the extremely shallow label bounds. It is now `TextScaled = false` with explicit responsive `TextSize` values, so sentence length no longer causes the entire label to shrink.
+- **Clear visual hierarchy:** Large bold update title, prominent cyan countdown/status, high-contrast description, medium-sized numbered stages and a readable footer. Text remains legible rather than disappearing into the card.
+- **Four responsive layouts:** Portrait phone, tablet, short landscape and desktop each have appropriate percentage-based panel width, height and spacing. Mobile portrait centers the emblem and title; landscape/desktop use an efficient two-column header.
+- **Better spacing and contrast:** The panel's header, message, stages and footer no longer crowd each other. The panel has a slightly brighter glass gradient and descriptions use brighter text.
+- **Human-readable stages:** `01 Save`, `02 Transfer`, `03 Restore`, with sentence-case status captions instead of tiny all-caps labels.
+- **No data behavior changes:** This is a LocalScript presentation repair; the server persistence format 700, Compression 2.6.1, session locks, restart logic and auto-publish detection are unchanged.
+
+### Update
+
+Replace the LocalScript under `ReplicatedFirst` with the latest `SoftShutdownClient.client.lua`; set `STORE_NAME = "PlayerData"` and `BACKGROUND_IMAGE_ID = "rbxassetid://135793690711172"` if you want your approved uploaded neon background. Do not keep an old copy of the LocalScript active alongside the new version. Test the `scheduled` state using Studio's preview script on desktop, short-landscape and mobile portrait sizes.
+
+**Validation:** GitHub CI verifies source structure and Luau compilation. Visual readability still requires Roblox Studio/real-device inspection, including longer translated strings and user-preferred accessibility text sizes.
+
+## Previously in 8.4.2 — Cleaner shutdown animations and readable typography
 
 The `ReplicatedFirst/SoftShutdownClient.client.lua` animation has been refined for smoother motion and less visual clutter, while keeping the same neon-blue GIF-style horizon, Save → Transfer → Restore states, and session-safe update system.
 
