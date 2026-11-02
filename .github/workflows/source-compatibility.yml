@@ -37,6 +37,6 @@ jobs:
       - name: Build Luau CLI
         run: make -C .luau-toolchain config=release luau luau-compile -j2
       - name: Compile library and regression scripts
-        run: .luau-toolchain/luau-compile --null DataStore.lua Compression.lua Data.lua tests/*.lua tests/*.luau
+        run: .luau-toolchain/luau-compile --null DataStore.lua Compression.lua Data.lua SoftShutdownClient.client.lua tests/*.lua tests/*.luau
       - name: Execute session and compression regressions
         run: python3 tools/run_behavioral_tests.py --luau .luau-toolchain/luau
