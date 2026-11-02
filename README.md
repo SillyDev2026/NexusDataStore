@@ -16,7 +16,7 @@ NexusDataStore brings standard Roblox DataStore persistence, session ownership, 
 
 ## New in 8.1.0 — Fully responsive soft-shutdown interface
 
-The built-in restart LocalScript has been **fully redesigned**. Every UI object's `Position` and `Size` uses `UDim2.fromScale` (relative percentages); there are no pixel-based layout offsets or `UISizeConstraint` widths/heights. This makes the interface adapt to phones, tablets and PCs without hand-tuning dimensions.
+The built-in restart LocalScript has been **fully redesigned**. Every UI object's `Position` and `Size` uses `UDim2.fromScale` (relative percentages); there are no pixel-based layout offsets or `UISizeConstraint` widths/heights. The script also switches between portrait-phone, tablet, desktop and short-landscape percentage layouts when the viewport changes, without hand-tuning dimensions.
 
 The new interface includes:
 
