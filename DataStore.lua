@@ -1289,6 +1289,12 @@ function NexusDataStore:_EncodeRecord(record: any): (any?, string?, any?)
 		end
 	end
 	if bestEnvelope == nil then
+		if not enforceCompressed and rawBytes <= self.Config.MaxStoredBytes then
+			rawReport.SelectionReason = "compression-failed-raw-fallback"
+			rawReport.CandidateFailures = candidateFailures
+			rawReport.CompressionError = firstCandidateError
+			return storageRecord, nil, rawReport
+		end
 		return nil, firstCandidateError or "NO_COMPRESSION_TRANSPORT_AVAILABLE"
 	end
 	bestReport.CandidateFailures = candidateFailures
@@ -2437,16 +2443,16 @@ function NexusDataStore:ReleaseAllAsync(): {[string]: any}
 end
 
 function NexusDataStore:_HandleLifecycleJoin(player: Player)
-	if self.Config.EnableSoftShutdown then player:SetAttribute("NexusDataStoreProfileReady", false) end
+	if self.Config.EnableSoftShutdown then player:SetAttribute("NexusDataStoreProfileReady_" .. self.Config.Name, false) end
 	local session, err = self:OpenPlayerAsync(player)
 	if not session then
-		if self.Config.EnableSoftShutdown and player.Parent == Players then player:SetAttribute("NexusDataStoreProfileError", tostring(err)) end
+		if self.Config.EnableSoftShutdown and player.Parent == Players then player:SetAttribute("NexusDataStoreProfileError_" .. self.Config.Name, tostring(err)) end
 		self:_Fire("PlayerLoadFailed", player, err)
 		return
 	end
 	if self.Config.EnableSoftShutdown and player.Parent == Players then
-		player:SetAttribute("NexusDataStoreProfileError", nil)
-		player:SetAttribute("NexusDataStoreProfileReady", true)
+		player:SetAttribute("NexusDataStoreProfileError_" .. self.Config.Name, nil)
+		player:SetAttribute("NexusDataStoreProfileReady_" .. self.Config.Name, true)
 	end
 	if player.Parent ~= Players then
 		local released, releaseErr = self:ReleaseAsync(session)
