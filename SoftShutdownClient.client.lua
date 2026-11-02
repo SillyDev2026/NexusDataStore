@@ -1,5 +1,5 @@
 --!strict
--- NexusDataStore v8.4.2 stable neon shutdown interface with adaptive motion and readable type.
+-- NexusDataStore v8.4.3 readable restart UI: proportional layout and consistent typography.
 -- Install this LocalScript in ReplicatedFirst and set STORE_NAME to the DataStore Name.
 local STORE_NAME = "PlayerData"
 local REDUCED_MOTION = false -- Set true to disable continuous animations and shorten transitions.
@@ -23,8 +23,8 @@ local dangerAccent = Color3.fromRGB(255, 129, 151)
 local warningAccent = Color3.fromRGB(255, 200, 109)
 local violetAccent = Color3.fromRGB(172, 133, 255)
 local normal = Color3.fromRGB(230, 242, 255)
-local muted = Color3.fromRGB(157, 179, 207)
-local panelColor = Color3.fromRGB(17, 31, 55)
+local muted = Color3.fromRGB(196, 212, 232)
+local panelColor = Color3.fromRGB(13, 30, 53)
 local stateTextFade = TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 local accentEase = TweenInfo.new(0.28, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 local infoEase = TweenInfo.new(0.42, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
@@ -45,6 +45,9 @@ local phaseFill: Frame? = nil
 local accentLine: Frame? = nil
 local statusOrb: Frame? = nil
 local phaseSteps: {TextLabel} = {}
+local textElements: {TextLabel} = {}
+local eyebrowLabel: TextLabel? = nil
+local coreIconLabel: TextLabel? = nil
 local statusTweens: {Tween} = {}
 local activePresentation = "hidden"
 local currentStatus = "idle"
@@ -93,8 +96,8 @@ local function stroke(parent: Instance, color: Color3, opacity: number)
     item.Parent = parent
 end
 
--- Keep all UI geometry percentage-based while bounding text size in pixels.
--- TextScaled alone makes captions microscopic on phones and huge on desktops.
+-- The size and position of every label stays percentage-based. Font sizes are
+-- updated on viewport changes instead of shrinking the contents with TextScaled.
 local function textLabel(parent: Instance, name: string, value: string, font: Enum.Font, color: Color3, pos: UDim2, size: UDim2, alignment: Enum.TextXAlignment?): TextLabel
     local item = Instance.new("TextLabel")
     item.Name = name
@@ -104,30 +107,14 @@ local function textLabel(parent: Instance, name: string, value: string, font: En
     item.Text = value
     item.Font = font
     item.TextColor3 = color
-    item.TextScaled = true
-    item.TextWrapped = true
+    item.TextSize = 18
+    item.TextScaled = false
+    item.TextWrapped = name == "Title" or name == "Status" or name == "Description" or name == "Message"
     item.TextXAlignment = alignment or Enum.TextXAlignment.Center
     item.TextYAlignment = Enum.TextYAlignment.Center
-    item.TextStrokeTransparency = 0.94
-    local limits = Instance.new("UITextSizeConstraint")
-    limits.Name = "ReadableText"
-    if name == "Title" then
-        limits.MinTextSize, limits.MaxTextSize = 17, 34
-    elseif name == "Status" then
-        limits.MinTextSize, limits.MaxTextSize = 13, 23
-    elseif name == "Description" then
-        limits.MinTextSize, limits.MaxTextSize = 12, 18
-    elseif name == "Icon" then
-        limits.MinTextSize, limits.MaxTextSize = 17, 36
-    elseif name == "Timer" then
-        limits.MinTextSize, limits.MaxTextSize = 13, 23
-    elseif name == "Message" then
-        limits.MinTextSize, limits.MaxTextSize = 12, 19
-    else
-        limits.MinTextSize, limits.MaxTextSize = 10, 16
-    end
-    limits.Parent = item
+    item.TextStrokeTransparency = 1
     item.Parent = parent
+    table.insert(textElements, item)
     return item
 end
 
@@ -348,14 +335,14 @@ local function makeInterface(): ScreenGui
     main.Position = UDim2.fromScale(0.5, 0.55)
     main.Size = UDim2.fromScale(0.86, 0.47)
     main.BackgroundColor3 = panelColor
-    main.BackgroundTransparency = 0.07
+    main.BackgroundTransparency = 0.06
     main.BorderSizePixel = 0
     main.Parent = overlay
     corner(main, 0.055)
     stroke(main, Color3.fromRGB(79, 149, 205), 0.44)
     panel = main
     local mainGradient = Instance.new("UIGradient")
-    mainGradient.Color = ColorSequence.new(Color3.fromRGB(16, 33, 58), Color3.fromRGB(9, 19, 38))
+    mainGradient.Color = ColorSequence.new(Color3.fromRGB(21, 43, 73), Color3.fromRGB(11, 25, 48))
     mainGradient.Rotation = 105
     mainGradient.Parent = main
 
@@ -404,36 +391,38 @@ local function makeInterface(): ScreenGui
     haloGradient.Parent = haloStroke
     haloGradientRef = haloGradient
     local coreIcon = textLabel(core, "Icon", "◆", Enum.Font.GothamBold, normal, UDim2.fromScale(0.2, 0.18), UDim2.fromScale(0.6, 0.64))
+    coreIconLabel = coreIcon
     coreIcon.TextTransparency = 0.05
     statusOrb = core
 
 
-    local tag = textLabel(main, "Eyebrow", "NEXUS  /  SERVER MIGRATION", Enum.Font.GothamBold, accent, UDim2.fromScale(0.12, 0.10), UDim2.fromScale(0.76, 0.085))
+    local tag = textLabel(main, "Eyebrow", "NEXUS   /   SERVER UPDATE", Enum.Font.GothamMedium, accent, UDim2.fromScale(0.12, 0.095), UDim2.fromScale(0.76, 0.09))
+    eyebrowLabel = tag
     tag.TextTransparency = 0.03
 
-    title = textLabel(main, "Title", "Server update scheduled", Enum.Font.GothamBold, normal, UDim2.fromScale(0.32, 0.235), UDim2.fromScale(0.59, 0.18), Enum.TextXAlignment.Left)
-    statusText = textLabel(main, "Status", "Preparing to migrate...", Enum.Font.GothamMedium, accent, UDim2.fromScale(0.32, 0.44), UDim2.fromScale(0.59, 0.11), Enum.TextXAlignment.Left)
-    description = textLabel(main, "Description", "Your progress stays protected while the server updates.", Enum.Font.Gotham, muted, UDim2.fromScale(0.12, 0.568), UDim2.fromScale(0.76, 0.135))
+    title = textLabel(main, "Title", "Server update scheduled", Enum.Font.GothamBold, normal, UDim2.fromScale(0.30, 0.225), UDim2.fromScale(0.63, 0.205), Enum.TextXAlignment.Left)
+    statusText = textLabel(main, "Status", "Preparing to migrate...", Enum.Font.GothamMedium, accent, UDim2.fromScale(0.30, 0.44), UDim2.fromScale(0.63, 0.13), Enum.TextXAlignment.Left)
+    description = textLabel(main, "Description", "Your progress stays protected while the server updates.", Enum.Font.Gotham, muted, UDim2.fromScale(0.12, 0.605), UDim2.fromScale(0.76, 0.115))
 
     -- Three-stage timeline shows only server-confirmed milestones, never a made-up percentage.
-    local stepNames = {"01   SAVE", "02   TRANSFER", "03   RESTORE"}
+    local stepNames = {"01  Save", "02  Transfer", "03  Restore"}
     table.clear(phaseSteps)
     for index, label in ipairs(stepNames) do
         local item = textLabel(main, "Step" .. index, label, Enum.Font.GothamBold, muted,
-            UDim2.fromScale(0.105 + (index - 1) * 0.275, 0.735),
-            UDim2.fromScale(0.24, 0.085))
+            UDim2.fromScale(0.105 + (index - 1) * 0.275, 0.76),
+            UDim2.fromScale(0.24, 0.11))
         item.BackgroundTransparency = 0.72
         item.BackgroundColor3 = Color3.fromRGB(38, 67, 103)
         corner(item, 0.25)
         table.insert(phaseSteps, item)
     end
 
-    phaseLabel = textLabel(main, "Phase", "CHECKING PROFILE", Enum.Font.GothamBold, muted, UDim2.fromScale(0.11, 0.845), UDim2.fromScale(0.78, 0.052), Enum.TextXAlignment.Left)
+    phaseLabel = textLabel(main, "Phase", "Checking profile", Enum.Font.GothamMedium, muted, UDim2.fromScale(0.11, 0.885), UDim2.fromScale(0.78, 0.06), Enum.TextXAlignment.Left)
 
     local bar = Instance.new("Frame")
     bar.Name = "ProgressTrack"
     bar.Size = UDim2.fromScale(0.78, 0.023)
-    bar.Position = UDim2.fromScale(0.11, 0.934)
+    bar.Position = UDim2.fromScale(0.11, 0.965)
     bar.BackgroundColor3 = Color3.fromRGB(43, 68, 101)
     bar.BorderSizePixel = 0
     bar.ClipsDescendants = true
