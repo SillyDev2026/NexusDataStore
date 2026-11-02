@@ -19,6 +19,13 @@ check("version defined", version is not None)
 check("README and source versions match", version is not None and ("**Current version:** `" + version + "`") in readme)
 check("README badge matches", version is not None and ("NexusDataStore-" + version + "-") in readme)
 check("strict Luau directive", data.startswith("--!strict\n"))
+check("soft shutdown remains explicitly opt-in", "EnableSoftShutdown = config.EnableSoftShutdown == true" in data)
+check("scheduled restart event handles developer and Roblox platform migrations", "game.ServerRestartScheduled:Connect" in data and "_OnServerRestartScheduled" in data)
+check("session writes freeze before final persistence", 'SOFT_SHUTDOWN_FROZEN' in data and 'self.SoftShutdownFrozen = true' in data)
+check("shutdown uses bounded parallel release", 'remaining -= 1' in data and 'self.Config.SoftShutdownCloseTimeout' in data)
+check("destination waits on session ownership", "config.EnableSoftShutdown == true" in data and "WaitForSessionLock" in data)
+check("restart UI and client arrival implementation present", all(token in (ROOT / "SoftShutdownClient.client.lua").read_text(encoding="utf-8") for token in ("SetTeleportGui", "GetArrivingTeleportGui", "NexusDataStoreProfileReady", "UDim2.fromScale", "Restart in")))
+check("restart setup and publish workflow documented", "## New in 7.10.0" in readme and "Restart only servers with outdated versions" in readme)
 local_declaration_pattern = re.compile(r"^[ \t]*local[ \t]+[^=\n]+=[ \t]*$", re.MULTILINE)
 luau_files = [ROOT / "DataStore.lua", ROOT / "Compression.lua", *(ROOT / "tests").glob("*.lua"), *(ROOT / "tests").glob("*.luau")]
 split_locals = [str(path.relative_to(ROOT)) for path in luau_files if local_declaration_pattern.search(path.read_text(encoding="utf-8"))]
@@ -41,7 +48,7 @@ check("RLE encoder compares exact array costs", 'local competingBytes = normalBy
 check("RLE decoder rejects hostile run lengths", 'NON_CANONICAL_RLE_RUN' in codec and 'INVALID_RLE_TOTAL_LENGTH' in codec and 'INVALID_RLE_SCALAR' in codec)
 check("RLE does not mutate source and exposes diagnostics", 'RunLengthRuns = writeState.RunLengthRuns' in codec and 'RunLengthValues = report.RunLengthValues' in data)
 check("RLE selection supports eight candidates", '"legacy", "compact", "packed", "rle"' in data and 'selectedCodec ~= 233' in data)
-check("v7.9 documented opt-in and safe rollout", '## New in 7.9.0' in readme and 'RunLengthArrays = true' in readme and 'Safe rollout' in readme)
+check("v7.9 documented opt-in and safe rollout", '## Previously in 7.9.0' in readme and 'RunLengthArrays = true' in readme and 'Safe rollout' in readme)
 check("v7.8 README documents rolling upgrades", '## Previously in 7.8.0' in readme and 'BitPackedIntegers = true' in readme and 'Safe rollout' in readme)
 check("store envelope carries selected packet codec", 'Codec = selectedCodec' in data and 'COMPRESSED_ENVELOPE_CODEC_MISMATCH' in data)
 check("compact setting documented with staged rollout", '## Previously in 7.6.0' in readme and 'CompactEncoding = true' in readme and 'Safe deployment order' in readme)
@@ -108,7 +115,7 @@ required = (
     "MutationSafetyRegression.server.lua", "PersistenceRecoveryRegression.server.lua",
     "SchemaMigrationRegression.server.lua", "CompressionRegression.server.lua",
     "ForcedBufferRegression.server.lua", "SessionLockWaitRegression.server.lua", "SessionHandoffRegression.server.lua",
-    "AlwaysCompressedRegression.server.lua", "PortableCompressionPolicyRegression.luau",
+    "AlwaysCompressedRegression.server.lua", "PortableCompressionPolicyRegression.luau", "PortableSoftShutdownRegression.luau",
     "CompactCodecRegression.server.lua", "PackedIntegerCodecRegression.server.lua", "RunLengthPersistenceRegression.server.lua",
     "MillionLocalBenchmark.server.lua", "MillionMockBackendBenchmark.server.lua",
 )
