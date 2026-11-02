@@ -15,6 +15,7 @@ local activeGui: ScreenGui? = nil
 local statusLabel: TextLabel? = nil
 local detailLabel: TextLabel? = nil
 local titleLabel: TextLabel? = nil
+local bannerLabel: TextLabel? = nil
 local restartAt = 0
 local currentStatus = "idle"
 local closed = false
@@ -123,6 +124,25 @@ local function createGui(): ScreenGui
     progress.Parent = indicator
     local moving = TweenService:Create(progress, TweenInfo.new(1.6, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {Position = UDim2.fromScale(0.8, 0)})
     moving:Play()
+    local banner = Instance.new("TextLabel")
+    banner.Name = "Banner"
+    banner.AnchorPoint = Vector2.new(0.5, 0)
+    banner.Position = UDim2.fromScale(0.5, 0.025)
+    banner.Size = UDim2.fromScale(0.85, 0.07)
+    banner.BackgroundColor3 = Color3.fromRGB(21, 34, 55)
+    banner.Font = Enum.Font.GothamBold
+    banner.TextColor3 = Color3.fromRGB(220, 239, 255)
+    banner.TextScaled = true
+    banner.Text = "Server update scheduled"
+    banner.Visible = false
+    banner.Parent = gui
+    local bannerBounds = Instance.new("UISizeConstraint")
+    bannerBounds.MaxSize = Vector2.new(470, 60)
+    bannerBounds.MinSize = Vector2.new(170, 32)
+    bannerBounds.Parent = banner
+    local bannerCorner = Instance.new("UICorner")
+    bannerCorner.CornerRadius = UDim.new(0.2, 0)
+    bannerCorner.Parent = banner
     return gui
 end
 
@@ -132,6 +152,7 @@ local function attach(gui: ScreenGui)
     statusLabel = panel:WaitForChild("Status") :: TextLabel
     detailLabel = panel:WaitForChild("Details") :: TextLabel
     titleLabel = panel:WaitForChild("Title") :: TextLabel
+    bannerLabel = gui:FindFirstChild("Banner") :: TextLabel?
     gui.Parent = playerGui
 end
 
@@ -152,7 +173,13 @@ local function update(status: string, target: number, message: string)
     currentStatus = status
     restartAt = target
     show()
-    if not titleLabel or not statusLabel or not detailLabel then return end
+    if not titleLabel or not statusLabel or not detailLabel or not activeGui then return end
+    local background = activeGui:FindFirstChild("Background") :: Frame?
+    local panel = background and background:FindFirstChild("Panel") :: Frame?
+    local quiet = status == "scheduled" and target - DateTime.now().UnixTimestamp > 30
+    if background then background.BackgroundTransparency = quiet and 1 or 0 end
+    if panel then panel.Visible = not quiet end
+    if bannerLabel then bannerLabel.Visible = quiet end
     if status == "arriving" then
         titleLabel.Text = "Connecting to new server"
         statusLabel.Text = "Securing your profile session..."
@@ -223,7 +250,16 @@ task.spawn(function()
     while not closed do
         if currentStatus == "scheduled" and statusLabel and restartAt > 0 then
             local seconds = math.max(0, restartAt - DateTime.now().UnixTimestamp)
-            statusLabel.Text = string.format("Restart in %02d:%02d", math.floor(seconds / 60), seconds % 60)
+            local label = string.format("Restart in %02d:%02d", math.floor(seconds / 60), seconds % 60)
+            statusLabel.Text = seconds == 0 and "Moving to new server soon" or label
+            if bannerLabel then bannerLabel.Text = "SERVER UPDATE  •  " .. label end
+            if seconds <= 30 and activeGui then
+                local bg = activeGui:FindFirstChild("Background") :: Frame?
+                local panel = bg and bg:FindFirstChild("Panel") :: Frame?
+                if bg then bg.BackgroundTransparency = 0 end
+                if panel then panel.Visible = true end
+                if bannerLabel then bannerLabel.Visible = false end
+            end
         end
         task.wait(1)
     end
