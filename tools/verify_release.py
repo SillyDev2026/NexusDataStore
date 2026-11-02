@@ -18,7 +18,7 @@ version = match.group(1) if match else None
 check("version defined", version is not None)
 check("README and source versions match", version is not None and ("**Current version:** `" + version + "`") in readme)
 check("README badge matches", version is not None and ("NexusDataStore-" + version + "-") in readme)
-check("strict Luau directive", data.startswith("--!strict\\n"))
+check("strict Luau directive", data.startswith("--!strict\n"))
 check("soft shutdown remains explicitly opt-in", "EnableSoftShutdown = config.EnableSoftShutdown == true" in data)
 check("scheduled restart event handles developer and Roblox platform migrations", "game.ServerRestartScheduled:Connect" in data and "_OnServerRestartScheduled" in data)
 check("session writes freeze before final persistence", 'SOFT_SHUTDOWN_FROZEN' in data and 'self.SoftShutdownFrozen = true' in data)
