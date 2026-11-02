@@ -1,8 +1,9 @@
 --!strict
--- NexusDataStore v8.3 frame-synced restart UI: motion follows actual Roblox rendered frames.
+-- NexusDataStore v8.4.1 neon-horizon restart UI: GIF-inspired background and frame-synced motion.
 -- Install this LocalScript in ReplicatedFirst and set STORE_NAME to the DataStore Name.
 local STORE_NAME = "PlayerData"
 local REDUCED_MOTION = false -- Set true to disable continuous animations and shorten transitions.
+local BACKGROUND_IMAGE_ID = "" -- Optional exact PNG: upload neon_nexus_data_horizon.png to Roblox, then use "rbxassetid://<id>".
 local Players = game:GetService("Players")
 local ReplicatedFirst = game:GetService("ReplicatedFirst")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -72,6 +73,10 @@ local slowFrameDuration = 0
 local recoveryDuration = 0
 local lightweightEffects = false
 local diagnosticsAccumulator = 0
+local horizonRays: {{Line: Frame, StartX: number}} = {}
+local horizonScan: Frame? = nil
+local horizonRing: UIGradient? = nil
+local horizonArc: UIGradient? = nil
 
 local function corner(parent: Instance, radius: number)
     local item = Instance.new("UICorner")
@@ -126,6 +131,139 @@ local function phaseColor(status: string): Color3
     return accent
 end
 
+-- Build the cyan/violet digital horizon using Roblox UI objects. An uploaded
+-- Roblox image asset can replace the generated scenery for an exact art match.
+-- All positions/sizes remain scale-based; the perspective rays reflow on resize.
+local function horizonFrame(parent: Instance, name: string, pos: UDim2, size: UDim2, color: Color3, transparency: number): Frame
+    local frame = Instance.new("Frame")
+    frame.Name = name
+    frame.Position = pos
+    frame.Size = size
+    frame.BackgroundColor3 = color
+    frame.BackgroundTransparency = transparency
+    frame.BorderSizePixel = 0
+    frame.Parent = parent
+    return frame
+end
+
+local function buildHorizon(backdrop: Frame)
+    backdrop.ClipsDescendants = true
+    if BACKGROUND_IMAGE_ID ~= "" then
+        local image = Instance.new("ImageLabel")
+        image.Name = "NeonHorizonImage"
+        image.Position = UDim2.fromScale(0, 0)
+        image.Size = UDim2.fromScale(1, 1)
+        image.BackgroundTransparency = 1
+        image.BorderSizePixel = 0
+        image.ScaleType = Enum.ScaleType.Crop
+        image.Image = BACKGROUND_IMAGE_ID
+        image.Parent = backdrop
+    else
+        local floor = horizonFrame(backdrop, "PerspectiveGridFloor", UDim2.fromScale(0, 0.645), UDim2.fromScale(1, 0.355), Color3.fromRGB(7, 22, 45), 0.13)
+        local floorGradient = Instance.new("UIGradient")
+        floorGradient.Rotation = 90
+        floorGradient.Color = ColorSequence.new(Color3.fromRGB(9, 48, 89), Color3.fromRGB(4, 15, 35))
+        floorGradient.Parent = floor
+        for index = 1, 10 do
+            local distance = (index / 10) ^ 1.45
+            local y = 0.645 + distance * 0.355
+            horizonFrame(backdrop, "GridY" .. index, UDim2.fromScale(0, y), UDim2.fromScale(1, 0.0014),
+                Color3.fromRGB(32, 142, 245), 0.69 + distance * 0.12)
+        end
+        for index = 0, 12 do
+            local start = index / 12
+            local line = horizonFrame(backdrop, "GridX" .. index, UDim2.fromScale(0.5, 0.82), UDim2.fromScale(0.45, 0.0015),
+                Color3.fromRGB(41, 160, 255), 0.68)
+            line.AnchorPoint = Vector2.new(0.5, 0.5)
+            table.insert(horizonRays, {Line = line, StartX = start})
+        end
+        local horizonGlow = horizonFrame(backdrop, "HorizonGlow", UDim2.fromScale(0, 0.627), UDim2.fromScale(1, 0.042),
+            Color3.fromRGB(21, 105, 199), 0.84)
+        local glowGradient = Instance.new("UIGradient")
+        glowGradient.Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1),
+            NumberSequenceKeypoint.new(0.16, 0.2),
+            NumberSequenceKeypoint.new(0.84, 0.2),
+            NumberSequenceKeypoint.new(1, 1),
+        })
+        glowGradient.Parent = horizonGlow
+        horizonFrame(backdrop, "HorizonLine", UDim2.fromScale(0, 0.645), UDim2.fromScale(1, 0.002),
+            Color3.fromRGB(56, 183, 255), 0.26)
+        -- The far-off data towers mirror the silhouettes in the preview background.
+        local towers = {
+            {0.035, 0.15, 0.040}, {0.105, 0.27, 0.053}, {0.207, 0.11, 0.038},
+            {0.786, 0.17, 0.036}, {0.865, 0.27, 0.058}, {0.948, 0.12, 0.035},
+        }
+        for index, spec in ipairs(towers) do
+            local x, height, width = spec[1], spec[2], spec[3]
+            local tower = horizonFrame(backdrop, "DataTower" .. index, UDim2.fromScale(x, 0.645 - height), UDim2.fromScale(width, height),
+                Color3.fromRGB(16, 48, 91), 0.49)
+            tower.ClipsDescendants = true
+            local towerGradient = Instance.new("UIGradient")
+            towerGradient.Rotation = 90
+            towerGradient.Color = ColorSequence.new(Color3.fromRGB(22, 69, 130), Color3.fromRGB(8, 28, 59))
+            towerGradient.Parent = tower
+            horizonFrame(tower, "Edge", UDim2.fromScale(0, 0), UDim2.fromScale(0.027, 1), Color3.fromRGB(34, 172, 255), 0.15)
+            for bar = 1, 3 do
+                horizonFrame(tower, "Light" .. bar, UDim2.fromScale(0.18, 0.24 * bar), UDim2.fromScale(0.58, 0.009),
+                    Color3.fromRGB(34, 173, 255), 0.2 + bar * 0.1)
+            end
+        end
+        -- Star/data points: deterministic positions, zero per-frame creation.
+        for index = 1, 27 do
+            local x = (index * 0.61803398875) % 1
+            local y = (index * 0.41421356237) % 0.56
+            local dot = horizonFrame(backdrop, "DataStar" .. index, UDim2.fromScale(x, y), UDim2.fromScale(0.0016, 0.0029),
+                Color3.fromRGB(71, 191, 255), 0.18 + (index % 4) * 0.15)
+            corner(dot, 1)
+        end
+        local ring = horizonFrame(backdrop, "HorizonHUDRing", UDim2.fromScale(0.72, -0.12), UDim2.fromScale(0.47, 0.7),
+            Color3.fromRGB(25, 73, 137), 1)
+        corner(ring, 1)
+        local ringStroke = Instance.new("UIStroke")
+        ringStroke.Color = Color3.fromRGB(51, 166, 255)
+        ringStroke.Thickness = 1.5
+        ringStroke.Transparency = 0.69
+        ringStroke.Parent = ring
+        local ringGradient = Instance.new("UIGradient")
+        ringGradient.Color = ColorSequence.new(Color3.fromRGB(31, 105, 221), Color3.fromRGB(74, 203, 255))
+        ringGradient.Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1),
+            NumberSequenceKeypoint.new(0.27, 0.3),
+            NumberSequenceKeypoint.new(0.65, 0.7),
+            NumberSequenceKeypoint.new(1, 1),
+        })
+        ringGradient.Parent = ringStroke
+        horizonRing = ringGradient
+        local arc = horizonFrame(backdrop, "FloorLightArc", UDim2.fromScale(0.05, 0.69), UDim2.fromScale(0.9, 0.52),
+            Color3.fromRGB(41, 171, 255), 1)
+        corner(arc, 1)
+        local arcStroke = Instance.new("UIStroke")
+        arcStroke.Thickness = 2
+        arcStroke.Color = Color3.fromRGB(61, 184, 255)
+        arcStroke.Transparency = 0.58
+        arcStroke.Parent = arc
+        local arcGradient = Instance.new("UIGradient")
+        arcGradient.Color = ColorSequence.new(Color3.fromRGB(35, 116, 244), Color3.fromRGB(180, 91, 255))
+        arcGradient.Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 0.9),
+            NumberSequenceKeypoint.new(0.35, 0.15),
+            NumberSequenceKeypoint.new(0.72, 0.45),
+            NumberSequenceKeypoint.new(1, 0.95),
+        })
+        arcGradient.Parent = arcStroke
+        horizonArc = arcGradient
+    end
+    -- The subtle moving light sweep also runs over a supplied Roblox image asset.
+    horizonScan = horizonFrame(backdrop, "HorizonScan", UDim2.fromScale(-0.15, 0.643), UDim2.fromScale(0.25, 0.003),
+        Color3.fromRGB(93, 212, 255), 0.42)
+    local scanGradient = Instance.new("UIGradient")
+    scanGradient.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.5, 0.04), NumberSequenceKeypoint.new(1, 1),
+    })
+    scanGradient.Parent = horizonScan
+end
+
 local function makeInterface(): ScreenGui
     local screen = Instance.new("ScreenGui")
     screen.Name = guiName
@@ -156,27 +294,7 @@ local function makeInterface(): ScreenGui
     backgroundGradient.Color = ColorSequence.new(Color3.fromRGB(8, 13, 26), Color3.fromRGB(20, 40, 69))
     backgroundGradient.Parent = backdrop
 
-    -- Decorative grid: lightweight, no rendering loop or texture download.
-    for index = 1, 9 do
-        local gridLine = Instance.new("Frame")
-        gridLine.Name = "GridX" .. index
-        gridLine.Position = UDim2.fromScale(index / 10, 0)
-        gridLine.Size = UDim2.fromScale(0.001, 1)
-        gridLine.BackgroundColor3 = Color3.fromRGB(92, 148, 211)
-        gridLine.BackgroundTransparency = 0.965
-        gridLine.BorderSizePixel = 0
-        gridLine.Parent = backdrop
-    end
-    for index = 1, 6 do
-        local gridLine = Instance.new("Frame")
-        gridLine.Name = "GridY" .. index
-        gridLine.Position = UDim2.fromScale(0, index / 7)
-        gridLine.Size = UDim2.fromScale(1, 0.001)
-        gridLine.BackgroundColor3 = Color3.fromRGB(92, 148, 211)
-        gridLine.BackgroundTransparency = 0.967
-        gridLine.BorderSizePixel = 0
-        gridLine.Parent = backdrop
-    end
+    buildHorizon(backdrop)
 
     local glow = Instance.new("Frame")
     glow.Name = "AmbientGlow"
@@ -361,6 +479,15 @@ local function applyResponsiveLayout()
     local view = stage.AbsoluteSize
     if view.X <= 0 or view.Y <= 0 then return end
     local ratio = view.X / view.Y
+    -- Rotate and resize the floor's perspective lines only when viewport geometry changes.
+    for _, entry in ipairs(horizonRays) do
+        local dx = (entry.StartX - 0.5) * view.X
+        local dy = (1 - 0.645) * view.Y
+        local length = math.sqrt(dx * dx + dy * dy)
+        entry.Line.Size = UDim2.fromScale(length / view.X, 0.0017)
+        entry.Line.Position = UDim2.fromScale((0.5 + entry.StartX) * 0.5, (0.645 + 1) * 0.5)
+        entry.Line.Rotation = math.deg(math.atan2(dy, dx))
+    end
     if ratio < 0.85 then
         panel.Size = UDim2.fromScale(0.88, 0.43)
         banner.Size = UDim2.fromScale(0.9, 0.073)
@@ -462,6 +589,8 @@ local function clearInterface()
     diagnosticsAccumulator = 0
     lightweightEffects = false
     if activeGui then activeGui:Destroy() end
+    table.clear(horizonRays)
+    horizonScan, horizonRing, horizonArc = nil, nil, nil
     activeGui, stage, banner, panel = nil, nil, nil, nil
     bannerText, bannerTimer, title, statusText, description = nil, nil, nil, nil, nil
     phaseLabel, progressTrack, phaseFill, accentLine, statusOrb = nil, nil, nil, nil, nil
@@ -542,6 +671,9 @@ renderStep = function(deltaTime: number)
         end
         if statusOrb then statusOrb.BackgroundTransparency = 0.33 + 0.16 * (0.5 + 0.5 * math.sin(t * 2.1)) end
         if not lightweightEffects then
+            if horizonScan then horizonScan.Position = UDim2.fromScale(-0.23 + ((t * 0.095) % 1.45), 0.643) end
+            if horizonRing then horizonRing.Rotation = (t * 5) % 360 end
+            if horizonArc then horizonArc.Rotation = 11 * math.sin(t * 0.23) end
             if accentLine then accentLine.Position = UDim2.fromScale(0.375 + 0.245 * (0.5 + 0.5 * math.sin(t * 0.8)), 0) end
             if ambientGlow then
                 ambientGlow.Position = UDim2.fromScale(0.76 + 0.06 * math.sin(t * 0.55), 0.28 + 0.05 * math.cos(t * 0.55))

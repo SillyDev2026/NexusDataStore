@@ -2,19 +2,37 @@
 
 **Typed, session-aware data persistence for Roblox.**
 
-![Version](https://img.shields.io/badge/NexusDataStore-8.4.0-2563eb)
+![Version](https://img.shields.io/badge/NexusDataStore-8.4.1-2563eb)
 ![Codec](https://img.shields.io/badge/Compression-2.6.1-0f766e)
 ![Luau](https://img.shields.io/badge/language-Luau-00a2ff)
 ![Platform](https://img.shields.io/badge/platform-Roblox-222222)
 
 NexusDataStore brings standard Roblox DataStore persistence, session ownership, typed player profiles, validation, migrations, snapshots, adaptive compression, and numeric leaderboards into one server-side library.
 
-**Current version:** `8.4.0` · **Compression:** `2.6.1` / codecs `230`–`233` · **Record format:** `700`
+**Current version:** `8.4.1` · **Compression:** `2.6.1` / codecs `230`–`233` · **Record format:** `700`
 
 > [!IMPORTANT]
 > This documentation describes the current source on `main`. Regression scripts are included, but production reliability and performance have not been certified by live-server load testing. Use a separate test universe before deploying changes to existing player data.
 
-## New in 8.4.0 — Opt-in auto-migration after a Studio publish
+## New in 8.4.1 — Neon Horizon animated shutdown background
+
+The actual **ReplicatedFirst LocalScript** now uses the cinematic blue/violet horizon background from the NexusDataStore GIF-style preview: a glowing horizon, converging perspective floor, blue-lit data towers, distant stars, a partial rotating HUD ring, sweeping floor arcs, and a subtle cyan scan streak. The current glassy Save → Transfer → Restore card and phase colors are preserved.
+
+### Two supported background modes
+
+**Immediately usable, no assets required:** Leave `BACKGROUND_IMAGE_ID = ""` at the top of `SoftShutdownClient.client.lua`. The script draws a lightweight procedural approximation using built-in Roblox `Frame`, `UIGradient`, `UICorner` and `UIStroke` objects. It requires no asset IDs, network image downloads or manual UI hierarchy.
+
+**Exact visual from the generated artwork:** Upload `neon_nexus_data_horizon.png` (the provided background preview) to Roblox via Creator Dashboard / Studio Asset Manager, ensure the image is approved and usable by the experience, then set `BACKGROUND_IMAGE_ID = "rbxassetid://YOUR_IMAGE_ASSET_ID"` in the same LocalScript. The script uses a full-screen `ImageLabel` with `ScaleType.Crop`, automatically showing the uploaded background behind the existing UI. This is the only way to show that exact PNG inside Roblox; a local file or ChatGPT image URL cannot be referenced directly by a game. The dynamic horizon scan runs in either mode.
+
+- All layout positions and sizes use `UDim2.fromScale`; perspective lines are recalculated when the viewport changes orientation.
+- Background effects run only during the full-screen stage, follow `RunService.PreRender` frame time and respect adaptive low-FPS and `REDUCED_MOTION` settings.
+- The same background is used during scheduled updates, saving, teleport retries, arrival and session-lock loading. A short early update notice remains nonblocking.
+- The active player session, server restart events, compression and saved-record formats are **unchanged**.
+- Install by replacing `ReplicatedFirst/SoftShutdownClient.client.lua` with the updated script; do **not** replace the DataStore server code just to adjust background art. If using the PNG, update its asset ID as above.
+
+**Validation:** GitHub CI compiles the Luau client and runs portable tests. Roblox Studio visual inspection and a live published teleport are still needed to validate UI visibility across different screen sizes.
+
+## Previously in 8.4.0 — Opt-in auto-migration after a Studio publish
 
 **Goal:** Publishing a new version from Roblox Studio can trigger a live server countdown, save every active player, and initiate a teleport to a **fresh updated server**, without manually choosing Restart Servers in Creator Dashboard.
 
