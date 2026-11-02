@@ -32,7 +32,7 @@ check("shutdown uses bounded parallel release", 'remaining -= 1' in data and 'se
 check("destination waits on session ownership", "config.EnableSoftShutdown == true" in data and "WaitForSessionLock" in data)
 client = (ROOT / "SoftShutdownClient.client.lua").read_text(encoding="utf-8")
 check("restart UI and client arrival implementation present", all(token in client for token in ("SetTeleportGui", "GetArrivingTeleportGui", "NexusDataStoreProfileReady", "UDim2.fromScale", "Server restart in")))
-check("responsive UI uses only normalized layout coordinates", "UDim2.new(" not in client and "UDim2.fromOffset(" not in client and "UISizeConstraint" not in client and all(value == "fromScale" for value in re.findall(r'\\b(?:Position|Size)\\s*=\\s*UDim2\\.(\\w+)\\(', client)))
+check("responsive UI uses only normalized layout coordinates", "UDim2.new(" not in client and "UDim2.fromOffset(" not in client and "UISizeConstraint" not in client and all(value == "fromScale" for value in re.findall(r'\b(?:Position|Size)\s*=\s*UDim2\.(\w+)\(', client)))
 check("responsive UI has animated banner and full-screen presentation", all(token in client for token in ("CanvasGroup", "GroupTransparency", 'activePresentation', 'kind == "banner"', 'kind == "full"', 'TweenService:Create')))
 check("restart animations pause when hidden and cancel on cleanup", all(token in client for token in ("tween:Pause()", "tween:Cancel()", "table.clear(stageTweens)", "table.clear(bannerTweens)")))
 check("arrival interface works with legacy transfer GUIs", 'arriving.Name == "NexusRestartGui"' in client and 'readyAttribute' in client and 'errorAttribute' in client)
