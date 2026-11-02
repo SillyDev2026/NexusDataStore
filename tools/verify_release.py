@@ -63,7 +63,7 @@ check("v8.4 setup and limitations preserved", '## Previously in 8.4.0' in readme
 check("v8.4.1 neon horizon procedural background", all(token in client for token in ("buildHorizon(backdrop)", "PerspectiveGridFloor", "HorizonGlow", "HorizonLine", "GridX", "GridY", "DataTower", "DataStar", "HorizonHUDRing", "FloorLightArc", "HorizonScan")))
 check("v8.4.1 optional exact art uses a Roblox ImageLabel", 'BACKGROUND_IMAGE_ID = ""' in client and 'image.ScaleType = Enum.ScaleType.Crop' in client and 'image.Image = BACKGROUND_IMAGE_ID' in client)
 check("v8.4.1 floor perspective responds to viewport geometry", 'math.atan2(dy, dx)' in client and 'entry.Line.Rotation' in client and 'GetPropertyChangedSignal("AbsoluteSize")' in client)
-check("v8.4.1 animated background only on active full screen", 'if horizonScan then horizonScan.Position' in client and 'if not lightweightEffects then' in client and 'if REDUCED_MOTION then return end' in client)
+check("v8.4.1 animated background only on active full screen", 'if horizonScan then' in client and 'if not lightweightEffects and backgroundAccumulator >= 1 / 30 then' in client and 'if REDUCED_MOTION then return end' in client)
 check("v8.4.1 horizon asset instructions retained", '## Previously in 8.4.1' in readme and 'BACKGROUND_IMAGE_ID' in readme and 'neon_nexus_data_horizon.png' in readme)
 check("v8.4.2 ensures text is bounded and readable", 'UITextSizeConstraint' in client and 'limits.MinTextSize' in client and 'TextScaled = true' in client)
 check("v8.4.2 uses a short, non-flashing text fade", 'TextTransparency = REDUCED_MOTION and 0 or 0.2' in client and 'TweenInfo.new(0.22' in client)
