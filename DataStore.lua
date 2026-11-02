@@ -55,6 +55,7 @@ export type CompressionOptions = {
 	AllowExpansion: boolean?,
 	CompactEncoding: boolean?,
 	BitPackedIntegers: boolean?,
+	RunLengthArrays: boolean?,
 }
 
 export type OrderedDataStoreConfig<T> = {
@@ -282,7 +283,7 @@ local EncodingService = game:GetService("EncodingService")
 
 local NexusDataStore: any = {}
 NexusDataStore.__index = NexusDataStore
-NexusDataStore.Version = "7.8.0"
+NexusDataStore.Version = "7.9.0"
 NexusDataStore.RecordFormat = 700
 NexusDataStore.RequiredCompressionVersion = "2.3.0"
 
@@ -976,7 +977,7 @@ local function compressionVersionCompatible(version: string): boolean
 	if majorText == nil or minorText == nil then
 		return false
 	end
-	return tonumber(majorText) == 2 and (tonumber(minorText) == 3 or tonumber(minorText) == 4 or tonumber(minorText) == 5)
+	return tonumber(majorText) == 2 and (tonumber(minorText) == 3 or tonumber(minorText) == 4 or tonumber(minorText) == 5 or tonumber(minorText) == 6)
 end
 
 local function compressionResolve(configured: ModuleScript?): (any?, string?)
@@ -1009,7 +1010,7 @@ local function compressionResolve(configured: ModuleScript?): (any?, string?)
 	end
 	version = tostring(version)
 	if not compressionVersionCompatible(version) then
-		return nil, ("Compression v2.3.x, v2.4.x, or v2.5.x required, got v%s"):format(version)
+		return nil, ("Compression v2.3.x through v2.6.x required, got v%s"):format(version)
 	end
 	if tonumber(engine.CodecVersion) ~= 230 then
 		return nil, "Compression codec 230 required"
@@ -1212,8 +1213,9 @@ function NexusDataStore:_EncodeRecord(record: any): (any?, string?, any?)
 	if self.Config.CompressionStrategy == "smallest" or alwaysCompressed then
 		variants[2] = not variants[1]
 	end
-	local packedEnabled = self.Config.CompressionOptions.BitPackedIntegers == true
-	local codecModes = alwaysCompressed and (packedEnabled and {"legacy", "compact", "packed"} or {"legacy", "compact"}) or {packedEnabled and "packed" or (self.Config.CompressionOptions.CompactEncoding == true and "compact" or "legacy")}
+	local rleEnabled = self.Config.CompressionOptions.RunLengthArrays == true
+	local packedEnabled = self.Config.CompressionOptions.BitPackedIntegers == true or rleEnabled
+	local codecModes = alwaysCompressed and (rleEnabled and {"legacy", "compact", "packed", "rle"} or (packedEnabled and {"legacy", "compact", "packed"} or {"legacy", "compact"})) or {rleEnabled and "rle" or (packedEnabled and "packed" or (self.Config.CompressionOptions.CompactEncoding == true and "compact" or "legacy"))}
 	for _, codecMode in ipairs(codecModes) do
 		for _, dictionaryEnabled in ipairs(variants) do
 			local options = self.Config.CompressionOptions
@@ -1222,7 +1224,8 @@ function NexusDataStore:_EncodeRecord(record: any): (any?, string?, any?)
 				options.StringDictionary = dictionaryEnabled
 				if alwaysCompressed then
 					options.CompactEncoding = codecMode ~= "legacy"
-					options.BitPackedIntegers = codecMode == "packed"
+					options.BitPackedIntegers = codecMode == "packed" or codecMode == "rle"
+					options.RunLengthArrays = codecMode == "rle"
 				end
 			end
 			local ok, encoded, report = pcall(self.CompressionEngine.CompressTablePacket, storageRecord, options)
@@ -1236,9 +1239,10 @@ function NexusDataStore:_EncodeRecord(record: any): (any?, string?, any?)
 				report = {EngineVersion = self.CompressionEngineVersion, EncodedBytes = buffer.len(encoded)}
 			end
 			local selectedCodec = tonumber(report.CodecVersion) or codec
-			if selectedCodec ~= 230 and selectedCodec ~= 231 and selectedCodec ~= 232 then return nil, "UNSUPPORTED_COMPRESSION_CODEC:" .. tostring(selectedCodec) end
+			if selectedCodec ~= 230 and selectedCodec ~= 231 and selectedCodec ~= 232 and selectedCodec ~= 233 then return nil, "UNSUPPORTED_COMPRESSION_CODEC:" .. tostring(selectedCodec) end
 			if selectedCodec == 231 and tonumber(self.CompressionEngine.CompactCodecVersion) ~= 231 then return nil, "COMPACT_COMPRESSION_UNAVAILABLE" end
 			if selectedCodec == 232 and tonumber(self.CompressionEngine.PackedCodecVersion) ~= 232 then return nil, "PACKED_COMPRESSION_UNAVAILABLE" end
+			if selectedCodec == 233 and tonumber(self.CompressionEngine.RunLengthCodecVersion) ~= 233 then return nil, "RLE_COMPRESSION_UNAVAILABLE" end
 			local candidate, candidateBytes, candidateTransport = nil, math.huge, nil
 			if transport == "auto" or transport == "buffer" then
 				local envelope = {Format = RECORD_FORMAT, Codec = selectedCodec, Compressed = true, Encoding = "buffer", Payload = encoded}
@@ -1275,7 +1279,8 @@ function NexusDataStore:_EncodeRecord(record: any): (any?, string?, any?)
 				bestEnvelope, bestBytes, bestTransport, bestReport = candidate, candidateBytes, candidateTransport, report
 				bestReport.DictionaryEnabled = dictionaryEnabled
 				bestReport.CompactEncoding = codecMode ~= "legacy"
-				bestReport.BitPackedIntegers = codecMode == "packed"
+				bestReport.BitPackedIntegers = codecMode == "packed" or codecMode == "rle"
+				bestReport.RunLengthEncoding = codecMode == "rle"
 			end
 		end
 	end
@@ -1332,7 +1337,7 @@ function NexusDataStore:_DecodeRecord(raw: any): (any?, string?)
 		end
 		local codec = tonumber(self.CompressionEngine.CodecVersion)
 		local declaredCodec = tonumber(raw.Codec)
-		if raw.Codec ~= nil and declaredCodec ~= codec and declaredCodec ~= tonumber(self.CompressionEngine.CompactCodecVersion) and declaredCodec ~= tonumber(self.CompressionEngine.PackedCodecVersion) then
+		if raw.Codec ~= nil and declaredCodec ~= codec and declaredCodec ~= tonumber(self.CompressionEngine.CompactCodecVersion) and declaredCodec ~= tonumber(self.CompressionEngine.PackedCodecVersion) and declaredCodec ~= tonumber(self.CompressionEngine.RunLengthCodecVersion) then
 			return nil, "UNSUPPORTED_COMPRESSION_CODEC:" .. tostring(raw.Codec)
 		end
 
@@ -2626,7 +2631,8 @@ function NexusDataStore:GetStorageForecast(dataOrSession: any, warningRatio: num
 		Transport = report.Transport, IncludesSessionLock = sessionReport, RawStorageEstimate = report.RawStorageEstimate,
 		SelectedCodec = report.SelectedCodec, Compressed = report.PersistedCompressed, SelectionReason = report.SelectionReason,
 		SavedStorageBytes = report.SavedStorageBytes, ExpansionBytes = report.ExpansionBytes,
-		CandidatesChecked = report.AlternativeCodecCandidates, PackedIntegerValues = report.PackedIntegerValues,
+		CandidatesChecked = report.AlternativeCodecCandidates, RunLengthRuns = report.RunLengthRuns, RunLengthValues = report.RunLengthValues,
+		PackedIntegerValues = report.PackedIntegerValues,
 		PackedIntegerValueBits = report.PackedIntegerValueBits}
 end
 
@@ -3855,9 +3861,10 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 	end
 	self.CompressionEngineVersion = versionOK and compressionVersion ~= nil and tostring(compressionVersion) or nil
 	if self.Config.Compression then
-		assert(compressionEngine ~= nil, "NexusDataStore compression requires compatible v2.3.x/v2.4.x/v2.5.x engine (codec 230): " .. tostring(compressionError))
+		assert(compressionEngine ~= nil, "NexusDataStore compression requires compatible v2.3.x through v2.6.x engine (codec 230): " .. tostring(compressionError))
 		if self.Config.CompressionOptions.CompactEncoding or self.Config.CompressionPolicy == "always-smallest" then assert(tonumber(compressionEngine.CompactCodecVersion) == 231, "Compact encoding and always-smallest policy require Compression v2.4.0 or later (codec 231)") end
-		if self.Config.CompressionOptions.BitPackedIntegers then assert(tonumber(compressionEngine.PackedCodecVersion) == 232, "BitPackedIntegers requires Compression v2.5.0 (codec 232)") end
+		if self.Config.CompressionOptions.BitPackedIntegers or self.Config.CompressionOptions.RunLengthArrays then assert(tonumber(compressionEngine.PackedCodecVersion) == 232, "BitPackedIntegers requires Compression v2.5.0 or later (codec 232)") end
+		if self.Config.CompressionOptions.RunLengthArrays then assert(tonumber(compressionEngine.RunLengthCodecVersion) == 233, "RunLengthArrays requires Compression v2.6.0 (codec 233)") end
 	end
 
 	-- Cache the JSON overhead for the compressed envelope once. Base64 payload
