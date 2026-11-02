@@ -1,7 +1,8 @@
 --!strict
--- NexusDataStore v8.1 restart interface: scale-only layout, animated notices and teleport arrival.
+-- NexusDataStore v8.2 cinematic restart UI: responsive scale-only layout, stage-aware motion.
 -- Install this LocalScript in ReplicatedFirst and set STORE_NAME to the DataStore Name.
 local STORE_NAME = "PlayerData"
+local REDUCED_MOTION = false -- Set true to disable continuous animations and shorten transitions.
 local Players = game:GetService("Players")
 local ReplicatedFirst = game:GetService("ReplicatedFirst")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -15,9 +16,15 @@ local guiName = "NexusRestartGui_" .. STORE_NAME
 local readyAttribute = "NexusDataStoreProfileReady_" .. STORE_NAME
 local errorAttribute = "NexusDataStoreProfileError_" .. STORE_NAME
 local accent = Color3.fromRGB(86, 191, 255)
+local successAccent = Color3.fromRGB(101, 236, 186)
+local dangerAccent = Color3.fromRGB(255, 129, 151)
+local warningAccent = Color3.fromRGB(255, 200, 109)
+local violetAccent = Color3.fromRGB(172, 133, 255)
 local normal = Color3.fromRGB(230, 242, 255)
 local muted = Color3.fromRGB(157, 179, 207)
 local panelColor = Color3.fromRGB(17, 31, 55)
+local stateTextFade = TweenInfo.new(0.48, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+local accentEase = TweenInfo.new(0.55, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
 local infoEase = TweenInfo.new(0.38, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
 local fadeEase = TweenInfo.new(0.28, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 local moveEase = TweenInfo.new(1.55, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true)
@@ -34,6 +41,10 @@ local description: TextLabel? = nil
 local phaseLabel: TextLabel? = nil
 local progressTrack: Frame? = nil
 local phaseFill: Frame? = nil
+local accentLine: Frame? = nil
+local statusOrb: Frame? = nil
+local phaseSteps: {TextLabel} = {}
+local statusTweens: {Tween} = {}
 local activePresentation = "hidden"
 local currentStatus = "idle"
 local restartAt = 0
@@ -79,8 +90,31 @@ local function textLabel(parent: Instance, name: string, value: string, font: En
 end
 
 local function loopTween(object: Instance, config: TweenInfo, properties: {[string]: any}, bucket: {Tween})
+    if REDUCED_MOTION then return end
     local tween = TweenService:Create(object, config, properties)
     table.insert(bucket, tween)
+end
+
+local function cancelStatusTweens()
+    for _, tween in ipairs(statusTweens) do tween:Cancel() end
+    table.clear(statusTweens)
+end
+
+local function animateState(object: Instance, properties: {[string]: any}, info: TweenInfo?)
+    if REDUCED_MOTION then
+        for key, value in pairs(properties) do (object :: any)[key] = value end
+        return
+    end
+    local tween = TweenService:Create(object, info or accentEase, properties)
+    table.insert(statusTweens, tween)
+    tween:Play()
+end
+
+local function phaseColor(status: string): Color3
+    if status == "ready" or status == "arriving" then return successAccent end
+    if status == "retrying" then return warningAccent end
+    if status == "error" then return dangerAccent end
+    return accent
 end
 
 local function makeInterface(): ScreenGui
