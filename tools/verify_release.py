@@ -199,6 +199,14 @@ for filename, required_count in (
     cases = re.findall(r'benchmark\("([^"]+)"', script)
     check(filename + " cases are unique", len(cases) >= required_count and len(cases) == len(set(cases)))
     check(filename + " has million-iteration setting", "ITERATIONS = 1_000_000" in script)
+check("v8.5 safe snapshot reads exported and implemented", 'TryGet: (self: Session<T>' in data and 'function Session:TryGet(' in data and 'return true, value' in data)
+check("v8.5 bounded zero timeout and lifecycle waits", 'local remaining = deadline - now()' in data and 'math.min(0.05, remaining)' in data and '"PLAYER_LEFT"' in data and '"INVALID_SESSION_KEY"' in data)
+check("v8.5 retry state resets between attempts", 'saveError = nil\n\t\t\tencodeReport = nil' in data and 'acquireError = nil\n\t\t\t\tlockedOwner = nil' in data)
+check("v8.5 session status diagnostics", all(token in data for token in ('NextAutoSaveIn =', 'LastHeartbeatAge =', 'CommitBusy = self.CommitBusy', 'SavePending = self.SavePending')))
+check("v8.5 server-synchronized restart countdown", 'Workspace.GetServerTimeNow' in client and 'DateTime.now().UnixTimestamp' in client)
+check("v8.5 late restart RemoteEvent binding", 'ReplicatedStorage.ChildAdded:Connect(bindRestartRemote)' in client and 'WaitForChild("NexusDataStoreRestart_"' not in client)
+check("v8.5 restart UI exposes operational attributes", all(token in client for token in ('"ReducedMotion"', '"CountdownSeconds"', '"Fullscreen"', '"Presentation"', '"Status"')))
+check("v8.5 release notes and example", '## New in 8.5.0' in readme and 'profile:TryGet("Coins")' in readme)
 failures = [name for name, passed in checks if not passed]
 print(f"\nStatic release gate: {len(checks) - len(failures)}/{len(checks)} passed")
 if failures:

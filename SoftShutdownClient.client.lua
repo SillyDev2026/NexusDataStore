@@ -1,5 +1,5 @@
 --!strict
--- NexusDataStore v8.4.3 readable restart UI: proportional layout and consistent typography.
+-- NexusDataStore v8.5.0 readable restart UI: proportional layout and consistent typography.
 -- Install this LocalScript in ReplicatedFirst and set STORE_NAME to the DataStore Name.
 local STORE_NAME = "PlayerData"
 local REDUCED_MOTION = false -- Set true to disable continuous animations and shorten transitions.
@@ -10,6 +10,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TeleportService = game:GetService("TeleportService")
 local TweenService = game:GetService("TweenService")
 local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
@@ -109,7 +110,8 @@ local function textLabel(parent: Instance, name: string, value: string, font: En
     item.TextColor3 = color
     item.TextSize = 18
     item.TextScaled = false
-    item.TextWrapped = name == "Title" or name == "Status" or name == "Description" or name == "Message"
+    item.TextTruncate = Enum.TextTruncate.None
+    item.TextWrapped = name == "Title" or name == "Status" or name == "Description" or name == "Message" or name == "Phase"
     item.TextXAlignment = alignment or Enum.TextXAlignment.Center
     item.TextYAlignment = Enum.TextYAlignment.Center
     item.TextStrokeTransparency = 1
@@ -277,6 +279,10 @@ local function makeInterface(): ScreenGui
     local screen = Instance.new("ScreenGui")
     screen.Name = guiName
     screen:SetAttribute("StoreName", STORE_NAME)
+    screen:SetAttribute("ReducedMotion", REDUCED_MOTION)
+    screen:SetAttribute("Status", currentStatus)
+    screen:SetAttribute("Presentation", activePresentation)
+    screen:SetAttribute("Fullscreen", false)
     screen.ResetOnSpawn = false
     screen.IgnoreGuiInset = true
     screen.DisplayOrder = 1000
@@ -595,6 +601,10 @@ local function setPresentation(kind: string, immediate: boolean?)
     local token = transitionToken
     stopTransitions()
     activePresentation = kind
+    if activeGui then
+        activeGui:SetAttribute("Presentation", kind)
+        activeGui:SetAttribute("Fullscreen", kind == "full")
+    end
     local showStage = kind == "full"
     local showBanner = kind == "banner"
     if REDUCED_MOTION then
@@ -674,8 +684,10 @@ local function clearInterface()
     currentStatus, activePresentation, restartAt, lastMessage = "idle", "hidden", 0, ""
 end
 
-local function secondsRemaining()
-    return math.max(0, math.ceil(restartAt - DateTime.now().UnixTimestamp))
+local function secondsRemaining(): number
+    local ok, serverNow = pcall(Workspace.GetServerTimeNow, Workspace)
+    local currentTime = ok and typeof(serverNow) == "number" and serverNow or DateTime.now().UnixTimestamp
+    return math.max(0, math.ceil(restartAt - currentTime))
 end
 
 local function countdown(seconds: number): string
@@ -698,6 +710,7 @@ renderStep = function(deltaTime: number)
         local seconds = secondsRemaining()
         if seconds ~= lastCountdownSeconds then
             lastCountdownSeconds = seconds
+            if activeGui then activeGui:SetAttribute("CountdownSeconds", seconds) end
             if statusText then statusText.Text = seconds == 0 and "Moving to new server soon" or "Server restart in " .. countdown(seconds) end
             if bannerTimer then bannerTimer.Text = countdown(seconds) end
             if seconds <= 30 and activePresentation == "banner" then setPresentation("full") end
@@ -780,6 +793,11 @@ local function update(status: string, target: number, message: string)
     local seconds = secondsRemaining()
     local presentation = status == "scheduled" and seconds > 30 and not arrivalMode and "banner" or "full"
     setPresentation(presentation)
+    if activeGui then
+        activeGui:SetAttribute("Status", status)
+        activeGui:SetAttribute("RestartAt", restartAt)
+        activeGui:SetAttribute("CountdownSeconds", seconds)
+    end
     if not title or not statusText or not description or not phaseLabel then return end
     if status ~= previousStatus then
         cancelStatusTweens()
@@ -869,19 +887,30 @@ if arriving and arriving:IsA("ScreenGui") and (arriving.Name == guiName or (arri
     inspectArrivingProfile()
 end
 
-task.spawn(function()
-    local remote = ReplicatedStorage:WaitForChild("NexusDataStoreRestart_" .. STORE_NAME, 30)
-    if not remote or not remote:IsA("RemoteEvent") then return end
-    local function receive(status: any, timestamp: any, message: any)
-        if typeof(status) ~= "string" or status == "idle" or arrivalMode then return end
-        update(status, typeof(timestamp) == "number" and timestamp or 0, typeof(message) == "string" and message or "")
-        if activeGui then
-            local ok, err = pcall(TeleportService.SetTeleportGui, TeleportService, activeGui)
-            if not ok then warn("[NexusDataStore UI] Could not prepare teleport GUI:", err) end
-        end
+-- Bind even if the server creates the restart RemoteEvent after the old 30-second wait window.
+local restartRemoteName = "NexusDataStoreRestart_" .. STORE_NAME
+local restartRemote: RemoteEvent? = nil
+local restartChildConnection: RBXScriptConnection? = nil
+
+local function receiveRestart(status: any, timestamp: any, message: any)
+    if typeof(status) ~= "string" or status == "idle" or arrivalMode then return end
+    update(status, typeof(timestamp) == "number" and timestamp or 0, typeof(message) == "string" and message or "")
+    if activeGui then
+        local ok, err = pcall(TeleportService.SetTeleportGui, TeleportService, activeGui)
+        if not ok then warn("[NexusDataStore UI] Could not prepare teleport GUI:", err) end
     end
-    remote.OnClientEvent:Connect(receive)
-    receive(remote:GetAttribute("Status"), remote:GetAttribute("RestartAt"), remote:GetAttribute("Message"))
-end)
+end
+
+local function bindRestartRemote(remote: Instance)
+    if restartRemote ~= nil or remote.Name ~= restartRemoteName or not remote:IsA("RemoteEvent") then return end
+    restartRemote = remote
+    if restartChildConnection then restartChildConnection:Disconnect(); restartChildConnection = nil end
+    remote.OnClientEvent:Connect(receiveRestart)
+    receiveRestart(remote:GetAttribute("Status"), remote:GetAttribute("RestartAt"), remote:GetAttribute("Message"))
+end
+
+restartChildConnection = ReplicatedStorage.ChildAdded:Connect(bindRestartRemote)
+local initialRestartRemote = ReplicatedStorage:FindFirstChild(restartRemoteName)
+if initialRestartRemote then bindRestartRemote(initialRestartRemote) end
 
 

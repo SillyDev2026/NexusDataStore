@@ -268,5 +268,41 @@ test("Released notifications wake waiters without changing ownership", function(
     assert(store.HandoffWakeGeneration.test == 1, "Untrusted notification triggered retry")
 end)
 
+test("v8.5 TryGet is nonthrowing and detaches returned tables", function()
+    local session = profile()
+    local ok, items = session:TryGet("Inventory")
+    assert(ok and items[1] == "Potion")
+    items[1] = "modified"
+    assert(session.Data.Inventory[1] == "Potion")
+    local exists, missing = session:TryGet("DoesNotExist")
+    assert(exists and missing == nil)
+    local valid, reason = session:TryGet({})
+    assert(not valid and string.find(reason, "INVALID_PATH:", 1, true) == 1)
+    session.Active = false
+    local active, inactiveReason = session:TryGet("Coins")
+    assert(not active and inactiveReason == "SESSION_INACTIVE")
+end)
+
+test("v8.5 WaitForSession respects zero timeout and closing", function()
+    local session = profile()
+    local store = session.Store
+    store.Config.KeyPrefix = ""
+    assert(store:WaitForSession("test", 0) == session)
+    local missing, reason = store:WaitForSession("missing", 0)
+    assert(missing == nil and reason == "SESSION_WAIT_TIMEOUT")
+    local invalid, invalidReason = store:WaitForSession({}, 0)
+    assert(invalid == nil and invalidReason == "INVALID_SESSION_KEY")
+    store.Closing = true
+    local closed, closedReason = store:WaitForSession("missing", 1)
+    assert(closed == nil and closedReason == "STORE_CLOSING")
+end)
+
+test("v8.5 GetStatus includes pending and heartbeat diagnostics", function()
+    local session = profile()
+    local status = session:GetStatus()
+    assert(status.CommitBusy == false and status.SavePending == false and status.Releasing == false)
+    assert(status.NextAutoSaveIn >= 0 and status.LastHeartbeatAge >= 0)
+end)
+
 print(string.format("Behavioral tests: %d passed, %d failed", passed, failed))
 assert(failed == 0, "Behavioral regressions failed")

@@ -167,6 +167,7 @@ export type Session<T> = {
 	IsActive: (self: Session<T>) -> boolean,
 	IsDirty: (self: Session<T>) -> boolean,
 	Get: (self: Session<T>, path: Path) -> any,
+	TryGet: (self: Session<T>, path: Path) -> (boolean, any),
 	GetOr: (self: Session<T>, path: Path, fallback: any) -> any,
 	Has: (self: Session<T>, path: Path) -> boolean,
 	SetDefault: (self: Session<T>, path: Path, value: any) -> (boolean, any, boolean?),
@@ -297,7 +298,7 @@ local activeSoftShutdownStores = setmetatable({}, {__mode = "k"})
 
 local NexusDataStore: any = {}
 NexusDataStore.__index = NexusDataStore
-NexusDataStore.Version = "8.4.3"
+NexusDataStore.Version = "8.5.0"
 NexusDataStore.RecordFormat = 700
 NexusDataStore.RequiredCompressionVersion = "2.3.0"
 
@@ -1778,6 +1779,10 @@ function NexusDataStore:OpenAsync(key: string | number, context: OpenContext?): 
 			if self.Closing or self.Closed then return nil, "STORE_CLOSING" end
 			if openContext.Player and openContext.Player.Parent ~= Players then return nil, "PLAYER_LEFT" end
 			success, result = self:_Retry(function()
+				acquireError = nil
+				lockedOwner = nil
+				recordForSession = nil
+				encodeReport = nil
 				return self.DataStore:UpdateAsync(normalizedKey, function(raw, keyInfo)
 					acquireError = nil
 					lockedOwner = nil
@@ -1994,15 +1999,20 @@ function NexusDataStore:WaitForSession(keyOrPlayer: string | number | Player, ti
 	if timeout ~= nil and (not finiteNumber(timeout) or timeout < 0) then
 		return nil, "INVALID_WAIT_TIMEOUT"
 	end
+	local isPlayer = typeof(keyOrPlayer) == "Instance" and keyOrPlayer:IsA("Player")
+	if not isPlayer and self:_ResolveKey(keyOrPlayer) == nil then return nil, "INVALID_SESSION_KEY" end
 	local deadline = now() + (timeout or self.Config.LoadTimeout)
-	repeat
+	while not self.Closed and not self.Closing do
+		if isPlayer and keyOrPlayer.Parent ~= Players then return nil, "PLAYER_LEFT" end
 		local session = self:GetSession(keyOrPlayer)
-		if session and session:IsActive() then
-			return session
-		end
-		task.wait(0.05)
-	until now() >= deadline or self.Closed
-	return nil, self.Closed and "STORE_CLOSED" or "SESSION_WAIT_TIMEOUT"
+		if session and session:IsActive() then return session end
+		local remaining = deadline - now()
+		if remaining <= 0 then break end
+		task.wait(math.min(0.05, remaining))
+	end
+	if self.Closed then return nil, "STORE_CLOSED" end
+	if self.Closing then return nil, "STORE_CLOSING" end
+	return nil, "SESSION_WAIT_TIMEOUT"
 end
 
 function NexusDataStore:_AcquireCommitLock(session: any, absoluteDeadline: number?): (boolean, string?)
@@ -2097,6 +2107,8 @@ function NexusDataStore:_Commit(session: any, release: boolean, reason: string):
 		local encodeReport
 
 		local success, result = self:_Retry(function()
+			saveError = nil
+			encodeReport = nil
 			return self.DataStore:UpdateAsync(session.Key, function(raw, keyInfo)
 				saveError = nil
 				encodeReport = nil
@@ -2160,6 +2172,7 @@ function NexusDataStore:_Commit(session: any, release: boolean, reason: string):
 			if confirmed and confirmed.LastCommitId == commitId
 				and ((release and confirmed.Lock == nil) or (not release and self:_OwnsRecord(confirmed, session))) then
 				success = true
+				saveError = nil
 				nextRevision = confirmed.Revision
 				encodeReport = nil
 			else
@@ -3569,6 +3582,16 @@ function Session:Get(path: Path): any
 	return clone(getAt(self.Data, path))
 end
 
+-- Non-throwing, detached reads for optional data and untrusted paths.
+function Session:TryGet(path: Path): (boolean, any)
+	if not self:IsActive() then return false, "SESSION_INACTIVE" end
+	local ok, value = pcall(function()
+		return clone(getAt(self.Data, path))
+	end)
+	if not ok then return false, "INVALID_PATH:" .. tostring(value) end
+	return true, value
+end
+
 function Session:GetOr(path: Path, fallback: any): any
 	local value = getAt(self.Data, path)
 	if value == nil then
@@ -3769,7 +3792,8 @@ function Session:UpdatePath(path: Path, callback): (boolean, any)
 	if not valid then return false, "INVALID_PATH:" .. tostring(keys) end
 	local baseMutationId = self.MutationId
 	-- A yielding callback must not overwrite a direct edit of this path.
-	local original = clone(getAt(self.Data, keys))
+	local captured, original = pcall(function() return clone(getAt(self.Data, keys)) end)
+	if not captured then return false, "INVALID_PATH_VALUE:" .. tostring(original) end
 	local ok, transformed = pcall(callback, clone(original), self)
 	if not ok then
 		return false, tostring(transformed)
@@ -3799,7 +3823,8 @@ function Session:Mutate(callback: (draft: Data, session: Session<Data>) -> any):
 	if not mutable then
 		return false, mutableErr
 	end
-	local draft = clone(self.Data) :: Data
+	local draftOK, draft = pcall(clone, self.Data)
+	if not draftOK then return false, "INVALID_MUTATION_SOURCE:" .. tostring(draft) end
 	-- Preserve the callback-start state when direct edits can bypass MutationId.
 	-- Without this guard, a yielding Mutate callback could silently replace newer
 	-- direct changes with an outdated draft.
@@ -3978,6 +4003,12 @@ function Session:GetStatus()
 		SchemaVersion = self.SchemaVersion,
 		Age = now() - self.OpenedAt,
 		LastSaveAge = now() - self.LastSaveAt,
+		LastHeartbeatAge = now() - self.LastHeartbeatAt,
+		NextAutoSaveIn = math.max(0, self.NextAutoSaveAt - now()),
+		CommitBusy = self.CommitBusy,
+		Releasing = self.Releasing,
+		SavePending = self.SavePending,
+		HeartbeatPending = self.HeartbeatPending,
 		Mutations = self.MutationId,
 	}
 end
