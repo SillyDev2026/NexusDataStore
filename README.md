@@ -491,7 +491,7 @@ local publish = Store:GetAutoPublishStatus()
 print(metrics.ActiveSessions, metrics.DirtySessions, metrics.SaveFailed)
 print(health.Version, health.CompressionVersion)
 print(performance.Enabled, performance.SavesCoalesced)
-print(shutdown.Status, publish.Status)
+print(shutdown.Status, publish.RestartScheduled)
 
 local savedConnection = Store:On("Saved", function(session, priority, releasing)
     print("Saved:", session.Key, priority, releasing)
