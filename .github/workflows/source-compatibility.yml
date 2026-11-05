@@ -17,6 +17,8 @@ jobs:
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
+      - name: Enforce same-line Luau local assignments
+        run: python3 tools/check_luau_style.py
       - name: Verify version, API, codec and benchmark scripts
         run: python3 tools/verify_release.py
 
