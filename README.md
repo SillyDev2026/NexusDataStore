@@ -2,17 +2,42 @@
 
 **Typed, session-aware data persistence for Roblox.**
 
-![Version](https://img.shields.io/badge/NexusDataStore-8.4.3-2563eb)
+![Version](https://img.shields.io/badge/NexusDataStore-8.5.0-2563eb)
 ![Codec](https://img.shields.io/badge/Compression-2.6.1-0f766e)
 ![Luau](https://img.shields.io/badge/language-Luau-00a2ff)
 ![Platform](https://img.shields.io/badge/platform-Roblox-222222)
 
 NexusDataStore brings standard Roblox DataStore persistence, session ownership, typed player profiles, validation, migrations, snapshots, adaptive compression, and numeric leaderboards into one server-side library.
 
-**Current version:** `8.4.3` · **Compression:** `2.6.1` / codecs `230`–`233` · **Record format:** `700`
+**Current version:** `8.5.0` · **Compression:** `2.6.1` / codecs `230`–`233` · **Record format:** `700`
 
 > [!IMPORTANT]
 > This documentation describes the current source on `main`. Regression scripts are included, but production reliability and performance have not been certified by live-server load testing. Use a separate test universe before deploying changes to existing player data.
+
+## New in 8.5.0 — Session reliability and restart QoL
+
+This release updates the Roblox server module and the ReplicatedFirst restart LocalScript. It preserves record format `700`, Compression `2.6.1`, the existing codecs, and storage compatibility with v8.4.3.
+
+- **Reliable reads:** `profile:TryGet(path)` returns `true, value` or `false, error` without throwing for invalid paths. Returned tables are detached copies; a valid missing field returns `true, nil`.
+- **Session waits:** `Store:WaitForSession(key, 0)` returns immediately when no active session exists; invalid keys, store shutdown, and departed players now receive explicit errors instead of needless polling.
+- **Safer retries:** Each backend write attempt clears transient error state, and a verified lost-ack save resets stale errors before accepting a confirmed commit. No session lock or persisted record format changes are needed.
+- **Safer mutation callbacks:** `UpdatePath` and `Mutate` report invalid source/path copies as errors rather than allowing an unexpected clone exception to escape.
+- **Better session diagnostics:** `profile:GetStatus()` includes commit activity, pending saves/heartbeats, releasing state, time until autosave, and heartbeat age.
+- **Restart UI:** Countdown uses Roblox's synchronized server clock with a fallback; RemoteEvents created later than 30 seconds are still received; UI attributes expose current status, presentation, fullscreen mode, countdown and reduced-motion mode. Labels continue to avoid automatic text shrinking.
+- **Regression coverage:** Portable session tests and static source checks exercise the new API and lifecycle behavior. Roblox Studio and published-universe load/teleport testing are still required before production rollout.
+
+### v8.5.0 read example
+
+~~~lua
+local ok, coins = profile:TryGet("Coins")
+if not ok then warn("Read failed:", coins) else print("Coins:", coins) end
+local status = profile:GetStatus()
+print("Dirty:", status.Dirty, "Next autosave:", status.NextAutoSaveIn)
+~~~
+
+### Deployment
+
+Update `DataStore.lua` and `SoftShutdownClient.client.lua` together. Keep the existing `Compression.lua` and `PlayersData` modules; do not reset or migrate player records for this release. Test in a separate universe and verify save/release/rejoin, handoff and shutdown on live Roblox servers.
 
 ## New in 8.4.3 — Fix tiny unreadable shutdown text
 
