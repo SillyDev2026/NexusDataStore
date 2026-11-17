@@ -2,6 +2,7 @@
 """Run real module methods in Luau with service stubs; not a Roblox emulator."""
 import argparse
 from pathlib import Path
+from shutil import which
 import subprocess
 import tempfile
 
@@ -9,7 +10,9 @@ ROOT = Path(__file__).resolve().parent.parent
 parser = argparse.ArgumentParser()
 parser.add_argument('--luau', default='luau')
 args = parser.parse_args()
-source = (ROOT / 'DataStore.lua').read_text()
+if which(args.luau) is None:
+    parser.error(f"Luau executable not found: {args.luau!r}; pass --luau with the path to the Luau CLI")
+source = (ROOT / 'DataStore.lua').read_text(encoding='utf-8')
 source = source.replace('local PlayersData = require(script.PlayersData)', 'local PlayersData = {}', 1)
 prelude = '''local services = {}
 local game = {GetService = function(_self, name)
@@ -20,14 +23,14 @@ local Enum = {DataStoreRequestType = {}}
 local task = {spawn = function(callback, ...) callback(...) end}
 local DataStore = (function()
 '''
-tests = (ROOT / 'tests/PortableSessionRegression.luau').read_text() + '\n' + (ROOT / 'tests/PortableCompressionPolicyRegression.luau').read_text() + '\n' + (ROOT / 'tests/PortableSoftShutdownRegression.luau').read_text() + '\n' + (ROOT / 'tests/PortableFramePacingRegression.luau').read_text() + '\n' + (ROOT / 'tests/PortableAutoPublishRegression.luau').read_text()
+tests = (ROOT / 'tests/PortableSessionRegression.luau').read_text(encoding='utf-8') + '\n' + (ROOT / 'tests/PortableCompressionPolicyRegression.luau').read_text(encoding='utf-8') + '\n' + (ROOT / 'tests/PortableSoftShutdownRegression.luau').read_text(encoding='utf-8') + '\n' + (ROOT / 'tests/PortableFramePacingRegression.luau').read_text(encoding='utf-8') + '\n' + (ROOT / 'tests/PortableAutoPublishRegression.luau').read_text(encoding='utf-8')
 with tempfile.TemporaryDirectory(prefix='nexus-tests-') as directory:
     bundle = Path(directory) / 'suite.luau'
-    bundle.write_text(prelude + source + '\nend)()\n' + tests)
+    bundle.write_text(prelude + source + '\nend)()\n' + tests, encoding='utf-8')
     session_result = subprocess.run([args.luau, str(bundle)])
-    codec = (ROOT / 'Compression.lua').read_text()
-    regression = (ROOT / 'tests/CompressionRegression.server.lua').read_text()
+    codec = (ROOT / 'Compression.lua').read_text(encoding='utf-8')
+    regression = (ROOT / 'tests/CompressionRegression.server.lua').read_text(encoding='utf-8')
     regression = regression.replace('local Compression = require(script.Parent:WaitForChild("Compression"))', '', 1)
-    bundle.write_text('local Compression = (function()\n' + codec + '\nend)()\n' + regression)
+    bundle.write_text('local Compression = (function()\n' + codec + '\nend)()\n' + regression, encoding='utf-8')
     codec_result = subprocess.run([args.luau, str(bundle)])
     raise SystemExit(1 if session_result.returncode or codec_result.returncode else 0)
