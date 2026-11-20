@@ -20,10 +20,11 @@ local Enum = {DataStoreRequestType = {}}
 local task = {spawn = function(callback, ...) callback(...) end}
 local DataStore = (function()
 '''
-tests = (ROOT / 'tests/PortableSessionRegression.luau').read_text() + '\n' + (ROOT / 'tests/PortableCompressionPolicyRegression.luau').read_text() + '\n' + (ROOT / 'tests/PortableSoftShutdownRegression.luau').read_text() + '\n' + (ROOT / 'tests/PortableFramePacingRegression.luau').read_text() + '\n' + (ROOT / 'tests/PortableAutoPublishRegression.luau').read_text() + '\n' + (ROOT / 'tests/PortableV9Regression.luau').read_text()
+tests = (ROOT / 'tests/PortableSessionRegression.luau').read_text() + '\n' + (ROOT / 'tests/PortableCompressionPolicyRegression.luau').read_text() + '\n' + (ROOT / 'tests/PortableSoftShutdownRegression.luau').read_text() + '\n' + (ROOT / 'tests/PortableFramePacingRegression.luau').read_text() + '\n' + (ROOT / 'tests/PortableAutoPublishRegression.luau').read_text() + '\n' + (ROOT / 'tests/PortableV9Regression.luau').read_text() + '\n' + (ROOT / 'tests/PortableReceiptRegression.luau').read_text()
+receipts_source = (ROOT / 'NexusReceipts.lua').read_text()
 with tempfile.TemporaryDirectory(prefix='nexus-tests-') as directory:
     bundle = Path(directory) / 'suite.luau'
-    bundle.write_text(prelude + source + '\nend)()\n' + tests)
+    bundle.write_text(prelude + source + '\nend)()\nlocal NexusReceipts = (function()\n' + receipts_source + '\nend)()\n' + tests)
     session_result = subprocess.run([args.luau, str(bundle)])
     codec = (ROOT / 'Compression.lua').read_text()
     regression = (ROOT / 'tests/CompressionRegression.server.lua').read_text()
