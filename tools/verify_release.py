@@ -208,7 +208,7 @@ check("v8.5 session status diagnostics", all(token in data for token in ('NextAu
 check("v8.5 server-synchronized restart countdown", 'Workspace.GetServerTimeNow' in client and 'DateTime.now().UnixTimestamp' in client)
 check("v8.5 late restart RemoteEvent binding", 'ReplicatedStorage.ChildAdded:Connect(bindRestartRemote)' in client and 'WaitForChild("NexusDataStoreRestart_"' not in client)
 check("v8.5 restart UI exposes operational attributes", all(token in client for token in ('"ReducedMotion"', '"CountdownSeconds"', '"Fullscreen"', '"Presentation"', '"Status"')))
-check("v8.5 release notes and example", '## New in 8.5.0' in readme and 'profile:TryGet("Coins")' in readme)
+check("v8.5 release notes and example", '## Previously in 8.5.0' in readme and 'profile:TryGet("Coins")' in readme)
 # Current README documents all exported public methods without requiring a historical release scroll.
 public_methods = sorted(set(re.findall(r'^function (?:NexusDataStore|Session|OrderedStore):([A-Za-z][A-Za-z0-9_]*)\(', data, flags=re.MULTILINE)))
 missing_public = [method for method in public_methods if not re.search(r'\b' + re.escape(method) + r'\(', readme)]
@@ -217,6 +217,13 @@ if missing_public:
     print("Undocumented public methods:", ", ".join(missing_public))
 check("current README has quick start, all API families, compression, migration and safety", all(section in readme for section in ("## Install and quick start", "## Complete profile API examples", "## Complete store API examples", "## Ordered leaderboards", "## Compression and record size", "## Schemas and migrations", "## Restart and cross-server handoff", "## Configuration reference", "## API reference", "## Testing and troubleshooting")))
 check("legacy release history is archived separately", "# NexusDataStore" in historical_docs and "## Previously in 8.4.3" not in readme and "## New in 8.4.3" in historical_docs)
+check("v9 modern engine is included and version-pinned", (ROOT / "CompressionLatest.lua").exists() and 'return "2.6.5"' in (ROOT / "CompressionLatest.lua").read_text(encoding="utf-8"))
+check("v9 keeps legacy record format and codec values", 'local RECORD_FORMAT = 700' in data and 'local MODERN_CODEC = 250' in data and 'CodecVersion = 230' in codec)
+check("v9 modern encoder is opt-in", 'EnableModernCompression = config.EnableModernCompression == true' in data and 'if self.Config.EnableModernCompression and self.ModernCompressionEngine then' in data)
+check("v9 decodes modern even without enabling new writes", 'local isModern = declaredCodec == MODERN_CODEC' in data and 'decoder = isModern and self.ModernCompressionEngine or self.CompressionEngine' in data)
+check("v9 has read-only history inspection", all(token in data for token in ('function NexusDataStore:ListVersionsAsync(', 'function NexusDataStore:GetVersionAsync(', 'function NexusDataStore:PreviewRestoreAsync(')))
+check("v9 includes receipt retry adapter", (ROOT / "NexusReceipts.lua").exists() and 'ProcessReceipt' in (ROOT / "NexusReceipts.lua").read_text(encoding="utf-8") and 'SaveAsync("critical")' in (ROOT / "NexusReceipts.lua").read_text(encoding="utf-8"))
+check("v9 portable regressions are wired", (ROOT / "tests/PortableV9Regression.luau").exists() and "PortableV9Regression.luau" in (ROOT / "tools/run_behavioral_tests.py").read_text(encoding="utf-8"))
 check("Luau style checker is included", (ROOT / "tools" / "check_luau_style.py").is_file())
 failures = [name for name, passed in checks if not passed]
 print(f"\nStatic release gate: {len(checks) - len(failures)}/{len(checks)} passed")
