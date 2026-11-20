@@ -90,6 +90,9 @@ export type StoreConfig<T> = {
 	ChangeJournalLimit: number?,
 	Compression: boolean?,
 	CompressionModule: ModuleScript?,
+	ModernCompressionModule: ModuleScript?,
+	EnableModernCompression: boolean?,
+	ModernCompressionOptions: {[string]: any}?,
 	CompressionOptions: CompressionOptions?,
 	CompressionReports: boolean?,
 	CompressionMinBytes: number?,
@@ -247,6 +250,9 @@ export type Store<T> = {
 	GetSchema: (self: Store<T>) -> {[string]: SchemaRule}?,
 	PreviewMigration: (self: Store<T>, data: T, fromVersion: number, key: string?) -> (any?, string?),
 	GetStorageForecast: (self: Store<T>, dataOrSession: any, warningRatio: number?) -> (any?, string?),
+	ListVersionsAsync: (self: Store<T>, key: string | number, limit: number?) -> ({any}?, string?),
+	GetVersionAsync: (self: Store<T>, key: string | number, version: string) -> (T?, any),
+	PreviewRestoreAsync: (self: Store<T>, key: string | number, version: string) -> (any?, string?),
 	GetVersion: (self: Store<T>) -> string,
 	EncodeCompressed: (self: Store<T>, data: any) -> (buffer?, any),
 	DecodeCompressed: (self: Store<T>, raw: buffer) -> (any?, string?),
@@ -280,6 +286,7 @@ export type NexusDataStoreModule = {
 	Version: string,
 	RecordFormat: number,
 	RequiredCompressionVersion: string,
+	ModernCompressionVersion: string,
 	Errors: {[string]: string},
 	OrderedDataStore: any,
 	Compression: any,
@@ -298,9 +305,10 @@ local activeSoftShutdownStores = setmetatable({}, {__mode = "k"})
 
 local NexusDataStore: any = {}
 NexusDataStore.__index = NexusDataStore
-NexusDataStore.Version = "8.5.0"
+NexusDataStore.Version = "9.0.0"
 NexusDataStore.RecordFormat = 700
 NexusDataStore.RequiredCompressionVersion = "2.3.0"
+NexusDataStore.ModernCompressionVersion = "2.6.5"
 
 local Session: any = {}
 Session.__index = Session
@@ -312,6 +320,7 @@ local Signal: any = {}
 Signal.__index = Signal
 
 local RECORD_FORMAT = 700
+local MODERN_CODEC = 250
 local REQUIRED_COMPRESSION_VERSION = "2.3.0"
 local MAX_SAFE_INTEGER = 9007199254740991
 
@@ -540,6 +549,7 @@ local REQUEST_ORDERED_READ = resolveRequestType({"OrderedRead", "GetAsync"})
 local REQUEST_ORDERED_WRITE = resolveRequestType({"OrderedWrite", "SetIncrementSortedAsync", "UpdateAsync"})
 local REQUEST_ORDERED_LIST = resolveRequestType({"OrderedList", "GetSortedAsync"})
 local REQUEST_ORDERED_REMOVE = resolveRequestType({"OrderedRemove"})
+local REQUEST_STANDARD_LIST = resolveRequestType({"StandardList", "ListAsync"})
 local REQUEST_STANDARD_UPDATE = {REQUEST_GET, REQUEST_UPDATE}
 local REQUEST_ORDERED_UPDATE = {REQUEST_ORDERED_READ, REQUEST_ORDERED_WRITE}
 
@@ -1029,6 +1039,27 @@ local function compressionResolve(configured: ModuleScript?): (any?, string?)
 	end
 	if tonumber(engine.CodecVersion) ~= 230 then
 		return nil, "Compression codec 230 required"
+	end
+	return engine
+end
+
+-- Legacy table packets and modern v2.6.5 packets are incompatible on-wire.
+-- Both engines stay installed so old persisted records continue to decode.
+local function modernCompressionResolve(configured: ModuleScript?): (any?, string?)
+	local candidate: Instance? = configured
+	if candidate == nil then candidate = script:FindFirstChild("CompressionLatest") end
+	if candidate == nil and script.Parent then candidate = script.Parent:FindFirstChild("CompressionLatest") end
+	if candidate == nil then return nil, "CompressionLatest ModuleScript not installed" end
+	if not candidate:IsA("ModuleScript") then return nil, "ModernCompressionModule must be a ModuleScript" end
+	local ok, engine = pcall(require, candidate)
+	if not ok then return nil, "Modern compression require failed:" .. tostring(engine) end
+	if typeof(engine) ~= "table" or typeof(engine.Version) ~= "function"
+		or typeof(engine.CompressTablePacket) ~= "function" or typeof(engine.DecompressTable) ~= "function" then
+		return nil, "Modern engine does not expose packet-compatible table functions"
+	end
+	local versionOK, version = pcall(engine.Version)
+	if not versionOK or tostring(version) ~= "2.6.5" then
+		return nil, "Modern compression version 2.6.5 required; got " .. tostring(version)
 	end
 	return engine
 end
@@ -2895,6 +2926,8 @@ function NexusDataStore:GetHealth()
 		Version = NexusDataStore.Version,
 		RecordFormat = RECORD_FORMAT,
 		CompressionVersion = self.CompressionEngineVersion,
+		ModernCompressionVersion = self.ModernCompressionEngineVersion,
+		ModernCompressionWrites = self.Config.EnableModernCompression,
 		Closed = self.Closed,
 		Closing = self.Closing,
 		JobId = self.JobId,
@@ -4045,6 +4078,10 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 		end
 	end
 	assert(config.CompressionOptions == nil or typeof(config.CompressionOptions) == "table", "CompressionOptions must be a table")
+	assert(config.ModernCompressionOptions == nil or typeof(config.ModernCompressionOptions) == "table", "ModernCompressionOptions must be a table")
+	assert(config.EnableModernCompression == nil or typeof(config.EnableModernCompression) == "boolean", "EnableModernCompression must be a boolean")
+	assert(config.EnableModernCompression ~= true or config.Compression ~= false, "Modern compression requires Compression = true")
+	assert(config.ModernCompressionModule == nil or (typeof(config.ModernCompressionModule) == "Instance" and config.ModernCompressionModule:IsA("ModuleScript")), "ModernCompressionModule must be a ModuleScript")
 	assert(config.CompressionTransport == nil or config.CompressionTransport == "auto" or config.CompressionTransport == "buffer" or config.CompressionTransport == "base64", "CompressionTransport must be auto, buffer, or base64")
 	assert(config.CompressionStrategy == nil or config.CompressionStrategy == "balanced" or config.CompressionStrategy == "smallest", "CompressionStrategy must be balanced or smallest")
 	assert(config.CompressionPolicy == nil or config.CompressionPolicy == "adaptive" or config.CompressionPolicy == "always-smallest", "CompressionPolicy must be adaptive or always-smallest")
@@ -4096,6 +4133,9 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 		ChangeJournalLimit = configNumber(config.ChangeJournalLimit, 0, 0, "ChangeJournalLimit", true, 1000),
 		Compression = config.Compression ~= false,
 		CompressionModule = config.CompressionModule,
+		ModernCompressionModule = config.ModernCompressionModule,
+		EnableModernCompression = config.EnableModernCompression == true,
+		ModernCompressionOptions = clone(config.ModernCompressionOptions or {UseStringDictionary = true, RunLengthArrays = true, EntropyCoding = true, EntropyStrategy = "Auto"}),
 		CompressionOptions = clone(config.CompressionOptions or {}),
 		CompressionReports = config.CompressionReports == true,
 		CompressionMinBytes = configNumber(config.CompressionMinBytes, 512, 0, "CompressionMinBytes", true),
@@ -4235,6 +4275,11 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 		versionOK, compressionVersion = pcall(compressionEngine.Version)
 	end
 	self.CompressionEngineVersion = versionOK and compressionVersion ~= nil and tostring(compressionVersion) or nil
+	local modernEngine, modernError = modernCompressionResolve(config.ModernCompressionModule)
+	self.ModernCompressionEngine = modernEngine
+	self.ModernCompressionError = modernError
+	self.ModernCompressionEngineVersion = modernEngine and "2.6.5" or nil
+	assert(not self.Config.EnableModernCompression or modernEngine ~= nil, "ModernCompressionModule v2.6.5 required: " .. tostring(modernError))
 	if self.Config.Compression then
 		assert(compressionEngine ~= nil, "NexusDataStore compression requires compatible v2.3.x through v2.6.x engine (codec 230): " .. tostring(compressionError))
 		if self.Config.CompressionOptions.CompactEncoding or self.Config.CompressionPolicy == "always-smallest" then assert(tonumber(compressionEngine.CompactCodecVersion) == 231, "Compact encoding and always-smallest policy require Compression v2.4.0 or later (codec 231)") end
@@ -4260,7 +4305,7 @@ function NexusDataStore.new(config: StoreConfig<Data>): Store<Data>
 	end
 
 	local templateOK, templateErr = self:Validate(self.Template)
-	assert(templateOK,  "Invalid NexusDataStore v8 template: " .. tostring(templateErr))
+	assert(templateOK,  "Invalid NexusDataStore v9 template: " .. tostring(templateErr))
 	if self.Config.Compression then
 		local codecOK, codecErr = pcall(self.CompressionEngine.CompressTablePacket, self:_BuildNewRecord(clone(self.Template)), self.Config.CompressionOptions)
 		assert(codecOK, "Invalid Compression v2.3.x–v2.6.x configuration or template: " .. tostring(codecErr))
@@ -4318,6 +4363,8 @@ NexusDataStore.Compression = table.freeze({
 	CompatibleSeries = "2.3.x–2.6.x",
 	CompactCodecVersion = 231,
 	CodecVersion = 230,
+	ModernCodecVersion = MODERN_CODEC,
+	ModernEngineVersion = "2.6.5",
 	RecordFormat = RECORD_FORMAT,
 })
 
