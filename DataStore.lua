@@ -1328,6 +1328,39 @@ function NexusDataStore:_EncodeRecord(record: any): (any?, string?, any?)
 			end
 		end
 	end
+	-- The v2.6.5 packet format is assigned envelope codec 250; old codecs stay intact.
+	-- Writing remains opt-in until every live server can decode the modern packet.
+	if self.Config.EnableModernCompression and self.ModernCompressionEngine then
+		local modernOK, modernPacket = pcall(self.ModernCompressionEngine.CompressTablePacket, storageRecord, self.Config.ModernCompressionOptions)
+		if modernOK and typeof(modernPacket) == "table" and typeof(modernPacket.Data) == "buffer" then
+			local payloadBuffer = modernPacket.Data
+			local modernEnvelope, modernBytes, modernTransport = nil, math.huge, nil
+			if transport == "auto" or transport == "buffer" then
+				local envelope = {Format = RECORD_FORMAT, Codec = MODERN_CODEC, Compressed = true, Encoding = "buffer", Payload = payloadBuffer}
+				local bytes = self:_MeasureStoredValue(envelope)
+				if bytes ~= nil then modernEnvelope, modernBytes, modernTransport = envelope, bytes, "buffer" end
+			end
+			if transport == "auto" or transport == "base64" then
+				local baseOK, encoded = pcall(EncodingService.Base64Encode, EncodingService, payloadBuffer)
+				if baseOK then
+					local envelope = {Format = RECORD_FORMAT, Codec = MODERN_CODEC, Compressed = true, Encoding = "base64", Payload = buffer.tostring(encoded)}
+					local bytes = self:_MeasureStoredValue(envelope)
+					if bytes ~= nil and bytes < modernBytes then modernEnvelope, modernBytes, modernTransport = envelope, bytes, "base64" end
+				end
+			end
+			if modernEnvelope and modernBytes < bestBytes then
+				bestEnvelope, bestBytes, bestTransport = modernEnvelope, modernBytes, modernTransport
+				bestReport = {
+					Engine = "CompressionLatest", EngineVersion = self.ModernCompressionEngineVersion, SelectedCodec = MODERN_CODEC,
+					CodecVersion = MODERN_CODEC, Codec = modernPacket.Codec or "modern", EncodedBytes = buffer.len(payloadBuffer),
+					DictionaryEnabled = self.Config.ModernCompressionOptions.UseStringDictionary == true,
+				}
+			end
+		else
+			candidateFailures += 1
+			firstCandidateError = firstCandidateError or ("MODERN_COMPRESSION_FAILED:" .. tostring(modernPacket))
+		end
+	end
 	if bestEnvelope == nil then
 		if not enforceCompressed and rawBytes <= self.Config.MaxStoredBytes then
 			rawReport.SelectionReason = "compression-failed-raw-fallback"
@@ -1388,9 +1421,13 @@ function NexusDataStore:_DecodeRecord(raw: any): (any?, string?)
 		if not self.CompressionEngine then
 			return nil, "COMPRESSION_ENGINE_UNAVAILABLE:" .. tostring(self.CompressionEngineError)
 		end
-		local codec = tonumber(self.CompressionEngine.CodecVersion)
 		local declaredCodec = tonumber(raw.Codec)
-		if raw.Codec ~= nil and declaredCodec ~= codec and declaredCodec ~= tonumber(self.CompressionEngine.CompactCodecVersion) and declaredCodec ~= tonumber(self.CompressionEngine.PackedCodecVersion) and declaredCodec ~= tonumber(self.CompressionEngine.RunLengthCodecVersion) then
+		local isModern = declaredCodec == MODERN_CODEC
+		if isModern and not self.ModernCompressionEngine then
+			return nil, "MODERN_COMPRESSION_UNAVAILABLE:" .. tostring(self.ModernCompressionError)
+		end
+		local codec = tonumber(self.CompressionEngine.CodecVersion)
+		if not isModern and raw.Codec ~= nil and declaredCodec ~= codec and declaredCodec ~= tonumber(self.CompressionEngine.CompactCodecVersion) and declaredCodec ~= tonumber(self.CompressionEngine.PackedCodecVersion) and declaredCodec ~= tonumber(self.CompressionEngine.RunLengthCodecVersion) then
 			return nil, "UNSUPPORTED_COMPRESSION_CODEC:" .. tostring(raw.Codec)
 		end
 
@@ -1407,10 +1444,12 @@ function NexusDataStore:_DecodeRecord(raw: any): (any?, string?)
 			return nil, "INVALID_COMPRESSED_ENVELOPE"
 		end
 
-		if declaredCodec ~= nil and buffer.len(decodedBuffer) >= 6 and buffer.readu16(decodedBuffer, 4) ~= declaredCodec then
+		if not isModern and declaredCodec ~= nil and buffer.len(decodedBuffer) >= 6 and buffer.readu16(decodedBuffer, 4) ~= declaredCodec then
 			return nil, "COMPRESSED_ENVELOPE_CODEC_MISMATCH"
 		end
-		local ok, decoded = pcall(self.CompressionEngine.DecompressTable, decodedBuffer, self.Config.CompressionOptions)
+		local decoder = isModern and self.ModernCompressionEngine or self.CompressionEngine
+		local decoderOptions = isModern and self.Config.ModernCompressionOptions or self.Config.CompressionOptions
+		local ok, decoded = pcall(decoder.DecompressTable, decodedBuffer, decoderOptions)
 		if not ok then
 			return nil, "COMPRESSED_DECODE_FAILED:" .. tostring(decoded)
 		end
