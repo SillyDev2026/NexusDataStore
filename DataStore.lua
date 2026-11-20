@@ -2001,6 +2001,65 @@ function NexusDataStore:OpenPlayerAsync(player: Player): (Session<Data>?, string
 	})
 end
 
+-- Read-only historical browsing. Never acquires ownership or writes player keys.
+function NexusDataStore:ListVersionsAsync(key: string | number, limit: number?): ({any}?, string?)
+	if self.Closed then return nil, "STORE_CLOSED" end
+	if limit ~= nil and (not safeInteger(limit) or limit < 1 or limit > 100) then return nil, "INVALID_VERSION_LIMIT" end
+	local keyOK, normalizedKey = pcall(normalizeDataKey, key, self.Config.KeyPrefix)
+	if not keyOK then return nil, "INVALID_DATA_KEY:" .. tostring(normalizedKey) end
+	local success, pages = self:_Retry(function()
+		return self.DataStore:ListVersionsAsync(normalizedKey, Enum.SortDirection.Descending, nil, nil, limit or 30)
+	end, REQUEST_STANDARD_LIST, now() + self.Config.LoadTimeout, "VERSION_LIST_TIMEOUT")
+	if not success then return nil, tostring(pages) end
+	local pageOK, currentPage = pcall(pages.GetCurrentPage, pages)
+	if not pageOK or typeof(currentPage) ~= "table" then return nil, "VERSION_PAGE_FAILED:" .. tostring(currentPage) end
+	local output = {}
+	for i, item in ipairs(currentPage) do
+		if i > (limit or 30) then break end
+		output[i] = {Version = item.Version, CreatedTime = item.CreatedTime, IsDeleted = item.IsDeleted == true}
+	end
+	return output
+end
+
+-- Return a historical record as a detached view; it is NOT a live session.
+function NexusDataStore:GetVersionAsync(key: string | number, version: string): (Data?, any)
+	if self.Closed then return nil, "STORE_CLOSED" end
+	if typeof(version) ~= "string" or #version < 1 or #version > 128 then return nil, "INVALID_VERSION_ID" end
+	local keyOK, normalizedKey = pcall(normalizeDataKey, key, self.Config.KeyPrefix)
+	if not keyOK then return nil, "INVALID_DATA_KEY:" .. tostring(normalizedKey) end
+	local success, raw = self:_Retry(function()
+		return self.DataStore:GetVersionAsync(normalizedKey, version)
+	end, REQUEST_GET, now() + self.Config.LoadTimeout, "VERSION_READ_TIMEOUT")
+	if not success then return nil, tostring(raw) end
+	if raw == nil then return nil, "VERSION_NOT_FOUND" end
+	local record, err = self:_DecodeRecord(raw)
+	if not record then return nil, err end
+	return clone(record.Data) :: Data, {
+		Version = version, SchemaVersion = record.SchemaVersion, Revision = record.Revision,
+		CreatedAt = record.CreatedAt, UpdatedAt = record.UpdatedAt,
+	}
+end
+
+-- Validate a historical candidate against current schema; no restoration is attempted.
+function NexusDataStore:PreviewRestoreAsync(key: string | number, version: string): (any?, string?)
+	local historical, details = self:GetVersionAsync(key, version)
+	if historical == nil then return nil, tostring(details) end
+	local preview, migrationError = self:PreviewMigration(historical, details.SchemaVersion, tostring(key))
+	if preview == nil then return nil, "RESTORE_MIGRATION_FAILED:" .. tostring(migrationError) end
+	local current, currentDetails = self:PeekAsync(key)
+	if current == nil and currentDetails ~= "NOT_FOUND" then return nil, tostring(currentDetails) end
+	local changes: {Change} = {}
+	diffValues(current or self.Template, preview.Data, {}, changes, {})
+	local forecast, forecastError = self:GetStorageForecast(preview.Data)
+	if forecast == nil then return nil, "RESTORE_STORAGE_FAILED:" .. tostring(forecastError) end
+	return {
+		Version = version, CurrentFound = current ~= nil, Historical = details,
+		FromSchemaVersion = details.SchemaVersion, ToSchemaVersion = self.SchemaVersion,
+		Changes = changes, Data = preview.Data, StorageForecast = forecast,
+		ReadOnly = true,
+	}
+end
+
 function NexusDataStore:PeekAsync(key: string | number): (Data?, {[string]: any} | string?)
 	if self.Closed then
 		return nil, "STORE_CLOSED"
