@@ -3069,8 +3069,7 @@ local function packetFromBuffer(
 		and math.max(0, -byteDelta)
 		or nil
 
-	local savingsPercent =
-		rawBytes
+	local savingsPercent = rawBytes
 		and rawBytes > 0
 		and math.max(
 			0,
@@ -3080,8 +3079,7 @@ local function packetFromBuffer(
 		)
 		or 0
 
-	local expansionPercent =
-		rawBytes
+	local expansionPercent = rawBytes
 		and rawBytes > 0
 		and math.max(
 			0,
@@ -3091,14 +3089,12 @@ local function packetFromBuffer(
 		)
 		or 0
 
-	local ratio =
-		rawBytes
+	local ratio = rawBytes
 		and rawBytes > 0
 		and bytes / rawBytes
 		or nil
 
-	local savedBits =
-		rawBits ~= nil
+	local savedBits = rawBits ~= nil
 		and math.max(
 			0,
 			(rawBits :: number)
@@ -3106,8 +3102,7 @@ local function packetFromBuffer(
 		)
 		or nil
 
-	local expandedBits =
-		rawBits ~= nil
+	local expandedBits = rawBits ~= nil
 		and math.max(
 			0,
 			logicalBits
@@ -3115,8 +3110,7 @@ local function packetFromBuffer(
 		)
 		or nil
 
-	local bitSavingsPercent =
-		rawBits ~= nil
+	local bitSavingsPercent = rawBits ~= nil
 		and rawBits > 0
 		and math.max(
 			0,
@@ -3516,10 +3510,8 @@ function Schema:EncodeDelta(previous: {[string]: any}, current: {[string]: any},
 	end
 
 	for _, field in ipairs(self.Fields) do
-		local descriptor =
-			field.Descriptor
-		local value =
-			current[field.Name]
+		local descriptor = field.Descriptor
+		local value = current[field.Name]
 
 		if value == nil then
 			if not descriptor.Optional then
@@ -3563,8 +3555,7 @@ function Schema:EncodeDelta(previous: {[string]: any}, current: {[string]: any},
 			previous[field.Name],
 			current[field.Name]
 			) then
-			local value =
-				current[field.Name]
+			local value = current[field.Name]
 
 			writeBits(
 				w,
@@ -3584,8 +3575,7 @@ function Schema:EncodeDelta(previous: {[string]: any}, current: {[string]: any},
 		end
 	end
 
-	local data =
-		finish(w)
+	local data = finish(w)
 
 	return packetFromEntropy(
 		data,
@@ -3606,14 +3596,12 @@ function Schema:DecodeDelta(previous: {[string]: any}, packet: Packet | buffer, 
 		)
 	end
 
-	local data, packetVersion =
-		unwrapPacket(
+	local data, packetVersion = unwrapPacket(
 			packet,
 			options
 		)
 	local r = newReader(data)
-	local version, binaryVersion =
-		readHeader(
+	local version, binaryVersion = readHeader(
 			r,
 			MODE.DELTA
 		)
@@ -3633,8 +3621,7 @@ function Schema:DecodeDelta(previous: {[string]: any}, packet: Packet | buffer, 
 		)
 	end
 
-	local changed =
-		table.create(
+	local changed = table.create(
 			#self.Fields
 		)
 
@@ -3643,13 +3630,11 @@ function Schema:DecodeDelta(previous: {[string]: any}, packet: Packet | buffer, 
 			readBits(r, 1) == 1
 	end
 
-	local result =
-		table.clone(previous)
+	local result = table.clone(previous)
 
 	for i, field in ipairs(self.Fields) do
 		if changed[i] then
-			local present =
-				readBits(r, 1) == 1
+			local present = readBits(r, 1) == 1
 
 			if present then
 				result[field.Name] =
@@ -3682,8 +3667,7 @@ function Schema:DecodeDelta(previous: {[string]: any}, packet: Packet | buffer, 
 	end
 
 	for _, field in ipairs(self.Fields) do
-		local value =
-			result[field.Name]
+		local value = result[field.Name]
 
 		if value == nil then
 			if not field.Descriptor.Optional then
@@ -4496,8 +4480,7 @@ local function readTinyString(r: Reader): string
 		)
 	end
 
-	local bitsPerCharacter =
-		mode == 1
+	local bitsPerCharacter = mode == 1
 		and 6
 		or (
 			mode == 2
@@ -4505,11 +4488,9 @@ local function readTinyString(r: Reader): string
 			or 4
 		)
 
-	local requiredBits =
-		length * bitsPerCharacter
+	local requiredBits = length * bitsPerCharacter
 
-	local availableBits =
-		(r.Length - r.Position) * 8
+	local availableBits = (r.Length - r.Position) * 8
 
 	if requiredBits > availableBits then
 		fail(
@@ -4643,8 +4624,7 @@ local function buildCompactKeyMap(value: {[any]: any}, options: Options?): Dicti
 	for key, count in pairs(counts) do
 		if count >= minimumUses then
 			local _, keyBytes = tinyStringMode(key)
-			local potential =
-				count * keyBytes
+			local potential = count * keyBytes
 			- keyBytes
 			- count
 
@@ -4679,13 +4659,11 @@ local function buildCompactKeyMap(value: {[any]: any}, options: Options?): Dicti
 		local id = #state.Decode + 1
 		local idBytes = varUIntByteLength(id)
 
-		local dictionaryCountPenalty =
-			id == 128
+		local dictionaryCountPenalty = id == 128
 			and 1
 			or 0
 
-		local exactSavings =
-			candidate.Count * candidate.KeyBytes
+		local exactSavings = candidate.Count * candidate.KeyBytes
 		- candidate.KeyBytes
 		- candidate.Count * idBytes
 		- dictionaryCountPenalty
@@ -4755,10 +4733,8 @@ local function validateContainerCount(r: Reader, count: number, label: string)
 		)
 	end
 
-	local remaining =
-		r.Length - r.Position
-	local hardLimit =
-		math.max(
+	local remaining = r.Length - r.Position
+	local hardLimit = math.max(
 			16,
 			remaining * 8 + 16
 		)
@@ -6371,8 +6347,7 @@ function Compression.Decode(packet: Packet | buffer, options: Options?): any
 	local count = readVarUInt(r)
 	validateContainerCount(r, count, "string dictionary")
 	for i = 1, count do
-		local value =
-			binaryVersion >= 8
+		local value = binaryVersion >= 8
 			and readCompressedStringBlob(r)
 			or readStringRaw(r)
 
@@ -6578,10 +6553,8 @@ FMT.DescriptorsEquivalent = function(a: Descriptor, b: Descriptor): boolean
 	end
 
 	if a.Kind == "Object" then
-		local fieldsA =
-			a.Fields
-		local fieldsB =
-			b.Fields
+		local fieldsA = a.Fields
+		local fieldsB = b.Fields
 
 		if fieldsA == nil
 			or fieldsB == nil then
@@ -6589,8 +6562,7 @@ FMT.DescriptorsEquivalent = function(a: Descriptor, b: Descriptor): boolean
 		end
 
 		for name, childA in pairs(fieldsA) do
-			local childB =
-				fieldsB[name]
+			local childB = fieldsB[name]
 
 			if childB == nil
 				or not FMT.DescriptorsEquivalent(
@@ -6894,8 +6866,7 @@ local function adaptiveTablePacket(value: {[any]: any}, options: Options?): Pack
 			options
 		)
 
-	local dynamicPacket =
-		dynamicTablePacket(
+	local dynamicPacket = dynamicTablePacket(
 			value,
 			options,
 			rawBits,
@@ -7223,8 +7194,7 @@ MODE.AnalyzeTableStructure = function(value: {[any]: any}): {[string]: any}
 		if count >= 2 then
 			result.RepeatedStringKeys += 1
 
-			local _, keyBytes =
-				tinyStringMode(key)
+			local _, keyBytes = tinyStringMode(key)
 
 			if keyBytes * count
 				- keyBytes
@@ -7373,83 +7343,66 @@ function Compression.TableStats(value: {[any]: any}, options: Options?): {[strin
 		)
 	end
 
-	local packet =
-		Compression.CompressTablePacket(
+	local packet = Compression.CompressTablePacket(
 			value,
 			options
 		)
 
 	local bytes = packet.Bytes
-	local physicalBits =
-		packet.PhysicalBits
+	local physicalBits = packet.PhysicalBits
 		or bytes * 8
-	local usefulBits =
-		packet.UsefulBits
+	local usefulBits = packet.UsefulBits
 		or packet.Bits
 		or physicalBits
-	local paddingBits =
-		packet.PaddingBits
+	local paddingBits = packet.PaddingBits
 		or math.max(
 			0,
 			physicalBits - usefulBits
 		)
 
-	local rawBits =
-		rawValueBits(value)
-	local rawBytes =
-		math.ceil(rawBits / 8)
+	local rawBits = rawValueBits(value)
+	local rawBytes = math.ceil(rawBits / 8)
 
-	local byteDelta =
-		rawBytes - bytes
-	local savedBytes =
-		math.max(
+	local byteDelta = rawBytes - bytes
+	local savedBytes = math.max(
 			0,
 			byteDelta
 		)
-	local expandedBytes =
-		math.max(
+	local expandedBytes = math.max(
 			0,
 			-byteDelta
 		)
 
-	local bitDelta =
-		rawBits - usefulBits
-	local savedBits =
-		math.max(
+	local bitDelta = rawBits - usefulBits
+	local savedBits = math.max(
 			0,
 			bitDelta
 		)
-	local expandedBits =
-		math.max(
+	local expandedBits = math.max(
 			0,
 			-bitDelta
 		)
 
-	local structure =
-		MODE.AnalyzeTableStructure(value)
+	local structure = MODE.AnalyzeTableStructure(value)
 
-	local keyMap =
-		buildCompactKeyMap(
+	local keyMap = buildCompactKeyMap(
 			value,
 			options
 		)
 
-	local mode =
-		Compression.TableMode(
+	local mode = Compression.TableMode(
 			packet,
 			options
 		)
 
-	local mapped =
-		string.find(
+	local mapped = string.find(
 			mode,
 			"CompactMapped",
 			1,
 			true
 		) == 1
 
-	local mappingOptions =
-		options
+	local mappingOptions = options
 		and table.clone(options)
 		or {}
 
@@ -7466,8 +7419,7 @@ function Compression.TableStats(value: {[any]: any}, options: Options?): {[strin
 			mappingOptions
 		)
 
-	local unmappedOptions =
-		options
+	local unmappedOptions = options
 		and table.clone(options)
 		or {}
 
@@ -7484,18 +7436,15 @@ function Compression.TableStats(value: {[any]: any}, options: Options?): {[strin
 			unmappedOptions
 		)
 
-	local mappedCompactBytes =
-		mappedOK
+	local mappedCompactBytes = mappedOK
 		and mappedCompact.Bytes
 		or nil
 
-	local unmappedCompactBytes =
-		unmappedOK
+	local unmappedCompactBytes = unmappedOK
 		and unmappedCompact.Bytes
 		or nil
 
-	local mappingSavedBytes =
-		mappedCompactBytes
+	local mappingSavedBytes = mappedCompactBytes
 		and unmappedCompactBytes
 		and math.max(
 			0,
@@ -7504,8 +7453,7 @@ function Compression.TableStats(value: {[any]: any}, options: Options?): {[strin
 		)
 		or 0
 
-	local mappingSavingsPercent =
-		unmappedCompactBytes
+	local mappingSavingsPercent = unmappedCompactBytes
 		and unmappedCompactBytes > 0
 		and mappingSavedBytes
 		/ unmappedCompactBytes
