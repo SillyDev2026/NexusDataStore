@@ -2,12 +2,12 @@
 
 **Typed, session-aware Roblox DataStore persistence.** Written for server-side Luau with profile locks, safe updates, migration support, compression, ordered leaderboards, and restart integration.
 
-![Version](https://img.shields.io/badge/NexusDataStore-8.5.0-2563eb)
-![Compression](https://img.shields.io/badge/Compression-2.6.1-0f766e)
+![Version](https://img.shields.io/badge/NexusDataStore-9.0.0-2563eb)
+![Compression](https://img.shields.io/badge/Compression-2.6.5%20%2B%20legacy-0f766e)
 ![Luau](https://img.shields.io/badge/Luau-strict-00a2ff)
 ![Roblox](https://img.shields.io/badge/Roblox-server--side-222222)
 
-**Current version:** `8.5.0` · **Record format:** `700` · **Compression:** `2.6.1` (codecs `230`–`233`).
+**Current version:** `9.0.0` · **Record format:** `700` · **Legacy compression:** `2.6.1` (codecs `230`–`233`) · **Modern compression:** `2.6.5` (codec `250`, opt-in writing).
 
 > [!IMPORTANT]
 > This project has automated source checks and portable Luau behavioral tests, but those are not a substitute for Roblox Studio and published-server tests. **Use a test universe and test keys before rolling changes out to existing player records.**
@@ -26,7 +26,67 @@
 10. [API reference](#api-reference)
 11. [Testing and troubleshooting](#testing-and-troubleshooting)
 
-## New in 8.5.0
+## New in 9.0.0
+
+**Compatibility first:** v9 retains all v8.5 public profile, store, leaderboard, schema, and restart APIs. Persisted record format `700`, DataStore names, scopes, keys, and the legacy `Compression.lua` (v2.6.1, codecs 230–233) remain intact. Existing data needs no one-off conversion.
+
+### Modern Compression v2.6.5 with old-data decoding
+
+The `CompressionLatest.lua` ModuleScript is copied from [SillyDev2026/Compression](https://github.com/SillyDev2026/Compression) v2.6.5, a **separate binary codec** from NexusDataStore's legacy Compression v2.6.1. NexusDataStore identifies modern packets using envelope codec `250` without changing record format `700`.
+
+Both codec modules must be installed. Modern format **reads work even with modern writes disabled**, but old v8.x servers **cannot read codec 250**. Therefore `EnableModernCompression` defaults to `false`; upgrade *all running server instances* to v9 first and let every v8 server drain before enabling new writes.
+
+~~~lua
+local Store = NexusDataStore.new({
+    Name = "PlayerData",
+    Template = PlayersData,
+    Compression = true,
+    CompressionPolicy = "adaptive",
+    CompressionTransport = "auto",
+    EnableModernCompression = false, -- Set true only after every live server reads codec 250
+})
+~~~
+
+Once enabled, the encoder compares eligible modern and legacy packets and retains raw data when that is smaller under the adaptive policy. `ModernCompressionModule` overrides auto-discovery, and `ModernCompressionOptions` passes v2.6.5-specific tuning without changing `CompressionOptions` for legacy codecs. **Never replace `Compression.lua` with `CompressionLatest.lua`**. Compression gains depend on profile shapes and encode CPU cost, and are not performance guarantees.
+
+### Read-only version history and recovery previews
+
+~~~lua
+local versions, err = Store:ListVersionsAsync(player.UserId, 30)
+if not versions then warn(err) end
+if versions and versions[1] then
+    local historical, details = Store:GetVersionAsync(player.UserId, versions[1].Version)
+    local preview, reason = Store:PreviewRestoreAsync(player.UserId, versions[1].Version)
+    if preview then print("Changed fields:", #preview.Changes) else warn(reason) end
+end
+~~~
+
+These functions do **not** restore, overwrite, unlock, or mutate records. Historical versions follow Roblox's retention and hourly-versioning rules. `PreviewRestoreAsync` runs schema migrations and validation on detached copies.
+
+### Optional persistent purchase-receipt adapter
+
+Install `NexusReceipts.lua` as a separate server ModuleScript and add `ProcessedReceipts = {}` to your data template. Update schema validation if your game uses strict rules.
+
+~~~lua
+local Store = require(script.Parent.DataService)
+local NexusReceipts = require(script.Parent.NexusReceipts)
+local receipts = NexusReceipts.new(Store, {
+    [123456789] = function(data, receipt)
+        data.Gems += 100
+    end,
+})
+receipts:Bind()
+~~~
+
+Use your real developer-product ID and a nonyielding, server-authored grant handler. This adapter records purchase IDs and grants in one in-memory transaction, then attempts a critical save before returning `PurchaseGranted`. Ambiguous/failed saves return `NotProcessedYet` for Roblox to retry. Do not delete the receipt-ID ledger, which is stored in player data, or old receipts may be granted again. Only one script should set `MarketplaceService.ProcessReceipt`; do not chain competing handlers.
+
+### Release safety and validation
+
+`tests/PortableV9Regression.luau` tests the new routing and history APIs with service mocks. Live Roblox Studio and test-universe verification is still necessary, especially for compression roundtrips, purchases, migrations, and rolling upgrades. `EnableModernCompression = false` remains the safe initial production configuration.
+
+**Prior release notes:** [v8.5.0 validation](docs/8.5.0-validation.md).
+
+## Previously in 8.5.0
 
 - `profile:TryGet("Coins")` returns `true, value` or `false, error` without throwing for invalid read paths. Read tables are detached.
 - `Store:WaitForSession(player, timeout)` handles zero-second timeouts, closing stores, invalid keys, and departed players more precisely.
@@ -48,7 +108,8 @@ ServerScriptService
 └── Data
     ├── NexusDataStore                  ModuleScript: paste DataStore.lua
     │   ├── PlayersData                 ModuleScript: your template
-    │   └── Compression                 ModuleScript: paste Compression.lua
+    │   ├── Compression                 ModuleScript: paste Compression.lua (legacy v2.6.1)
+    │   └── CompressionLatest           ModuleScript: paste CompressionLatest.lua (modern v2.6.5)
     ├── DataService                     ModuleScript: create one shared Store
     └── DataBootstrap                   Script: attach lifecycle
 ~~~
@@ -69,6 +130,7 @@ local PlayersData = {
     Level = 1,
     Experience = 0,
     Rebirths = 0,
+    ProcessedReceipts = {} :: {[string]: boolean}, -- Required for optional NexusReceipts
     Inventory = {} :: {string},
     Upgrades = {} :: {[string]: number},
     Settings = {Music = true, SFX = true},
@@ -93,6 +155,7 @@ local Store = NexusDataStore.new({
     Name = "PlayerData",
     Template = PlayersData,
     Compression = true,
+    EnableModernCompression = false,
     CompressionStrategy = "balanced",
     CompressionPolicy = "adaptive",
     CompressionTransport = "auto",
@@ -758,7 +821,10 @@ All fields below go inside `NexusDataStore.new({...})`. Defaults refer to the so
 | `ProfileOperations` | `false` | Operation timing diagnostics; enable selectively. |
 | `ChangeJournalLimit` | `0` | In-memory journal limit, up to 1000. |
 | `Compression` | `true` | Codec-aware raw/compressed persistence. |
-| `CompressionModule` | auto | Override location of codec ModuleScript. |
+| `CompressionModule` | auto | Override location of legacy decoder/encoder ModuleScript. |
+| `ModernCompressionModule` | auto | Override location of optional CompressionLatest v2.6.5 ModuleScript. |
+| `EnableModernCompression` | `false` | Opt in to codec 250 writes **only after** all older live servers have drained. |
+| `ModernCompressionOptions` | adapter defaults | Separate v2.6.5 packet settings; does not change legacy compression settings. |
 | `CompressionOptions` | `{}` | Dictionary, compact, packed and RLE flags. |
 | `CompressionReports` | `false` | Emit detailed compression selection events. |
 | `CompressionMinBytes` | `512` | Adaptive threshold before considering compression. |
@@ -831,6 +897,9 @@ All *public* methods implemented by the v8.5.0 source are summarized below. The 
 | `Store:GetSchema()` | Get a detached schema copy, if present. |
 | `Store:PreviewMigration(data, fromVersion, key?)` | Migration preview only. |
 | `Store:GetStorageForecast(dataOrSession, warningRatio?)` | Stored-byte forecast. |
+| `Store:ListVersionsAsync(key, limit?)` | Read first page of historical version summaries. |
+| `Store:GetVersionAsync(key, version)` | Read one historical version without locking or writing it. |
+| `Store:PreviewRestoreAsync(key, version)` | Dry-run a historical restore with migration, diffs and storage forecast. |
 | `Store:GetVersion()` | Current module version. |
 | `Store:EncodeCompressed(data)` | Create a codec packet. |
 | `Store:DecodeCompressed(buffer)` | Decode a codec packet. |
