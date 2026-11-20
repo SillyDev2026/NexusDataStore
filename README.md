@@ -3,7 +3,7 @@
 **Typed, session-aware Roblox DataStore persistence.** Written for server-side Luau with profile locks, safe updates, migration support, compression, ordered leaderboards, and restart integration.
 
 ![Version](https://img.shields.io/badge/NexusDataStore-9.0.0-2563eb)
-![Compression](https://img.shields.io/badge/Compression-2.6.1-0f766e)
+![Compression](https://img.shields.io/badge/Compression-2.6.5%20%2B%20legacy-0f766e)
 ![Luau](https://img.shields.io/badge/Luau-strict-00a2ff)
 ![Roblox](https://img.shields.io/badge/Roblox-server--side-222222)
 
@@ -820,7 +820,10 @@ All fields below go inside `NexusDataStore.new({...})`. Defaults refer to the so
 | `ProfileOperations` | `false` | Operation timing diagnostics; enable selectively. |
 | `ChangeJournalLimit` | `0` | In-memory journal limit, up to 1000. |
 | `Compression` | `true` | Codec-aware raw/compressed persistence. |
-| `CompressionModule` | auto | Override location of codec ModuleScript. |
+| `CompressionModule` | auto | Override location of legacy decoder/encoder ModuleScript. |
+| `ModernCompressionModule` | auto | Override location of optional CompressionLatest v2.6.5 ModuleScript. |
+| `EnableModernCompression` | `false` | Opt in to codec 250 writes **only after** all older live servers have drained. |
+| `ModernCompressionOptions` | adapter defaults | Separate v2.6.5 packet settings; does not change legacy compression settings. |
 | `CompressionOptions` | `{}` | Dictionary, compact, packed and RLE flags. |
 | `CompressionReports` | `false` | Emit detailed compression selection events. |
 | `CompressionMinBytes` | `512` | Adaptive threshold before considering compression. |
@@ -893,6 +896,9 @@ All *public* methods implemented by the v8.5.0 source are summarized below. The 
 | `Store:GetSchema()` | Get a detached schema copy, if present. |
 | `Store:PreviewMigration(data, fromVersion, key?)` | Migration preview only. |
 | `Store:GetStorageForecast(dataOrSession, warningRatio?)` | Stored-byte forecast. |
+| `Store:ListVersionsAsync(key, limit?)` | Read first page of historical version summaries. |
+| `Store:GetVersionAsync(key, version)` | Read one historical version without locking or writing it. |
+| `Store:PreviewRestoreAsync(key, version)` | Dry-run a historical restore with migration, diffs and storage forecast. |
 | `Store:GetVersion()` | Current module version. |
 | `Store:EncodeCompressed(data)` | Create a codec packet. |
 | `Store:DecodeCompressed(buffer)` | Decode a codec packet. |
