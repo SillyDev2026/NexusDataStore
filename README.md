@@ -130,6 +130,7 @@ local PlayersData = {
     Level = 1,
     Experience = 0,
     Rebirths = 0,
+    ProcessedReceipts = {} :: {[string]: boolean}, -- Required for optional NexusReceipts
     Inventory = {} :: {string},
     Upgrades = {} :: {[string]: number},
     Settings = {Music = true, SFX = true},
